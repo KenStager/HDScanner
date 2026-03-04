@@ -1,0 +1,1 @@
+"""Shared dashboard components."""
