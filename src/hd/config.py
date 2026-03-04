@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
     email_smtp_host: str = ""
 
+    # OpenClaw / Slack notifications
+    openclaw_webhook_url: str = ""
+    openclaw_token: str = ""
+    slack_channel_id: str = ""
+    notify_cursor_path: str = ".hd_notify_cursor"
+
     @property
     def store_list(self) -> list[str]:
         return _parse_csv(self.stores)

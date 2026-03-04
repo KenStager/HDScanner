@@ -6,11 +6,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from hd.dashboard.pages.alerts import (
-    _GROUP_WINDOW_MINUTES,
-    _build_group,
-    _group_alerts,
-    _parse_ts,
+from hd.grouping import (
+    GROUP_WINDOW_MINUTES as _GROUP_WINDOW_MINUTES,
+    build_group as _build_group,
+    group_alerts as _group_alerts,
+    parse_ts as _parse_ts,
 )
 
 

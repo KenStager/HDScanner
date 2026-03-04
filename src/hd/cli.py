@@ -392,6 +392,118 @@ def prune(
 
 
 @app.command()
+def notify(
+    since: int = typer.Option(4, help="Fallback hours if no cursor exists"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print without sending"),
+    reset: bool = typer.Option(False, "--reset", help="Clear cursor and re-send"),
+) -> None:
+    """Send recent alerts to Slack via OpenClaw webhook."""
+    from pathlib import Path
+
+    setup_logging()
+    settings = Settings()
+
+    cursor_path = Path(settings.notify_cursor_path)
+
+    # Handle --reset
+    if reset and cursor_path.exists():
+        cursor_path.unlink()
+        console.print("[yellow]Cursor reset.[/yellow]")
+
+    # Read cursor timestamp
+    cursor_ts = None
+    if cursor_path.exists():
+        try:
+            from datetime import datetime
+
+            raw = cursor_path.read_text().strip()
+            cursor_ts = datetime.fromisoformat(raw)
+        except (ValueError, OSError):
+            console.print("[yellow]Invalid cursor file, using --since fallback.[/yellow]")
+
+    async def _notify():
+        from datetime import datetime, timedelta, timezone
+
+        from hd.db.base import init_db as _init_tables, close_db
+        from hd.dashboard.queries import get_alerts
+        from hd.grouping import group_alerts
+        from hd.notifiers.formatter import format_slack_message
+        from hd.notifiers.webhook import post_to_openclaw
+
+        await _init_tables(settings)
+
+        # Determine how far back to query
+        if cursor_ts is not None:
+            # Query with a generous window; we filter post-query
+            hours_back = max(since, 168)  # up to 7 days
+        else:
+            hours_back = since
+
+        alerts_list = await get_alerts(settings, since_hours=hours_back, limit=500)
+
+        # Filter to alerts after cursor_ts
+        if cursor_ts is not None:
+            from hd.grouping import parse_ts
+
+            alerts_list = [
+                a for a in alerts_list
+                if parse_ts(a.get("ts")) > cursor_ts
+            ]
+
+        # Filter out HEALTH_DEGRADED (internal, not useful in Slack)
+        alerts_list = [
+            a for a in alerts_list
+            if a.get("alert_type") != "HEALTH_DEGRADED"
+        ]
+
+        if not alerts_list:
+            await close_db()
+            return 0, None, None
+
+        groups = group_alerts(alerts_list)
+        message = format_slack_message(groups)
+
+        # Find max timestamp for cursor update
+        max_ts = max(
+            (parse_ts(a.get("ts")) for a in alerts_list),
+            default=None,
+        )
+
+        if dry_run:
+            console.print(message)
+            await close_db()
+            return len(groups), max_ts, True
+
+        # Validate webhook is configured
+        if not settings.openclaw_webhook_url:
+            console.print("[red]OPENCLAW_WEBHOOK_URL not set. Use --dry-run to preview.[/red]")
+            await close_db()
+            return len(groups), max_ts, False
+
+        success = await post_to_openclaw(settings, message)
+        await close_db()
+        return len(groups), max_ts, success
+
+    group_count, max_ts, success = _run(_notify())
+
+    if group_count == 0:
+        console.print("[yellow]No new alerts to send.[/yellow]")
+        return
+
+    if dry_run:
+        console.print(f"\n[cyan]--- Dry run: {group_count} alert group(s) above ---[/cyan]")
+        return
+
+    if success:
+        # Update cursor
+        if max_ts is not None:
+            cursor_path.write_text(max_ts.isoformat())
+        console.print(f"[green]Sent {group_count} alert group(s) to Slack.[/green]")
+    else:
+        console.print("[red]Webhook delivery failed. Cursor not updated.[/red]")
+
+
+@app.command()
 def serve(
     host: Optional[str] = typer.Option(None, help="Bind host (overrides config)"),
     port: Optional[int] = typer.Option(None, help="Bind port (overrides config)"),
