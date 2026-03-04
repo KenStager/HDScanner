@@ -1,0 +1,284 @@
+{
+  "data": {
+    "searchModel": {
+      "products": [
+        {
+          "itemId": "312345678",
+          "identifiers": {
+            "brandName": "Milwaukee",
+            "modelNumber": "2767-20",
+            "canonicalUrl": "/p/Milwaukee-M18-FUEL-18V-Lithium-Ion-Brushless-Cordless-1-2-in-Impact-Wrench/312345678",
+            "productLabel": "Milwaukee M18 FUEL 18V Lithium-Ion Brushless Cordless 1/2 in. Impact Wrench (Tool-Only)",
+            "storeSkuNumber": "1004500123",
+            "itemId": "312345678",
+            "productType": "REGULAR",
+            "parentId": null,
+            "isSuperSku": false
+          },
+          "pricing": {
+            "value": 249.00,
+            "original": 299.00,
+            "alternatePriceDisplay": null,
+            "mapAboveOriginalPrice": false,
+            "message": null,
+            "preferredPriceFlag": false,
+            "promotion": {
+              "type": "CLEARANCE",
+              "description": "Save $50.00 (17%)",
+              "dollarOff": 50.00,
+              "percentageOff": 17,
+              "promotionTag": "Clearance",
+              "savingsCenter": "CLEARANCE",
+              "savingsCenterPromos": null,
+              "specialBuySavings": null,
+              "specialBuyDollarOff": null,
+              "specialBuyPercentageOff": null,
+              "dates": null
+            },
+            "specialBuy": null,
+            "unitOfMeasure": null
+          },
+          "reviews": {
+            "ratingsReviews": {
+              "averageRating": "4.8",
+              "totalReviews": "1523"
+            }
+          },
+          "media": {
+            "images": [
+              {
+                "url": "https://images.thdstatic.com/productImages/example1.jpg",
+                "type": "PRIMARY",
+                "subType": null,
+                "sizes": null
+              }
+            ]
+          },
+          "fulfillment": {
+            "anchorStoreStatus": true,
+            "anchorStoreStatusType": "STORE",
+            "backordered": false,
+            "backorderedShipDate": null,
+            "fulfillmentOptions": [
+              {
+                "type": "pickup",
+                "fulfillable": true,
+                "services": [
+                  {
+                    "deliveryTimeline": null,
+                    "deliveryDates": null,
+                    "deliveryCharge": null,
+                    "dynamicEta": null,
+                    "hasFreeShipping": false,
+                    "freeDeliveryThreshold": null,
+                    "type": "bopis",
+                    "totalCharge": null,
+                    "locations": [
+                      {
+                        "curbsidePickupFlag": true,
+                        "isBuyInStoreCheckNearBy": false,
+                        "distance": null,
+                        "inventory": {
+                          "isOutOfStock": false,
+                          "isInStock": true,
+                          "isLimitedQuantity": false,
+                          "isUnavailable": false,
+                          "quantity": 12,
+                          "maxAllowedBopisQty": null,
+                          "minAllowedBopisQty": null
+                        },
+                        "isAnchor": true,
+                        "locationId": "2619",
+                        "state": "TX",
+                        "storeName": "Store 2619",
+                        "storePhone": "(555)555-0001",
+                        "type": "store"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "onlineStoreStatus": null,
+            "onlineStoreStatusType": null
+          },
+          "info": {
+            "hidePrice": false,
+            "ecoRebate": null,
+            "quantityLimit": 0,
+            "categoryHierarchy": null,
+            "sskMin": null,
+            "sskMax": null,
+            "productSubType": null,
+            "isLiveGoodsProduct": false,
+            "isSponsored": false,
+            "hasSubscription": false,
+            "samplesAvailable": null,
+            "totalNumberOfOptions": null,
+            "classNumber": null,
+            "productDepartment": null
+          },
+          "availabilityType": {
+            "type": "REGULAR",
+            "discontinued": false,
+            "buyable": true,
+            "status": "IN_STOCK"
+          },
+          "badges": [
+            {
+              "name": "clearance",
+              "label": "Clearance"
+            }
+          ],
+          "favoriteDetail": {
+            "count": 0
+          },
+          "keyProductFeatures": null,
+          "taxonomy": null,
+          "details": null
+        },
+        {
+          "itemId": "312345679",
+          "identifiers": {
+            "brandName": "Milwaukee",
+            "modelNumber": "2554-20",
+            "canonicalUrl": "/p/Milwaukee-M12-FUEL-12V-Lithium-Ion-Brushless-Cordless-Stubby-3-8-in-Impact-Wrench/312345679",
+            "productLabel": "Milwaukee M12 FUEL 12V Lithium-Ion Brushless Cordless Stubby 3/8 in. Impact Wrench (Tool-Only)",
+            "storeSkuNumber": "1004500124",
+            "itemId": "312345679",
+            "productType": "REGULAR",
+            "parentId": null,
+            "isSuperSku": false
+          },
+          "pricing": {
+            "value": 159.00,
+            "original": 159.00,
+            "alternatePriceDisplay": null,
+            "mapAboveOriginalPrice": false,
+            "message": null,
+            "preferredPriceFlag": false,
+            "promotion": null,
+            "specialBuy": null,
+            "unitOfMeasure": null
+          },
+          "reviews": {
+            "ratingsReviews": {
+              "averageRating": "4.9",
+              "totalReviews": "892"
+            }
+          },
+          "media": {
+            "images": []
+          },
+          "fulfillment": {
+            "anchorStoreStatus": true,
+            "anchorStoreStatusType": "STORE",
+            "backordered": false,
+            "backorderedShipDate": null,
+            "fulfillmentOptions": [
+              {
+                "type": "pickup",
+                "fulfillable": true,
+                "services": [
+                  {
+                    "deliveryTimeline": null,
+                    "deliveryDates": null,
+                    "deliveryCharge": null,
+                    "dynamicEta": null,
+                    "hasFreeShipping": false,
+                    "freeDeliveryThreshold": null,
+                    "type": "bopis",
+                    "totalCharge": null,
+                    "locations": [
+                      {
+                        "curbsidePickupFlag": true,
+                        "isBuyInStoreCheckNearBy": false,
+                        "distance": null,
+                        "inventory": {
+                          "isOutOfStock": false,
+                          "isInStock": true,
+                          "isLimitedQuantity": false,
+                          "isUnavailable": false,
+                          "quantity": 5,
+                          "maxAllowedBopisQty": null,
+                          "minAllowedBopisQty": null
+                        },
+                        "isAnchor": true,
+                        "locationId": "2619",
+                        "state": "TX",
+                        "storeName": "Store 2619",
+                        "storePhone": "(555)555-0001",
+                        "type": "store"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "onlineStoreStatus": null,
+            "onlineStoreStatusType": null
+          },
+          "info": null,
+          "availabilityType": {
+            "type": "REGULAR",
+            "discontinued": false,
+            "buyable": true,
+            "status": "IN_STOCK"
+          },
+          "badges": [],
+          "favoriteDetail": null,
+          "keyProductFeatures": null,
+          "taxonomy": null,
+          "details": null
+        },
+        {
+          "itemId": "312345680",
+          "identifiers": {
+            "brandName": "Milwaukee",
+            "modelNumber": "48-22-8424",
+            "canonicalUrl": "/p/Milwaukee-PACKOUT-22-in-Tool-Box/312345680",
+            "productLabel": "Milwaukee PACKOUT 22 in. Tool Box",
+            "storeSkuNumber": "1004500125",
+            "itemId": "312345680",
+            "productType": "REGULAR",
+            "parentId": null,
+            "isSuperSku": false
+          },
+          "pricing": {
+            "value": 59.97,
+            "original": 69.97,
+            "alternatePriceDisplay": null,
+            "mapAboveOriginalPrice": false,
+            "message": null,
+            "preferredPriceFlag": false,
+            "promotion": {
+              "type": "SALE",
+              "description": "Save $10.00 (14%)",
+              "dollarOff": 10.00,
+              "percentageOff": 14,
+              "promotionTag": "Sale",
+              "savingsCenter": null,
+              "savingsCenterPromos": null,
+              "specialBuySavings": null,
+              "specialBuyDollarOff": null,
+              "specialBuyPercentageOff": null,
+              "dates": null
+            },
+            "specialBuy": null,
+            "unitOfMeasure": null
+          },
+          "reviews": null,
+          "media": null,
+          "fulfillment": null,
+          "info": null,
+          "availabilityType": null,
+          "badges": null,
+          "favoriteDetail": null,
+          "keyProductFeatures": null,
+          "taxonomy": null,
+          "details": null
+        }
+      ]
+    }
+  }
+}
