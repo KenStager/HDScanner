@@ -31,6 +31,18 @@ CURL_HEADERS = [
 ]
 
 
+# Marker key stamped onto synthetic empty responses so downstream code can tell
+# "the API legitimately returned no products" apart from "we never got an answer".
+# Without this every failure looks like end-of-results and pagination stops early,
+# silently reporting partial coverage as complete.
+FAILURE_KEY = "_hd_failure"
+
+
+def failure_response(reason: str) -> dict[str, Any]:
+    """Empty-shaped response tagged with why it is empty."""
+    return {"data": {"searchModel": {"products": []}}, FAILURE_KEY: reason}
+
+
 class CircuitOpenError(Exception):
     """Raised when the circuit breaker is open."""
     pass
@@ -97,6 +109,21 @@ class HDClient:
         self._request_count: int = 0
         self._request_budget: int = settings.request_budget
         self._throttled: bool = False
+        self._failures: dict[str, int] = {}
+
+    def _fail(self, reason: str) -> dict[str, Any]:
+        """Record a failed request and return a tagged empty response."""
+        self._failures[reason] = self._failures.get(reason, 0) + 1
+        return failure_response(reason)
+
+    @property
+    def failures(self) -> dict[str, int]:
+        """Failure counts by reason for this client's lifetime."""
+        return dict(self._failures)
+
+    @property
+    def failure_count(self) -> int:
+        return sum(self._failures.values())
 
     def _load_query(self) -> str:
         if self._query_cache is None:
@@ -121,14 +148,14 @@ class HDClient:
     async def post_graphql(self, variables: dict[str, Any]) -> dict:
         """Send a GraphQL request with rate limiting, circuit breaker, and retry."""
         if self._throttled:
-            return {"data": {"searchModel": {"products": []}}}
+            return self._fail("throttled")
         if self._request_budget > 0 and self._request_count >= self._request_budget:
             log.warning(
                 "Request budget exhausted",
                 count=self._request_count,
                 budget=self._request_budget,
             )
-            return {"data": {"searchModel": {"products": []}}}
+            return self._fail("budget_exhausted")
         self._circuit_breaker.check()
         await self._rate_limiter.acquire()
         self._request_count += 1
@@ -174,7 +201,7 @@ class HDClient:
                 log.warning("Received 403 — possible bot detection, backing off 30s")
                 self._circuit_breaker.record_failure()
                 await asyncio.sleep(30)
-                return {"data": {"searchModel": {"products": []}}}
+                return self._fail('http_403')
 
             if status_code == 206:
                 self._throttled = True
@@ -182,7 +209,7 @@ class HDClient:
                     "Received 206 — quota exhausted, aborting further requests",
                     request_count=self._request_count,
                 )
-                return {"data": {"searchModel": {"products": []}}}
+                return self._fail('http_206_quota')
 
             if status_code == 429:
                 log.warning("Received 429 — rate limited")
@@ -190,7 +217,7 @@ class HDClient:
                 if attempt < 5:
                     await asyncio.sleep(min(2 ** attempt, 60))
                     return await self._do_request(variables, attempt + 1)
-                return {"data": {"searchModel": {"products": []}}}
+                return self._fail('http_429')
 
             if status_code >= 500:
                 log.warning("Server error", status=status_code)
@@ -198,12 +225,12 @@ class HDClient:
                 if attempt < 5:
                     await asyncio.sleep(min(2 ** attempt, 60))
                     return await self._do_request(variables, attempt + 1)
-                return {"data": {"searchModel": {"products": []}}}
+                return self._fail('http_5xx')
 
             if not body.strip():
                 log.warning("Empty response body", status=status_code)
                 self._circuit_breaker.record_failure()
-                return {"data": {"searchModel": {"products": []}}}
+                return self._fail('empty_body')
 
             data = json.loads(body)
 
@@ -226,15 +253,15 @@ class HDClient:
             if attempt < 5:
                 await asyncio.sleep(min(2 ** attempt, 60))
                 return await self._do_request(variables, attempt + 1)
-            return {"data": {"searchModel": {"products": []}}}
+            return self._fail('timeout')
         except json.JSONDecodeError as e:
             self._circuit_breaker.record_failure()
             log.error("Failed to parse response JSON", error=str(e))
-            return {"data": {"searchModel": {"products": []}}}
+            return self._fail('bad_json')
         except Exception as e:
             self._circuit_breaker.record_failure()
             log.error("Request failed", error=str(e))
-            return {"data": {"searchModel": {"products": []}}}
+            return self._fail('exception')
 
     async def close(self) -> None:
         """No persistent connection to close with curl backend."""

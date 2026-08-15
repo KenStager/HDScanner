@@ -22,7 +22,9 @@ env/
 .env
 dev.db
 hd_launchd.*.log
+hd_dashboard.*.log
 .hd_notify_cursor
+.hd_rotation_cursor
 raw_responses/
 screenshots/
 *.png

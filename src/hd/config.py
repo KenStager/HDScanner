@@ -42,7 +42,20 @@ class Settings(BaseSettings):
     jitter_max_ms: int = 2500
     max_pages: int = 32
     request_budget: int = 100  # Max API requests per HDClient instance (0 = unlimited)
-    page_size: int = 24
+    page_size: int = 24  # 24 is what the browser sends; larger values draw a 403
+
+    # Coverage rotation. A single keyword can need 90+ pages against a ~100
+    # request budget, so a run that always starts at page 0 never reaches the
+    # tail no matter how often it runs. Each run instead walks a slice starting
+    # where the previous run stopped.
+    rotation_enabled: bool = True
+    rotation_cursor_path: str = ".hd_rotation_cursor"
+    rotation_slice_pages: int = 8
+
+    # Pages per keyword for the supplementary storefilter=ALL pass, which picks
+    # up online-only items that the IN_STORE filter excludes. Kept small so the
+    # pass fits inside the budget instead of being starved by it.
+    online_pass_max_pages: int = 3
 
     # Scan strategy
     scan_keywords: str = ""           # CSV of keyword groups for split scanning (e.g. "Milwaukee M18,Milwaukee M12")

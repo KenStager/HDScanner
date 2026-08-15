@@ -5,12 +5,19 @@ from __future__ import annotations
 from typing import Any
 
 from hd.config import Settings
-from hd.http.client import HDClient
+from hd.http.client import FAILURE_KEY, HDClient
 
 
 def is_valid_search_response(raw: dict) -> bool:
-    """Check if response contains a valid searchModel payload."""
+    """Check if response contains a valid searchModel payload.
+
+    A tagged failure (see http.client.failure_response) is shaped like a real
+    empty result but is not one. Accepting it makes throttling indistinguishable
+    from end-of-results, which silently truncates coverage and reports success.
+    """
     if not isinstance(raw, dict):
+        return False
+    if FAILURE_KEY in raw:
         return False
     if "error" in raw or "errors" in raw:
         return False
@@ -19,6 +26,13 @@ def is_valid_search_response(raw: dict) -> bool:
         return False
     search_model = data.get("searchModel")
     return search_model is not None
+
+
+def failure_reason(raw: dict) -> str | None:
+    """Why a response was synthetic, or None if it came from the API."""
+    if not isinstance(raw, dict):
+        return "not_a_dict"
+    return raw.get(FAILURE_KEY)
 
 
 async def search(

@@ -11,11 +11,12 @@ from sqlalchemy import select
 from hd.config import Settings
 from hd.db.base import get_session
 from hd.db.models import Product
-from hd.hd_api.graphql import search, is_valid_search_response
+from hd.hd_api.graphql import search, is_valid_search_response, failure_reason
 from hd.hd_api.parsers import parse_products, matches_product_line
 from hd.http.client import HDClient
 from hd.logging import get_logger
 from hd.pipeline.health import check_drift, HealthStatus, emit_health_degraded_alert
+from hd import rotation
 
 log = get_logger("pipeline.discovery")
 
@@ -29,11 +30,26 @@ async def _discover_category(
     brands: list[str],
     filters: list[str],
     storefilter: str = "ALL",
+    cursors: dict[str, int] | None = None,
 ) -> tuple[int, bool]:
     """Paginate one brand+navParam, filter, upsert. Returns (upsert count, should_abort)."""
     page_upserted = 0
+    store_id = settings.store_list[0]
 
-    for page in range(max_pages):
+    if cursors is not None and settings.rotation_enabled:
+        slice_pages = min(settings.rotation_slice_pages, max_pages)
+        pages = rotation.next_window(
+            cursors, brand, store_id, f"discover:{storefilter}",
+            slice_pages=slice_pages, max_pages=max_pages,
+        )
+        rotation.advance(
+            cursors, brand, store_id, f"discover:{storefilter}",
+            slice_pages=slice_pages, max_pages=max_pages,
+        )
+    else:
+        pages = list(range(max_pages))
+
+    for page in pages:
         start_index = page * settings.page_size
 
         raw = await search(
@@ -53,17 +69,23 @@ async def _discover_category(
 
         # Validate API response before processing
         if not is_valid_search_response(raw):
+            reason = failure_reason(raw)
             log.error(
-                "Invalid API response during discovery",
+                "Discovery page unusable — coverage incomplete",
                 brand=brand,
                 page=page,
-                raw_keys=list(raw.get("data", {}).keys()),
+                storefilter=storefilter,
+                reason=reason or "api_error",
             )
-            await emit_health_degraded_alert(
-                settings,
-                ["API error response on discovery"],
-                message="API returned error instead of search results",
-            )
+            # Only a genuine API error implies schema/endpoint trouble. Our own
+            # sentinels (throttled, budget exhausted, 403/206) mean we stopped
+            # asking, which is not a health problem worth alerting on.
+            if reason is None:
+                await emit_health_degraded_alert(
+                    settings,
+                    ["API error response on discovery"],
+                    message="API returned error instead of search results",
+                )
             break
 
         # Check for schema drift
@@ -156,16 +178,44 @@ async def run_discovery(
     owns_client = client is None
     client = client or HDClient(settings)
     total_upserted = 0
+    # Bound outside the try so the finally block can always persist it.
+    cursors: dict[str, int] = (
+        rotation.load_cursors(settings.rotation_cursor_path)
+        if settings.rotation_enabled else {}
+    )
 
     try:
         if scan_keywords:
+            # Supplementary ALL pass FIRST. Discovery is the only gate for new
+            # items entering the products table, and snapshotting skips anything
+            # not already there — so if this pass is starved, online-only deals
+            # can never be captured at all. It used to run last and never ran.
+            if storefilter == "IN_STORE":
+                online_max_pages = min(max_pages, settings.online_pass_max_pages)
+                for i, keyword in enumerate(scan_keywords):
+                    log.info("Discovering online products", keyword=keyword)
+                    count, abort = await _discover_category(
+                        client, settings, keyword, nav_param, online_max_pages,
+                        brands, filters=[], storefilter="ALL", cursors=cursors,
+                    )
+                    total_upserted += count
+                    if count:
+                        log.info("Online discovery complete", keyword=keyword, total=count)
+                    if abort:
+                        break
+                    if i < len(scan_keywords) - 1:
+                        await asyncio.sleep(random.uniform(
+                            settings.keyword_pause_min_seconds,
+                            settings.keyword_pause_max_seconds,
+                        ))
+
             # Keyword-split mode: each keyword gets its own discovery pass
             # No product_line_filter — keywords themselves control scope
             for i, keyword in enumerate(scan_keywords):
                 log.info("Discovering products", keyword=keyword, storefilter=storefilter)
                 count, abort = await _discover_category(
                     client, settings, keyword, nav_param, max_pages, brands, filters=[],
-                    storefilter=storefilter,
+                    storefilter=storefilter, cursors=cursors,
                 )
                 total_upserted += count
                 log.info("Keyword discovery complete", keyword=keyword, total=count)
@@ -178,33 +228,13 @@ async def run_discovery(
                         settings.keyword_pause_max_seconds,
                     )
                     await asyncio.sleep(pause)
-            # Supplementary ALL pass: discover online-only items IN_STORE misses.
-            # Capped at 10 pages per keyword — just enough to find popular online deals.
-            if storefilter == "IN_STORE":
-                online_max_pages = min(max_pages, 10)
-                for i, keyword in enumerate(scan_keywords):
-                    log.info("Discovering online products", keyword=keyword)
-                    count, abort = await _discover_category(
-                        client, settings, keyword, nav_param, online_max_pages, brands, filters=[],
-                        storefilter="ALL",
-                    )
-                    total_upserted += count
-                    if count:
-                        log.info("Online discovery complete", keyword=keyword, total=count)
-                    if abort:
-                        break
-                    if i < len(scan_keywords) - 1:
-                        pause = random.uniform(
-                            settings.keyword_pause_min_seconds,
-                            settings.keyword_pause_max_seconds,
-                        )
-                        await asyncio.sleep(pause)
-
             log.info(
                 "Discovery phase complete",
                 requests_used=client.request_count,
                 budget=client._request_budget,
                 products=total_upserted,
+                throttled=client.is_throttled,
+                failures=client.failures or None,
             )
         else:
             # Legacy mode: brand list + navParams
@@ -232,6 +262,8 @@ async def run_discovery(
                         return total_upserted
 
     finally:
+        if settings.rotation_enabled:
+            rotation.save_cursors(settings.rotation_cursor_path, cursors)
         if owns_client:
             await client.close()
 

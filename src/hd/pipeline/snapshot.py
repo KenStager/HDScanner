@@ -15,10 +15,11 @@ from sqlalchemy import select
 from hd.config import Settings
 from hd.db.base import get_session
 from hd.db.models import Product, StoreSnapshot
-from hd.hd_api.graphql import search, is_valid_search_response
+from hd.hd_api.graphql import search, is_valid_search_response, failure_reason
 from hd.hd_api.parsers import parse_snapshots
 from hd.http.client import HDClient
 from hd.logging import get_logger
+from hd import rotation
 
 log = get_logger("pipeline.snapshot")
 
@@ -54,14 +55,56 @@ async def run_snapshots(
     owns_client = client is None
     client = client or HDClient(settings)
     total_inserted = 0
+    # Bound outside the try so the finally block can always persist it.
+    cursors: dict[str, int] = (
+        rotation.load_cursors(settings.rotation_cursor_path)
+        if settings.rotation_enabled else {}
+    )
 
     try:
         scan_keywords = settings.scan_keyword_list
         storefilter = settings.snapshot_storefilter
 
+        # One dedup set per store, shared by both passes below. Pricing is scoped
+        # by storeId regardless of storefilter, so whichever pass reaches an item
+        # first records equivalent data and the other can safely skip it.
+        seen_by_store: dict[str, set[str]] = {s: set() for s in store_ids}
+
+        # Supplementary ALL pass: catch online-only deals IN_STORE excludes.
+        # Runs BEFORE the main passes — it used to run last and was starved by
+        # budget exhaustion, so it never actually executed. Store-independent
+        # (online pricing is the same everywhere), so one reference store is enough.
+        if scan_keywords and storefilter == "IN_STORE" and store_ids:
+            ref_store = store_ids[0]
+            online_count = 0
+            for i, keyword in enumerate(scan_keywords):
+                if client.is_throttled:
+                    log.warning("Throttled, skipping remaining online keywords")
+                    break
+                online_count += await _paginate_and_snapshot(
+                    client, settings, keyword, ref_store, active_ids,
+                    seen_item_ids=seen_by_store[ref_store],
+                    storefilter="ALL",
+                    max_pages_override=settings.online_pass_max_pages,
+                    cursors=cursors,
+                )
+                if i < len(scan_keywords) - 1:
+                    await asyncio.sleep(random.uniform(
+                        settings.keyword_pause_min_seconds,
+                        settings.keyword_pause_max_seconds,
+                    ))
+            log.info(
+                "Online supplement complete",
+                store_id=ref_store,
+                rows=online_count,
+                requests_used=client.request_count,
+                budget=client._request_budget,
+            )
+            total_inserted += online_count
+
         for store_id in store_ids:
             store_count = 0
-            seen_item_ids: set[str] = set()  # Prevent duplicate snapshots per store
+            seen_item_ids = seen_by_store[store_id]
 
             if scan_keywords:
                 # Keyword-split mode: iterate each keyword with configured storefilter
@@ -73,6 +116,7 @@ async def run_snapshots(
                         client, settings, keyword, store_id, active_ids,
                         seen_item_ids=seen_item_ids,
                         storefilter=storefilter,
+                        cursors=cursors,
                     )
                     store_count += kw_count
                     # Inter-keyword pause (skip after last keyword)
@@ -102,36 +146,16 @@ async def run_snapshots(
             log.info("Store snapshots complete", store_id=store_id, rows=store_count)
             total_inserted += store_count
 
-        # Supplementary ALL pass: catch online-only deals that IN_STORE misses.
-        # Runs once (first store only) since online pricing is store-independent.
-        # Reuses seen_item_ids from the last store so items already captured are skipped.
-        if scan_keywords and storefilter == "IN_STORE":
-            online_count = 0
-            ref_store = store_ids[0]
-            for i, keyword in enumerate(scan_keywords):
-                kw_count = await _paginate_and_snapshot(
-                    client, settings, keyword, ref_store, active_ids,
-                    seen_item_ids=seen_item_ids,
-                    storefilter="ALL",
-                )
-                online_count += kw_count
-                if i < len(scan_keywords) - 1:
-                    pause = random.uniform(
-                        settings.keyword_pause_min_seconds,
-                        settings.keyword_pause_max_seconds,
-                    )
-                    await asyncio.sleep(pause)
-            if online_count:
-                log.info("Online supplement complete", store_id=ref_store, rows=online_count)
-            total_inserted += online_count
-
     finally:
+        if settings.rotation_enabled:
+            rotation.save_cursors(settings.rotation_cursor_path, cursors)
         log.info(
             "Snapshot phase complete",
             requests_used=client.request_count,
             budget=client._request_budget,
             snapshots=total_inserted,
             throttled=client.is_throttled,
+            failures=client.failures or None,
         )
         if owns_client:
             await client.close()
@@ -148,13 +172,31 @@ async def _paginate_and_snapshot(
     nav_param: str | None = None,
     seen_item_ids: set[str] | None = None,
     storefilter: str = "ALL",
+    max_pages_override: int | None = None,
+    cursors: dict[str, int] | None = None,
 ) -> int:
     """Paginate through category for one brand+store, insert matching snapshots."""
     nav_param = nav_param or settings.tools_nav_param
     inserted = 0
     now = datetime.now(timezone.utc)
 
-    for page in range(settings.max_pages):
+    max_pages = max_pages_override or settings.max_pages
+
+    if cursors is not None and settings.rotation_enabled:
+        pages = rotation.next_window(
+            cursors, brand, store_id, storefilter,
+            slice_pages=min(settings.rotation_slice_pages, max_pages),
+            max_pages=max_pages,
+        )
+        rotation.advance(
+            cursors, brand, store_id, storefilter,
+            slice_pages=min(settings.rotation_slice_pages, max_pages),
+            max_pages=max_pages,
+        )
+    else:
+        pages = list(range(max_pages))
+
+    for page in pages:
         start_index = page * settings.page_size
 
         try:
@@ -179,11 +221,16 @@ async def _paginate_and_snapshot(
             break
 
         if not is_valid_search_response(raw):
+            # Distinguish a real API error from our own failure sentinel — the
+            # latter means we never reached the API (throttled, out of budget,
+            # 403/206) and coverage for this keyword is incomplete, not empty.
             log.error(
-                "Invalid API response during snapshot",
+                "Snapshot page unusable — coverage incomplete",
                 brand=brand,
                 store_id=store_id,
                 page=page,
+                storefilter=storefilter,
+                reason=failure_reason(raw) or "api_error",
             )
             break
 
