@@ -19,7 +19,10 @@ env/
 *.swo
 
 # Project-specific
+.env
 dev.db
+hd_launchd.*.log
+.hd_notify_cursor
 raw_responses/
 screenshots/
 *.png
