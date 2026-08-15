@@ -159,6 +159,11 @@
             "preferredPriceFlag": false,
             "promotion": null,
             "specialBuy": null,
+            "clearance": {
+              "value": 99.00,
+              "dollarOff": 60.00,
+              "percentageOff": 38
+            },
             "unitOfMeasure": null
           },
           "reviews": {
@@ -181,33 +186,40 @@
                 "fulfillable": true,
                 "services": [
                   {
-                    "deliveryTimeline": null,
-                    "deliveryDates": null,
-                    "deliveryCharge": null,
-                    "dynamicEta": null,
-                    "hasFreeShipping": false,
-                    "freeDeliveryThreshold": null,
                     "type": "bopis",
-                    "totalCharge": null,
                     "locations": [
                       {
-                        "curbsidePickupFlag": true,
-                        "isBuyInStoreCheckNearBy": false,
-                        "distance": null,
+                        "inventory": {
+                          "isOutOfStock": true,
+                          "isInStock": false,
+                          "isLimitedQuantity": false,
+                          "quantity": 0
+                        },
+                        "isAnchor": true,
+                        "locationId": "2619",
+                        "storeName": "Store 2619",
+                        "type": "store"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "delivery",
+                "services": [
+                  {
+                    "type": "express delivery",
+                    "locations": [
+                      {
                         "inventory": {
                           "isOutOfStock": false,
                           "isInStock": true,
                           "isLimitedQuantity": false,
-                          "isUnavailable": false,
-                          "quantity": 5,
-                          "maxAllowedBopisQty": null,
-                          "minAllowedBopisQty": null
+                          "quantity": 3
                         },
                         "isAnchor": true,
                         "locationId": "2619",
-                        "state": "TX",
                         "storeName": "Store 2619",
-                        "storePhone": "(555)555-0001",
                         "type": "store"
                       }
                     ]
@@ -220,10 +232,10 @@
           },
           "info": null,
           "availabilityType": {
-            "type": "REGULAR",
+            "type": "Shared",
             "discontinued": false,
-            "buyable": true,
-            "status": "IN_STOCK"
+            "buyable": false,
+            "status": false
           },
           "badges": [],
           "favoriteDetail": null,

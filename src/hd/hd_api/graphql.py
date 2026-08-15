@@ -29,13 +29,14 @@ async def search(
     store_id: str,
     start_index: int = 0,
     page_size: int = 24,
+    storefilter: str = "ALL",
 ) -> dict[str, Any]:
     """Execute a searchModel GraphQL query and return raw JSON response."""
     variables: dict[str, Any] = {
         "keyword": keyword,
         "navParam": nav_param,
         "storeId": store_id,
-        "storefilter": "ALL",
+        "storefilter": storefilter,
         "channel": "DESKTOP",
         "isBrandPricingPolicyCompliant": False,
         "skipInstallServices": True,

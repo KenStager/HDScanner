@@ -16,6 +16,7 @@ from hd.dashboard.components.formatters import (
     product_status_badge,
     severity_color,
     stock_badge,
+    infer_in_stock,
 )
 from hd.dashboard.components.header import render_header
 from hd.dashboard.queries import get_product_detail, get_products_with_latest
@@ -165,7 +166,10 @@ async def product_detail_page(item_id: str) -> None:
     # Back link
     ui.link("← Back to Products", "/products").classes("px-4")
 
-    # Product info
+    # Product image + info
+    if product.get("image_url"):
+        with ui.row().classes("items-center px-4 mt-2"):
+            ui.image(product["image_url"]).classes("w-24 h-24 object-contain")
     with ui.row().classes("items-center gap-4 px-4 mt-2"):
         ui.label(product["title"]).classes("text-h5 font-bold")
         ui.badge(product["brand"]).props("color=primary")
@@ -173,8 +177,9 @@ async def product_detail_page(item_id: str) -> None:
             ui.label(f"Model: {product['model_number']}").classes("text-grey")
     if product.get("first_seen_ts"):
         ui.label(f"First seen: {fmt_ts(product['first_seen_ts'])}").classes("text-grey px-4")
-    if product.get("canonical_url"):
-        ui.link("View on HomeDepot.com", f"https://www.homedepot.com{product['canonical_url']}").classes("px-4")
+    canonical = product.get("canonical_url")
+    hd_url = f"https://www.homedepot.com{canonical}" if canonical else f"https://www.homedepot.com/s/{product['item_id']}"
+    ui.link("View on HomeDepot.com", hd_url).classes("px-4")
 
     snapshots = detail.get("snapshots", [])
 
@@ -208,7 +213,7 @@ async def product_detail_page(item_id: str) -> None:
                             ui.label(f"Store {sid}").classes("text-subtitle1 font-bold")
                             with ui.row().classes("items-center gap-4 mt-1"):
                                 ui.label(fmt_price(snap.get("price_value"))).classes("text-h5 font-bold")
-                                label, color = stock_badge(snap.get("in_stock"))
+                                label, color = stock_badge(infer_in_stock(snap))
                                 ui.badge(label).props(f"color={color}")
                                 qty = snap.get("inventory_qty")
                                 if qty is not None and qty > 0:

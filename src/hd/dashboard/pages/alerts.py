@@ -15,6 +15,7 @@ from hd.dashboard.components.formatters import (
     format_price_change,
     severity_color,
     stock_badge,
+    infer_in_stock,
 )
 from hd.dashboard.components.header import render_header
 from hd.dashboard.queries import get_alerts
@@ -107,8 +108,8 @@ async def alerts_page() -> None:
                 sp = sa.get("payload") or {}
                 sb = sp.get("before", {})
                 saf = sp.get("after", {})
-                sb_stock_label, sb_stock_color = stock_badge(sb.get("in_stock"))
-                sa_stock_label, sa_stock_color = stock_badge(saf.get("in_stock"))
+                sb_stock_label, sb_stock_color = stock_badge(infer_in_stock(sb))
+                sa_stock_label, sa_stock_color = stock_badge(infer_in_stock(saf))
                 store_details.append({
                     "store_id": sa.get("store_id", ""),
                     "severity": sa.get("severity", ""),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -26,6 +27,7 @@ async def run_snapshots(
     settings: Settings,
     store_ids: list[str] | None = None,
     limit: int | None = None,
+    client: HDClient | None = None,
 ) -> int:
     """Fetch snapshots for active products at each store.
 
@@ -49,21 +51,90 @@ async def run_snapshots(
     active_ids = {p.item_id for p in products}
     log.info("Starting snapshots", products=len(products), stores=len(store_ids))
 
-    client = HDClient(settings)
+    owns_client = client is None
+    client = client or HDClient(settings)
     total_inserted = 0
 
     try:
+        scan_keywords = settings.scan_keyword_list
+        storefilter = settings.snapshot_storefilter
+
         for store_id in store_ids:
             store_count = 0
-            for brand in settings.brand_list:
-                brand_count = await _paginate_and_snapshot(
-                    client, settings, brand, store_id, active_ids,
-                )
-                store_count += brand_count
+            seen_item_ids: set[str] = set()  # Prevent duplicate snapshots per store
+
+            if scan_keywords:
+                # Keyword-split mode: iterate each keyword with configured storefilter
+                for i, keyword in enumerate(scan_keywords):
+                    if client.is_throttled:
+                        log.warning("Throttled, skipping remaining keywords", store_id=store_id)
+                        break
+                    kw_count = await _paginate_and_snapshot(
+                        client, settings, keyword, store_id, active_ids,
+                        seen_item_ids=seen_item_ids,
+                        storefilter=storefilter,
+                    )
+                    store_count += kw_count
+                    # Inter-keyword pause (skip after last keyword)
+                    if i < len(scan_keywords) - 1:
+                        pause = random.uniform(
+                            settings.keyword_pause_min_seconds,
+                            settings.keyword_pause_max_seconds,
+                        )
+                        await asyncio.sleep(pause)
+            else:
+                # Legacy mode: brand list + navParams
+                for brand in settings.brand_list:
+                    brand_count = await _paginate_and_snapshot(
+                        client, settings, brand, store_id, active_ids,
+                        seen_item_ids=seen_item_ids,
+                    )
+                    store_count += brand_count
+                for extra_nav in settings.extra_nav_param_list:
+                    for brand in settings.brand_list:
+                        brand_count = await _paginate_and_snapshot(
+                            client, settings, brand, store_id, active_ids,
+                            nav_param=extra_nav,
+                            seen_item_ids=seen_item_ids,
+                        )
+                        store_count += brand_count
+
             log.info("Store snapshots complete", store_id=store_id, rows=store_count)
             total_inserted += store_count
+
+        # Supplementary ALL pass: catch online-only deals that IN_STORE misses.
+        # Runs once (first store only) since online pricing is store-independent.
+        # Reuses seen_item_ids from the last store so items already captured are skipped.
+        if scan_keywords and storefilter == "IN_STORE":
+            online_count = 0
+            ref_store = store_ids[0]
+            for i, keyword in enumerate(scan_keywords):
+                kw_count = await _paginate_and_snapshot(
+                    client, settings, keyword, ref_store, active_ids,
+                    seen_item_ids=seen_item_ids,
+                    storefilter="ALL",
+                )
+                online_count += kw_count
+                if i < len(scan_keywords) - 1:
+                    pause = random.uniform(
+                        settings.keyword_pause_min_seconds,
+                        settings.keyword_pause_max_seconds,
+                    )
+                    await asyncio.sleep(pause)
+            if online_count:
+                log.info("Online supplement complete", store_id=ref_store, rows=online_count)
+            total_inserted += online_count
+
     finally:
-        await client.close()
+        log.info(
+            "Snapshot phase complete",
+            requests_used=client.request_count,
+            budget=client._request_budget,
+            snapshots=total_inserted,
+            throttled=client.is_throttled,
+        )
+        if owns_client:
+            await client.close()
 
     return total_inserted
 
@@ -74,8 +145,12 @@ async def _paginate_and_snapshot(
     brand: str,
     store_id: str,
     active_ids: set[str],
+    nav_param: str | None = None,
+    seen_item_ids: set[str] | None = None,
+    storefilter: str = "ALL",
 ) -> int:
     """Paginate through category for one brand+store, insert matching snapshots."""
+    nav_param = nav_param or settings.tools_nav_param
     inserted = 0
     now = datetime.now(timezone.utc)
 
@@ -86,16 +161,21 @@ async def _paginate_and_snapshot(
             raw = await search(
                 client,
                 keyword=brand,
-                nav_param=settings.tools_nav_param,
+                nav_param=nav_param,
                 store_id=store_id,
                 start_index=start_index,
                 page_size=settings.page_size,
+                storefilter=storefilter,
             )
         except Exception as e:
             log.error(
                 "Snapshot page fetch failed",
                 brand=brand, store_id=store_id, page=page, error=str(e),
             )
+            break
+
+        # Abort immediately if throttled
+        if client.is_throttled:
             break
 
         if not is_valid_search_response(raw):
@@ -107,7 +187,22 @@ async def _paginate_and_snapshot(
             )
             break
 
-        raw_products = raw.get("data", {}).get("searchModel", {}).get("products", [])
+        search_model = raw.get("data", {}).get("searchModel", {})
+        raw_products = search_model.get("products", [])
+
+        # Log total results on first page for observability
+        if page == 0:
+            total = (search_model.get("searchReport") or {}).get("totalProducts")
+            if total is not None:
+                pages_needed = (total + settings.page_size - 1) // settings.page_size
+                log.info(
+                    "Scan started",
+                    keyword=brand,
+                    store_id=store_id,
+                    storefilter=storefilter,
+                    total_products=total,
+                    pages_needed=pages_needed,
+                )
 
         # Write raw JSON for the page if configured
         if settings.store_raw_json:
@@ -117,8 +212,12 @@ async def _paginate_and_snapshot(
 
         snapshots = parse_snapshots(raw, store_id)
 
-        # Match against active products
+        # Match against active products, skip already-seen items (dedup)
         matched = [s for s in snapshots if s.item_id in active_ids]
+        if seen_item_ids is not None:
+            matched = [s for s in matched if s.item_id not in seen_item_ids]
+            for s in matched:
+                seen_item_ids.add(s.item_id)
         if matched:
             count = await _insert_snapshots(settings, matched, store_id, now)
             inserted += count
@@ -151,6 +250,9 @@ async def _insert_snapshots(
                 dollar_off=Decimal(str(snap.dollar_off)) if snap.dollar_off is not None else None,
                 percentage_off=snap.percentage_off,
                 special_buy=snap.special_buy,
+                clearance_value=Decimal(str(snap.clearance_value)) if snap.clearance_value is not None else None,
+                clearance_dollar_off=Decimal(str(snap.clearance_dollar_off)) if snap.clearance_dollar_off is not None else None,
+                clearance_percentage_off=snap.clearance_percentage_off,
                 inventory_qty=snap.inventory_qty,
                 in_stock=snap.in_stock,
                 limited_qty=snap.limited_qty,

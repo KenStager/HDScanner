@@ -46,8 +46,10 @@ def alert_type_icon(alert_type: str) -> str:
         "PRICE_DROP": "trending_down",
         "CLEARANCE": "local_offer",
         "SPECIAL_BUY": "star",
+        "DEEP_DISCOUNT": "local_fire_department",
         "BACK_IN_STOCK": "inventory",
         "OOS": "remove_shopping_cart",
+        "IN_STORE_CLEARANCE": "store",
         "HEALTH_DEGRADED": "warning",
     }
     return mapping.get(alert_type, "info")
@@ -60,6 +62,17 @@ def stock_badge(in_stock: bool | None) -> tuple[str, str]:
     if in_stock:
         return ("In Stock", "green")
     return ("Out of Stock", "red")
+
+
+def infer_in_stock(data: dict) -> bool | None:
+    """Infer in_stock from inventory_qty when the API didn't provide isInStock."""
+    in_stock = data.get("in_stock")
+    if in_stock is not None:
+        return in_stock
+    qty = data.get("inventory_qty")
+    if qty is not None:
+        return qty > 0
+    return None
 
 
 def fmt_pct_nonzero(val: Union[int, float, None]) -> str:
@@ -77,6 +90,7 @@ def fmt_savings_center(val: str | None) -> str:
         "CLEARANCE": "Clearance",
         "SPECIAL_BUY": "Special Buy",
         "SPECIAL_BUYS": "Special Buy",
+        "DEEP_DISCOUNT": "Deep Discount",
     }
     return _MAP.get(val.upper(), val.replace("_", " ").title())
 
@@ -207,6 +221,18 @@ def format_price_change(alert_type: str, payload: dict | None) -> str:
         a_price = fmt_price(after.get("price_value"))
         return f"Special Buy at {a_price}"
 
+    if alert_type == "DEEP_DISCOUNT":
+        a_price = fmt_price(after.get("price_value"))
+        pct_off = payload.get("percentage_off") or after.get("percentage_off")
+        pct_str = f" ({pct_off}% off)" if pct_off else ""
+        return f"Deep discount: {a_price}{pct_str}"
+
+    if alert_type == "IN_STORE_CLEARANCE":
+        cl_price = fmt_price(payload.get("clearance_value"))
+        pct = payload.get("clearance_percentage_off")
+        pct_str = f" ({pct}% off)" if pct else ""
+        return f"In-store: {cl_price}{pct_str}"
+
     title = payload.get("product_title", "")
     return title[:50] if title else ""
 
@@ -222,5 +248,9 @@ def format_alert_details(alert_type: str, payload: dict | None) -> str:
     if alert_type == "CLEARANCE":
         pct = payload.get("after", {}).get("percentage_off", "?")
         return f"{pct}% off"
+    if alert_type == "IN_STORE_CLEARANCE":
+        cl = payload.get("clearance_value")
+        pct = payload.get("clearance_percentage_off")
+        return f"${cl} ({pct}% off)" if cl else ""
     title = payload.get("product_title", "")
     return title[:50] if title else ""

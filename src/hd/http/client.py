@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import subprocess
 import time
 from collections import deque
@@ -93,6 +94,9 @@ class HDClient:
             window_seconds=settings.circuit_breaker_window_seconds,
         )
         self._query_cache: str | None = None
+        self._request_count: int = 0
+        self._request_budget: int = settings.request_budget
+        self._throttled: bool = False
 
     def _load_query(self) -> str:
         if self._query_cache is None:
@@ -106,10 +110,28 @@ class HDClient:
             raise FileNotFoundError("Cannot find queries/searchModel.graphql")
         return self._query_cache
 
+    @property
+    def request_count(self) -> int:
+        return self._request_count
+
+    @property
+    def is_throttled(self) -> bool:
+        return self._throttled
+
     async def post_graphql(self, variables: dict[str, Any]) -> dict:
         """Send a GraphQL request with rate limiting, circuit breaker, and retry."""
+        if self._throttled:
+            return {"data": {"searchModel": {"products": []}}}
+        if self._request_budget > 0 and self._request_count >= self._request_budget:
+            log.warning(
+                "Request budget exhausted",
+                count=self._request_count,
+                budget=self._request_budget,
+            )
+            return {"data": {"searchModel": {"products": []}}}
         self._circuit_breaker.check()
         await self._rate_limiter.acquire()
+        self._request_count += 1
         return await self._do_request(variables)
 
     async def _do_request(self, variables: dict[str, Any], attempt: int = 1) -> dict:
@@ -152,6 +174,14 @@ class HDClient:
                 log.warning("Received 403 — possible bot detection, backing off 30s")
                 self._circuit_breaker.record_failure()
                 await asyncio.sleep(30)
+                return {"data": {"searchModel": {"products": []}}}
+
+            if status_code == 206:
+                self._throttled = True
+                log.warning(
+                    "Received 206 — quota exhausted, aborting further requests",
+                    request_count=self._request_count,
+                )
                 return {"data": {"searchModel": {"products": []}}}
 
             if status_code == 429:

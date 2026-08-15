@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -62,6 +63,28 @@ class Database:
         engine = self.get_engine(settings)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Migrate: add columns that create_all won't add to existing tables
+            try:
+                await conn.execute(text(
+                    "ALTER TABLE products ADD COLUMN image_url TEXT"
+                ))
+            except Exception:
+                pass  # Column already exists
+            for col in ("clearance_value", "clearance_dollar_off", "clearance_percentage_off"):
+                try:
+                    col_type = "NUMERIC(10,2)" if "value" in col or "dollar" in col else "INTEGER"
+                    await conn.execute(text(
+                        f"ALTER TABLE store_snapshots ADD COLUMN {col} {col_type}"
+                    ))
+                except Exception:
+                    pass  # Column already exists
+            # Ensure PRICING_ERROR enum value exists (SQLite stores as string)
+            try:
+                await conn.execute(text(
+                    "INSERT INTO alerttype VALUES ('PRICING_ERROR') ON CONFLICT DO NOTHING"
+                ))
+            except Exception:
+                pass  # Table may not exist (SQLite enum-as-string needs no migration)
 
     async def close_db(self) -> None:
         """Dispose of the engine."""

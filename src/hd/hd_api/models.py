@@ -13,6 +13,7 @@ class NormalizedProduct:
     title: str | None = None
     canonical_url: str | None = None
     model_number: str | None = None
+    image_url: str | None = None
 
 
 @dataclass
@@ -28,6 +29,9 @@ class NormalizedSnapshot:
     dollar_off: float | None = None
     percentage_off: int | None = None
     special_buy: bool | None = None
+    clearance_value: float | None = None
+    clearance_dollar_off: float | None = None
+    clearance_percentage_off: int | None = None
     inventory_qty: int | None = None
     in_stock: bool | None = None
     limited_qty: bool | None = None

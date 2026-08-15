@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from hd.config import Settings
+from hd.db.models import AlertType
 from hd.logging import setup_logging
 
 app = typer.Typer(name="hd", help="Home Depot Clearance Monitor")
@@ -150,47 +151,74 @@ def snapshot(
 
 
 @app.command()
-def run_once() -> None:
-    """Run full pipeline: discover -> snapshot -> diff -> alerts."""
+def run_once(
+    mode: str = typer.Option("auto", help="Run mode: auto, full, snapshot-only"),
+) -> None:
+    """Run pipeline: snapshot -> diff -> alerts (+ discovery on full runs).
+
+    Modes:
+      auto          - snapshot-only by default; full discovery once daily at 00:00 UTC
+      full          - discovery + snapshots (catalog refresh)
+      snapshot-only - snapshots only (clearance/price monitoring)
+    """
     setup_logging()
     settings = Settings()
 
     async def _run_once():
+        from pathlib import Path
+        from datetime import datetime, timezone
         from hd.db.base import init_db as _init_tables, close_db
         from hd.pipeline.discovery import run_discovery
         from hd.pipeline.snapshot import run_snapshots
         from hd.pipeline.diff import run_diff
         from hd.pipeline.alerts import write_alerts
+        from hd.http.client import HDClient
         from hd.logging import get_logger
 
         log = get_logger("pipeline")
 
+        # Determine effective mode
+        effective_mode = mode
+        if mode == "auto":
+            hour = datetime.now(timezone.utc).hour
+            effective_mode = "full" if hour == 0 else "snapshot-only"
+
+        log.info("Pipeline starting", mode=effective_mode)
         await _init_tables(settings)
 
-        product_count = await run_discovery(
-            settings=settings,
-            brands=settings.brand_list,
-            max_pages=settings.max_pages,
-        )
-        log.info("Discovery complete", products=product_count)
+        shared_client = HDClient(settings)
+        product_count = 0
+        snapshot_count = 0
 
-        if settings.stage_delay_seconds > 0:
-            log.info("Stage delay", seconds=settings.stage_delay_seconds)
-            await asyncio.sleep(settings.stage_delay_seconds)
+        try:
+            if effective_mode == "full":
+                product_count = await run_discovery(
+                    settings=settings,
+                    brands=settings.brand_list,
+                    max_pages=settings.max_pages,
+                    client=shared_client,
+                )
+                log.info("Discovery complete", products=product_count, requests=shared_client.request_count)
 
-        snapshot_count = await run_snapshots(
-            settings=settings,
-            store_ids=settings.store_list,
-        )
-        log.info("Snapshots complete", rows=snapshot_count)
+                if settings.stage_delay_seconds > 0:
+                    await asyncio.sleep(settings.stage_delay_seconds)
 
-        # Sanity check: products found but zero snapshots → likely API error responses
-        if product_count > 0 and snapshot_count == 0:
+            snapshot_count = await run_snapshots(
+                settings=settings,
+                store_ids=settings.store_list,
+                client=shared_client,
+            )
+            log.info("Snapshots complete", rows=snapshot_count, requests=shared_client.request_count)
+        finally:
+            await shared_client.close()
+
+        # Sanity check: zero snapshots on a snapshot run → likely API error
+        if snapshot_count == 0:
             from hd.pipeline.health import emit_health_degraded_alert
             await emit_health_degraded_alert(
                 settings,
-                ["Zero snapshots despite active products"],
-                message=f"Zero snapshots despite {product_count} active products — likely API error responses",
+                ["Zero snapshots"],
+                message="Zero snapshots — likely API throttling or error responses",
             )
 
         alerts_list = await run_diff(settings=settings)
@@ -199,14 +227,128 @@ def run_once() -> None:
             alert_count = await write_alerts(settings=settings, alerts=alerts_list)
         log.info("Diff complete", alerts=alert_count)
 
-        await close_db()
-        return product_count, snapshot_count, alert_count
+        # Auto-notify Slack when new alerts are found
+        sent_count = 0
+        if alert_count > 0 and settings.slack_bot_token:
+            from hd.dashboard.queries import get_alerts
+            from hd.grouping import group_alerts, parse_ts
+            from hd.notifiers.formatter import format_slack_blocks
+            from hd.notifiers.webhook import post_to_openclaw
 
-    products, snapshots, alerts_count = _run(_run_once())
-    console.print(
-        f"[green]Pipeline complete: {products} products, "
-        f"{snapshots} snapshots, {alerts_count} alerts.[/green]"
-    )
+            cursor_path = Path(settings.notify_cursor_path)
+            cursor_ts = None
+            if cursor_path.exists():
+                try:
+                    cursor_ts = datetime.fromisoformat(cursor_path.read_text().strip())
+                except (ValueError, OSError):
+                    pass
+
+            hours_back = max(4, 168) if cursor_ts else 4
+            recent = await get_alerts(settings, since_hours=hours_back, limit=500)
+            if cursor_ts is not None:
+                recent = [a for a in recent if parse_ts(a.get("ts")) > cursor_ts]
+            recent = [a for a in recent if a.get("alert_type") != "HEALTH_DEGRADED"]
+
+            if recent:
+                groups = group_alerts(recent)
+                blocks, fallback_text = format_slack_blocks(groups)
+                success = await post_to_openclaw(settings, fallback_text, blocks=blocks)
+                if success:
+                    max_ts = max(
+                        (parse_ts(a.get("ts")) for a in recent), default=None
+                    )
+                    if max_ts is not None:
+                        cursor_path.write_text(max_ts.isoformat())
+                    sent_count = len(groups)
+                    log.info("Slack notification sent", groups=sent_count)
+                else:
+                    log.warning("Slack notification failed")
+
+        # Update Slack canvas with current deal rundown
+        canvas_deals = 0
+        if settings.slack_bot_token and snapshot_count > 0:
+            try:
+                from hd.notifiers.canvas import run_canvas_update
+                _, canvas_deals = await run_canvas_update(settings)
+                log.info("Canvas updated", deals=canvas_deals)
+            except Exception as e:
+                log.warning("Canvas update failed", error=str(e))
+
+        await close_db()
+        return product_count, snapshot_count, alert_count, sent_count, canvas_deals, effective_mode
+
+    products, snapshots, alerts_count, sent, canvas_deals, effective_mode = _run(_run_once())
+    msg = f"[green]Pipeline complete ({effective_mode}): "
+    if products:
+        msg += f"{products} products, "
+    msg += f"{snapshots} snapshots, {alerts_count} alerts."
+    if sent:
+        msg += f" Sent {sent} group(s) to Slack."
+    if canvas_deals:
+        msg += f" Canvas: {canvas_deals} deal(s)."
+    msg += "[/green]"
+    console.print(msg)
+
+
+@app.command()
+def catch_up(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be created without writing"),
+) -> None:
+    """One-time scan: alert on anything currently ≥50% off or in Special Buys that has never been alerted."""
+    setup_logging()
+    settings = Settings()
+
+    async def _catch_up():
+        from hd.db.base import init_db as _init_tables, close_db
+        from hd.pipeline.diff import run_catch_up
+        from hd.pipeline.alerts import write_alerts
+
+        await _init_tables(settings)
+        alerts_list = await run_catch_up(settings=settings)
+
+        if dry_run:
+            await close_db()
+            return alerts_list, 0
+
+        written = 0
+        if alerts_list:
+            written = await write_alerts(settings=settings, alerts=alerts_list)
+        await close_db()
+        return alerts_list, written
+
+    alerts_list, written = _run(_catch_up())
+
+    if not alerts_list:
+        console.print("[yellow]No catch-up alerts needed — everything is already covered.[/yellow]")
+        return
+
+    if dry_run:
+        table = Table(title="Catch-up Alerts (dry run)")
+        table.add_column("Store", style="green")
+        table.add_column("Item", style="white")
+        table.add_column("Type", style="magenta")
+        table.add_column("Severity", style="red")
+        table.add_column("Details", style="dim")
+
+        for a in alerts_list:
+            payload = a.payload or {}
+            after = payload.get("after", {})
+            if a.alert_type == AlertType.DEEP_DISCOUNT:
+                details = f"{payload.get('percentage_off', '?')}% off @ ${after.get('price_value', '?')}"
+            elif a.alert_type == AlertType.SPECIAL_BUY:
+                details = f"Special Buy @ ${after.get('price_value', '?')}"
+            elif a.alert_type == AlertType.IN_STORE_CLEARANCE:
+                cl = payload.get("clearance_value", "?")
+                pct = payload.get("clearance_percentage_off", "?")
+                details = f"In-store ${cl} ({pct}% off)"
+            else:
+                details = payload.get("product_title", "")[:40]
+            table.add_row(a.store_id, a.item_id, a.alert_type.value, a.severity.value, details)
+
+        console.print(table)
+        console.print(f"\n[cyan]{len(alerts_list)} alert(s) would be created. Run without --dry-run to persist.[/cyan]")
+    else:
+        console.print(f"[green]Catch-up complete: {written} alerts created.[/green]")
 
 
 @app.command()
@@ -274,6 +416,10 @@ def alerts(
         elif row.alert_type.value == "CLEARANCE":
             pct = payload.get("after", {}).get("percentage_off", "?")
             details = f"{pct}% off"
+        elif row.alert_type.value == "IN_STORE_CLEARANCE":
+            cl = payload.get("clearance_value", "?")
+            pct = payload.get("clearance_percentage_off", "?")
+            details = f"${cl} ({pct}% off) in-store"
         else:
             title = payload.get("product_title", "")
             details = title[:40] if title else ""
@@ -427,7 +573,7 @@ def notify(
         from hd.db.base import init_db as _init_tables, close_db
         from hd.dashboard.queries import get_alerts
         from hd.grouping import group_alerts
-        from hd.notifiers.formatter import format_slack_message
+        from hd.notifiers.formatter import format_slack_message, format_slack_blocks
         from hd.notifiers.webhook import post_to_openclaw
 
         await _init_tables(settings)
@@ -442,9 +588,9 @@ def notify(
         alerts_list = await get_alerts(settings, since_hours=hours_back, limit=500)
 
         # Filter to alerts after cursor_ts
-        if cursor_ts is not None:
-            from hd.grouping import parse_ts
+        from hd.grouping import parse_ts
 
+        if cursor_ts is not None:
             alerts_list = [
                 a for a in alerts_list
                 if parse_ts(a.get("ts")) > cursor_ts
@@ -461,7 +607,8 @@ def notify(
             return 0, None, None
 
         groups = group_alerts(alerts_list)
-        message = format_slack_message(groups)
+        blocks, fallback_text = format_slack_blocks(groups)
+        plain_message = format_slack_message(groups)
 
         # Find max timestamp for cursor update
         max_ts = max(
@@ -470,17 +617,17 @@ def notify(
         )
 
         if dry_run:
-            console.print(message)
+            console.print(plain_message)
             await close_db()
             return len(groups), max_ts, True
 
-        # Validate webhook is configured
-        if not settings.openclaw_webhook_url:
-            console.print("[red]OPENCLAW_WEBHOOK_URL not set. Use --dry-run to preview.[/red]")
+        # Validate Slack token is configured
+        if not settings.slack_bot_token:
+            console.print("[red]SLACK_BOT_TOKEN not set. Use --dry-run to preview.[/red]")
             await close_db()
             return len(groups), max_ts, False
 
-        success = await post_to_openclaw(settings, message)
+        success = await post_to_openclaw(settings, fallback_text, blocks=blocks)
         await close_db()
         return len(groups), max_ts, success
 
@@ -501,6 +648,41 @@ def notify(
         console.print(f"[green]Sent {group_count} alert group(s) to Slack.[/green]")
     else:
         console.print("[red]Webhook delivery failed. Cursor not updated.[/red]")
+
+
+@app.command()
+def canvas_update(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print markdown without sending to Slack"),
+    reset: bool = typer.Option(False, "--reset", help="Delete canvas ID file and create a new canvas"),
+) -> None:
+    """Update the Slack canvas with current deal rundown per store."""
+    from pathlib import Path
+
+    setup_logging()
+    settings = Settings()
+
+    if reset:
+        canvas_path = Path(settings.canvas_id_path)
+        if canvas_path.exists():
+            canvas_path.unlink()
+            console.print("[yellow]Canvas ID reset — will create a new canvas.[/yellow]")
+
+    async def _canvas_update():
+        from hd.db.base import init_db as _init_tables, close_db
+        from hd.notifiers.canvas import run_canvas_update
+
+        await _init_tables(settings)
+        markdown, deal_count = await run_canvas_update(settings, dry_run=dry_run)
+        await close_db()
+        return markdown, deal_count
+
+    markdown, deal_count = _run(_canvas_update())
+
+    if dry_run:
+        console.print(markdown)
+        console.print(f"\n[cyan]--- Dry run: {deal_count} deal(s) across all stores ---[/cyan]")
+    else:
+        console.print(f"[green]Canvas updated with {deal_count} deal(s).[/green]")
 
 
 @app.command()

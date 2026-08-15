@@ -24,12 +24,17 @@ def parse_products(raw_response: dict[str, Any]) -> list[NormalizedProduct]:
             continue
         try:
             identifiers = item.get("identifiers") or {}
+            media = item.get("media") or {}
+            images = media.get("images") or []
+            raw_url = images[0].get("url") if images else None
+            image_url = raw_url.replace("<SIZE>", "600") if raw_url else None
             products.append(NormalizedProduct(
                 item_id=item.get("itemId", ""),
                 brand=identifiers.get("brandName"),
                 title=identifiers.get("productLabel"),
                 canonical_url=identifiers.get("canonicalUrl"),
                 model_number=identifiers.get("modelNumber"),
+                image_url=image_url,
             ))
         except (AttributeError, TypeError):
             continue
@@ -63,8 +68,13 @@ def parse_snapshots(
 
             pricing = item.get("pricing") or {}
             promotion = pricing.get("promotion") or {}
+            clearance = pricing.get("clearance") or {}
 
             inventory = _extract_inventory(item, store_id)
+
+            # Normalize: infer isInStock from quantity when the API omits it
+            if inventory and inventory.get("isInStock") is None and inventory.get("quantity") is not None:
+                inventory["isInStock"] = inventory["quantity"] > 0
 
             snapshots.append(NormalizedSnapshot(
                 item_id=item_id,
@@ -78,6 +88,9 @@ def parse_snapshots(
                 dollar_off=_safe_float(promotion.get("dollarOff")),
                 percentage_off=_safe_int(promotion.get("percentageOff")),
                 special_buy=_safe_bool(pricing.get("specialBuy")),
+                clearance_value=_safe_float(clearance.get("value")),
+                clearance_dollar_off=_safe_float(clearance.get("dollarOff")),
+                clearance_percentage_off=_safe_int(clearance.get("percentageOff")),
                 inventory_qty=inventory.get("quantity") if inventory else None,
                 in_stock=inventory.get("isInStock") if inventory else None,
                 limited_qty=inventory.get("isLimitedQuantity") if inventory else None,
@@ -91,7 +104,15 @@ def parse_snapshots(
 
 
 def _extract_inventory(item: dict, store_id: str) -> dict | None:
-    """Navigate the fulfillment path to find inventory for a specific store."""
+    """Navigate the fulfillment path to find inventory for a specific store.
+
+    Prefers BOPIS (buy-online-pickup-in-store) which reflects actual on-shelf
+    store inventory, over BOSS (buy-online-ship-to-store) which reports
+    warehouse/fulfillment center quantities.
+    """
+    store_id_str = str(store_id)
+    # Collect all matching inventory entries keyed by service type
+    candidates: dict[str, dict] = {}
     try:
         fulfillment = item.get("fulfillment") or {}
         options = fulfillment.get("fulfillmentOptions") or []
@@ -102,14 +123,53 @@ def _extract_inventory(item: dict, store_id: str) -> dict | None:
             for service in services:
                 if service is None:
                     continue
+                svc_type = (service.get("type") or "").lower()
                 locations = service.get("locations") or []
                 for location in locations:
                     if location is None:
                         continue
-                    if str(location.get("locationId", "")) == str(store_id):
-                        return location.get("inventory") or {}
+                    if str(location.get("locationId", "")) == store_id_str:
+                        inv = location.get("inventory") or {}
+                        if svc_type not in candidates:
+                            candidates[svc_type] = inv
     except (AttributeError, TypeError):
         pass
+
+    if not candidates:
+        return None
+
+    # BOPIS entry existence = item is assorted to this store's shelves.
+    # Without BOPIS, express delivery reflects delivery capability, not physical presence.
+    if "bopis" in candidates:
+        bopis_inv = candidates["bopis"]
+        # BOPIS in stock → real shelf inventory
+        if not bopis_inv.get("isOutOfStock"):
+            return bopis_inv
+        # BOPIS OOS but express delivery has stock → clearance item that can't
+        # be bought online but is physically present at the store
+        if "express delivery" in candidates:
+            return candidates["express delivery"]
+        return bopis_inv
+
+    # No BOPIS = item not assorted to this store's shelves.
+    # Express delivery / BOSS without BOPIS are delivery-only — not on-shelf stock.
+    # Mark as OOS to avoid false "in stock" signals.
+    for fallback_type in ("express delivery", "boss"):
+        if fallback_type in candidates:
+            inv = dict(candidates[fallback_type])
+            inv["isInStock"] = False
+            inv["isOutOfStock"] = True
+            inv["quantity"] = None
+            return inv
+
+    # Fallback to whatever we found, marked as OOS
+    if candidates:
+        inv = dict(next(iter(candidates.values())))
+        inv["isInStock"] = False
+        inv["isOutOfStock"] = True
+        inv["quantity"] = None
+        return inv
+
     return None
 
 

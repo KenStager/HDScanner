@@ -28,8 +28,11 @@ class AlertType(str, enum.Enum):
     PRICE_DROP = "PRICE_DROP"
     CLEARANCE = "CLEARANCE"
     SPECIAL_BUY = "SPECIAL_BUY"
+    DEEP_DISCOUNT = "DEEP_DISCOUNT"
+    PRICING_ERROR = "PRICING_ERROR"
     BACK_IN_STOCK = "BACK_IN_STOCK"
     OOS = "OOS"
+    IN_STORE_CLEARANCE = "IN_STORE_CLEARANCE"
     HEALTH_DEGRADED = "HEALTH_DEGRADED"
 
 
@@ -47,6 +50,7 @@ class Product(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_seen_ts: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc)
     )
@@ -88,6 +92,9 @@ class StoreSnapshot(Base):
     dollar_off: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     percentage_off: Mapped[int | None] = mapped_column(Integer, nullable=True)
     special_buy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    clearance_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    clearance_dollar_off: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    clearance_percentage_off: Mapped[int | None] = mapped_column(Integer, nullable=True)
     inventory_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
     in_stock: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     limited_qty: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

@@ -92,6 +92,102 @@ class TestParseSnapshots:
         assert snapshots == []
 
 
+class TestBossOnlyInventory:
+    """BOSS-only items should be marked OOS — HD shows them as unavailable."""
+
+    def test_boss_only_reports_out_of_stock(self):
+        """Item with only BOSS fulfillment (no BOPIS/express) should be OOS."""
+        response = {
+            "data": {
+                "searchModel": {
+                    "products": [
+                        {
+                            "itemId": "333177561",
+                            "identifiers": {"brandName": "Milwaukee", "modelNumber": "TEST-BOSS"},
+                            "media": {"images": [{"url": "https://example.com/img.jpg"}]},
+                            "pricing": {"value": 99.00},
+                            "fulfillment": {
+                                "fulfillmentOptions": [
+                                    {
+                                        "services": [
+                                            {
+                                                "type": "boss",
+                                                "locations": [
+                                                    {
+                                                        "locationId": "2619",
+                                                        "type": "online",
+                                                        "inventory": {
+                                                            "isOutOfStock": False,
+                                                            "isInStock": True,
+                                                            "isLimitedQuantity": False,
+                                                            "isUnavailable": False,
+                                                            "quantity": 1,
+                                                        },
+                                                    }
+                                                ],
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+        snapshots = parse_snapshots(response, "2619")
+        assert len(snapshots) == 1
+        s = snapshots[0]
+        assert s.in_stock is False
+        assert s.out_of_stock is True
+        assert s.inventory_qty is None
+
+
+class TestClearanceParsing:
+    """Tests for in-store clearance field parsing."""
+
+    def test_parses_clearance_fields(self, sample_response):
+        """M12 Stubby fixture has clearance pricing."""
+        snapshots = parse_snapshots(sample_response, "2619")
+        s = snapshots[1]  # M12 Stubby with clearance
+        assert s.clearance_value == 99.00
+        assert s.clearance_dollar_off == 60.00
+        assert s.clearance_percentage_off == 38
+
+    def test_clearance_null_when_absent(self, sample_response):
+        """M18 FUEL has no clearance object."""
+        snapshots = parse_snapshots(sample_response, "2619")
+        s = snapshots[0]  # M18 FUEL — has promotion but no clearance
+        assert s.clearance_value is None
+        assert s.clearance_dollar_off is None
+        assert s.clearance_percentage_off is None
+
+    def test_clearance_null_for_packout(self, sample_response):
+        """PACKOUT box has no clearance."""
+        snapshots = parse_snapshots(sample_response, "2619")
+        s = snapshots[2]  # PACKOUT — no clearance
+        assert s.clearance_value is None
+
+
+class TestBopisOosFallback:
+    """When BOPIS is OOS but express delivery has stock, prefer express delivery."""
+
+    def test_bopis_oos_uses_express_delivery(self, sample_response):
+        """M12 Stubby fixture: BOPIS OOS + express delivery in stock."""
+        snapshots = parse_snapshots(sample_response, "2619")
+        s = snapshots[1]  # M12 Stubby with split inventory
+        assert s.in_stock is True
+        assert s.inventory_qty == 3
+        assert s.out_of_stock is False
+
+    def test_bopis_in_stock_still_preferred(self, sample_response):
+        """M18 FUEL fixture: BOPIS in stock should be used."""
+        snapshots = parse_snapshots(sample_response, "2619")
+        s = snapshots[0]
+        assert s.in_stock is True
+        assert s.inventory_qty == 12
+
+
 class TestMatchesProductLine:
     def test_matches_m18_in_title(self):
         p = NormalizedProduct(item_id="1", title="Milwaukee M18 FUEL Impact", model_number="2767-20")

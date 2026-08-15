@@ -10,7 +10,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 SEVERITY_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
-GROUP_WINDOW_MINUTES: int = 10
+GROUP_WINDOW_MINUTES: int = 1440  # 24 hours
 
 
 def parse_ts(ts: datetime | str | None) -> datetime:
@@ -62,7 +62,7 @@ def build_group(store_alerts: list[dict]) -> dict:
 
 
 def group_alerts(alerts_list: list[dict]) -> list[dict]:
-    """Group alerts by (item_id, alert_type) within a 10-minute window.
+    """Group alerts by (item_id, alert_type) within a 24-hour window.
 
     Returns a list of *group* dicts (one per group), sorted most-recent first.
     """

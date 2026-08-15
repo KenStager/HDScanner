@@ -281,6 +281,7 @@ async def get_product_detail(
                 "title": product.title,
                 "model_number": product.model_number,
                 "canonical_url": product.canonical_url,
+                "image_url": product.image_url,
                 "first_seen_ts": product.first_seen_ts,
                 "last_seen_ts": product.last_seen_ts,
             },
@@ -323,7 +324,7 @@ async def get_alerts(
     """Return alerts with optional filters, joined with product title."""
     async with get_session(settings) as session:
         stmt = (
-            select(Alert, Product.title.label("product_title"))
+            select(Alert, Product.title.label("product_title"), Product.image_url.label("product_image_url"))
             .outerjoin(Product, Alert.item_id == Product.item_id)
         )
 
@@ -353,19 +354,22 @@ async def get_alerts(
         result = await session.execute(stmt)
         rows = result.all()
 
-        return [
-            {
+        alerts_out = []
+        for row in rows:
+            payload = row.Alert.payload or {}
+            if row.product_image_url and not payload.get("image_url"):
+                payload = {**payload, "image_url": row.product_image_url}
+            alerts_out.append({
                 "id": row.Alert.id,
                 "ts": row.Alert.ts,
                 "store_id": row.Alert.store_id,
                 "item_id": row.Alert.item_id,
                 "alert_type": row.Alert.alert_type.value,
                 "severity": row.Alert.severity.value,
-                "payload": row.Alert.payload,
+                "payload": payload,
                 "product_title": row.product_title,
-            }
-            for row in rows
-        ]
+            })
+        return alerts_out
 
 
 async def get_store_summary(settings: Settings) -> list[dict[str, Any]]:

@@ -1,4 +1,4 @@
-"""POST formatted alerts to an OpenClaw webhook via curl subprocess."""
+"""POST formatted alerts to Slack via chat.postMessage API."""
 
 from __future__ import annotations
 
@@ -11,32 +11,44 @@ from hd.logging import get_logger
 
 log = get_logger("notifiers.webhook")
 
+SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
-async def post_to_openclaw(settings: Settings, message: str) -> bool:
-    """Send a Slack message via OpenClaw webhook. Returns True on success."""
-    url = settings.openclaw_webhook_url
-    if not url:
-        log.warning("openclaw_webhook_url is not configured")
+
+async def post_to_openclaw(
+    settings: Settings,
+    message: str,
+    blocks: list[dict] | None = None,
+) -> bool:
+    """Send a Slack message via chat.postMessage. Returns True on success."""
+    token = settings.slack_bot_token
+    if not token:
+        log.warning("SLACK_BOT_TOKEN is not configured")
         return False
 
-    body = {
-        "message": message,
-        "deliver": True,
-        "channel": "slack",
-    }
-    if settings.slack_channel_id:
-        body["to"] = settings.slack_channel_id
+    channel = settings.slack_channel_id
+    if not channel:
+        log.warning("SLACK_CHANNEL_ID is not configured")
+        return False
 
-    body_json = json.dumps(body)
+    payload: dict = {
+        "channel": channel,
+        "text": message,
+        "unfurl_links": False,
+    }
+    if blocks:
+        payload["blocks"] = blocks
+
+    body = json.dumps(payload)
 
     cmd_parts = [
-        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+        "curl", "-s", "-w", "\n%{http_code}",
         "-X", "POST",
-        "-H", "Content-Type: application/json",
+        "-H", "Content-Type: application/json; charset=utf-8",
+        "-H", f"Authorization: Bearer {token}",
+        "-d", body,
+        "--max-time", "10",
+        SLACK_API_URL,
     ]
-    if settings.openclaw_token:
-        cmd_parts.extend(["-H", f"x-openclaw-token: {settings.openclaw_token}"])
-    cmd_parts.extend(["-d", body_json, "--max-time", "10", url])
 
     cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
 
@@ -47,17 +59,30 @@ async def post_to_openclaw(settings: Settings, message: str) -> bool:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        status_code = stdout.decode().strip()
+        output = stdout.decode().strip()
+        lines = output.rsplit("\n", 1)
+        response_body = lines[0] if len(lines) > 1 else ""
+        status_code = lines[-1]
 
         if status_code.startswith("2"):
-            log.info("Webhook delivered", status=status_code)
-            return True
+            # Check Slack API ok field
+            try:
+                result = json.loads(response_body)
+                if result.get("ok"):
+                    log.info("Slack message delivered", channel=channel)
+                    return True
+                else:
+                    log.warning("Slack API error", error=result.get("error", "unknown"))
+                    return False
+            except json.JSONDecodeError:
+                log.warning("Slack response not JSON", body=response_body[:200])
+                return False
         else:
-            log.warning("Webhook failed", status=status_code, stderr=stderr.decode().strip())
+            log.warning("Slack POST failed", status=status_code, stderr=stderr.decode().strip())
             return False
     except asyncio.TimeoutError:
-        log.warning("Webhook timed out")
+        log.warning("Slack POST timed out")
         return False
     except Exception as exc:
-        log.warning("Webhook error", error=str(exc))
+        log.warning("Slack POST error", error=str(exc))
         return False
