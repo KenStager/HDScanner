@@ -67,6 +67,58 @@ def _reference_price(
     return ref
 
 
+def clearance_purchasable(snap: StoreSnapshot) -> bool:
+    """Whether an in-store clearance deal can actually be had.
+
+    True when the item is on the local shelf, or when the online price is at
+    (or below) the clearance price so it can be bought without shelf stock.
+    Items OOS locally whose clearance price exists only in-store (e.g.
+    ship-to-store listings still at full online price) are not actionable —
+    alerting on them is noise.
+    """
+    if snap.in_stock or (snap.inventory_qty or 0) > 0:
+        return True
+    if snap.price_value is not None and snap.clearance_value is not None:
+        return float(snap.price_value) <= float(snap.clearance_value)
+    return False
+
+
+async def _load_dismissals(settings: Settings) -> dict[tuple[str, str], float | None]:
+    """Map of (store_id, item_id) -> dismissed price for user-dismissed deals."""
+    from hd.db.models import DismissedDeal
+
+    async with get_session(settings) as session:
+        rows = (await session.execute(select(DismissedDeal))).scalars().all()
+    return {
+        (d.store_id, d.item_id): float(d.dismissed_value) if d.dismissed_value is not None else None
+        for d in rows
+    }
+
+
+def _drop_dismissed(
+    alerts: list[Alert],
+    dismissals: dict[tuple[str, str], float | None],
+) -> list[Alert]:
+    """Drop IN_STORE_CLEARANCE alerts the user has marked as not real.
+
+    A dismissal keeps suppressing while the clearance price stays at or above
+    the price it was dismissed at; a deeper price is a new deal and alerts.
+    """
+    if not dismissals:
+        return alerts
+    kept = []
+    for a in alerts:
+        if a.alert_type == AlertType.IN_STORE_CLEARANCE:
+            key = (a.store_id, a.item_id)
+            if key in dismissals:
+                dismissed_value = dismissals[key]
+                current = (a.payload or {}).get("clearance_value")
+                if dismissed_value is None or current is None or current >= dismissed_value:
+                    continue
+        kept.append(a)
+    return kept
+
+
 async def run_catch_up(settings: Settings) -> list[Alert]:
     """One-time state-based scan: alert on anything currently ≥50% off or in
     Special Buys that has never had an alert of that type.
@@ -225,10 +277,10 @@ async def run_catch_up(settings: Settings) -> list[Alert]:
                         ))
                         existing_alerts.add(key)
 
-            # IN_STORE_CLEARANCE — catch up on items with clearance pricing
-            # Require inventory signal to suppress phantom clearance on unstocked items
-            has_inv = snap.in_stock is not None or snap.inventory_qty is not None
-            if snap.clearance_value is not None and has_inv:
+            # IN_STORE_CLEARANCE — catch up on items with clearance pricing.
+            # Only when the deal is actually obtainable (on shelf, or priced
+            # online at the clearance value) — see clearance_purchasable.
+            if snap.clearance_value is not None and clearance_purchasable(snap):
                 key = (snap.store_id, snap.item_id, AlertType.IN_STORE_CLEARANCE)
                 if key not in existing_alerts:
                     alerts.append(Alert(
@@ -247,6 +299,7 @@ async def run_catch_up(settings: Settings) -> list[Alert]:
                     ))
                     existing_alerts.add(key)
 
+    alerts = _drop_dismissed(alerts, await _load_dismissals(settings))
     log.info("Catch-up complete", snapshots=len(latest_snapshots), alerts=len(alerts))
     return alerts
 
@@ -364,6 +417,7 @@ async def run_diff(settings: Settings) -> list[Alert]:
 
             alerts.extend(pair_alerts)
 
+    alerts = _drop_dismissed(alerts, await _load_dismissals(settings))
     log.info("Diff complete", pairs=len(pairs), alerts=len(alerts))
     return alerts
 
@@ -428,9 +482,8 @@ def _cold_start_check(
                 payload=payload,
             ))
 
-    # Cold-start in-store clearance (require inventory signal)
-    has_inventory_signal = curr.in_stock is not None or curr.inventory_qty is not None
-    if curr.clearance_value is not None and has_inventory_signal:
+    # Cold-start in-store clearance — only when the deal is obtainable
+    if curr.clearance_value is not None and clearance_purchasable(curr):
         alerts.append(Alert(
             ts=now,
             store_id=curr.store_id,
@@ -710,10 +763,10 @@ def _diff_snapshots(
                     },
                 ))
 
-    # IN_STORE_CLEARANCE — clearance pricing appeared or deepened
-    # Require inventory signal to suppress phantom clearance on unstocked items
-    has_inventory_signal = curr.in_stock is not None or curr.inventory_qty is not None
-    if curr.clearance_value is not None and has_inventory_signal:
+    # IN_STORE_CLEARANCE — clearance pricing appeared or deepened.
+    # Only when the deal is obtainable (on shelf, or priced online at the
+    # clearance value); OOS-local + in-store-only pricing is unactionable noise.
+    if curr.clearance_value is not None and clearance_purchasable(curr):
         prev_cl = prev.clearance_value
         cl_payload = {
             **base_payload,

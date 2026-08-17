@@ -10,7 +10,7 @@ import pytest_asyncio
 
 from hd.config import Settings
 from hd.db.base import Database
-from hd.db.models import StoreSnapshot, Product, AlertType, Severity
+from hd.db.models import Alert, StoreSnapshot, Product, AlertType, Severity
 from hd.pipeline.diff import _diff_snapshots, _is_combo_kit, _cold_start_check, _product_url, run_diff
 
 
@@ -602,6 +602,81 @@ class TestInStoreClearance:
         cl_alerts = [a for a in alerts if a.alert_type == AlertType.IN_STORE_CLEARANCE]
         assert len(cl_alerts) == 0
 
+    def test_oos_locally_and_not_purchasable_online_suppressed(self):
+        """OOS locally + clearance price only in-store → no alert (unactionable)."""
+        prev = _make_snapshot(clearance_value=None)
+        curr = _make_snapshot(
+            id=2,
+            price_value=Decimal("299.00"),      # online still full price
+            clearance_value=Decimal("150.00"),
+            in_stock=False,
+            out_of_stock=True,
+            inventory_qty=None,
+        )
+        alerts = _diff_snapshots(prev, curr, _make_product())
+        cl_alerts = [a for a in alerts if a.alert_type == AlertType.IN_STORE_CLEARANCE]
+        assert len(cl_alerts) == 0
+
+    def test_oos_locally_but_online_price_at_clearance_alerts(self):
+        """OOS locally but online price matches the clearance price → purchasable online, alert."""
+        prev = _make_snapshot(clearance_value=None)
+        curr = _make_snapshot(
+            id=2,
+            price_value=Decimal("150.00"),      # online price reflects clearance
+            clearance_value=Decimal("150.00"),
+            in_stock=False,
+            out_of_stock=True,
+            inventory_qty=None,
+        )
+        alerts = _diff_snapshots(prev, curr, _make_product())
+        cl_alerts = [a for a in alerts if a.alert_type == AlertType.IN_STORE_CLEARANCE]
+        assert len(cl_alerts) == 1
+
+    def test_oos_but_partial_online_discount_still_suppressed(self):
+        """Online discounted, but not to the clearance price → clearance still unobtainable, no alert."""
+        prev = _make_snapshot(clearance_value=None)
+        curr = _make_snapshot(
+            id=2,
+            price_value=Decimal("79.00"),       # online discount exists...
+            price_original=Decimal("119.00"),
+            clearance_value=Decimal("22.00"),   # ...but the $22 clearance is in-store only
+            in_stock=False,
+            out_of_stock=True,
+            inventory_qty=None,
+        )
+        alerts = _diff_snapshots(prev, curr, _make_product())
+        cl_alerts = [a for a in alerts if a.alert_type == AlertType.IN_STORE_CLEARANCE]
+        assert len(cl_alerts) == 0
+
+    def test_in_stock_locally_alerts_regardless_of_online_price(self):
+        """Shelf stock present → alert even though clearance is in-store only."""
+        prev = _make_snapshot(clearance_value=None)
+        curr = _make_snapshot(
+            id=2,
+            price_value=Decimal("299.00"),
+            clearance_value=Decimal("150.00"),
+            in_stock=True,
+            inventory_qty=1,
+        )
+        alerts = _diff_snapshots(prev, curr, _make_product())
+        cl_alerts = [a for a in alerts if a.alert_type == AlertType.IN_STORE_CLEARANCE]
+        assert len(cl_alerts) == 1
+
+    def test_no_inventory_signal_suppressed_unless_online_reflects(self):
+        """No inventory data at all → suppressed when online price is still full."""
+        prev = _make_snapshot(clearance_value=None)
+        curr = _make_snapshot(
+            id=2,
+            price_value=Decimal("299.00"),
+            clearance_value=Decimal("150.00"),
+            in_stock=None,
+            out_of_stock=None,
+            inventory_qty=None,
+        )
+        alerts = _diff_snapshots(prev, curr, _make_product())
+        cl_alerts = [a for a in alerts if a.alert_type == AlertType.IN_STORE_CLEARANCE]
+        assert len(cl_alerts) == 0
+
 
 class TestColdStartClearance:
     """Tests for cold-start IN_STORE_CLEARANCE detection."""
@@ -713,3 +788,41 @@ class TestProductUrl:
         for alert in alerts:
             assert alert.payload.get("product_url") is not None
             assert "homedepot.com" in alert.payload["product_url"]
+
+
+class TestDismissedAlertSuppression:
+    def test_dismissed_at_same_price_suppressed(self):
+        from hd.pipeline.diff import _drop_dismissed
+
+        alert = Alert(
+            store_id="2619", item_id="303229042",
+            alert_type=AlertType.IN_STORE_CLEARANCE, severity=Severity.HIGH,
+            ts=datetime.now(timezone.utc),
+            payload={"clearance_value": 175.0},
+        )
+        kept = _drop_dismissed([alert], {("2619", "303229042"): 175.0})
+        assert kept == []
+
+    def test_deeper_price_alerts_again(self):
+        from hd.pipeline.diff import _drop_dismissed
+
+        alert = Alert(
+            store_id="2619", item_id="303229042",
+            alert_type=AlertType.IN_STORE_CLEARANCE, severity=Severity.HIGH,
+            ts=datetime.now(timezone.utc),
+            payload={"clearance_value": 120.0},
+        )
+        kept = _drop_dismissed([alert], {("2619", "303229042"): 175.0})
+        assert kept == [alert]
+
+    def test_other_alert_types_untouched(self):
+        from hd.pipeline.diff import _drop_dismissed
+
+        alert = Alert(
+            store_id="2619", item_id="303229042",
+            alert_type=AlertType.PRICE_DROP, severity=Severity.MEDIUM,
+            ts=datetime.now(timezone.utc),
+            payload={},
+        )
+        kept = _drop_dismissed([alert], {("2619", "303229042"): 175.0})
+        assert kept == [alert]

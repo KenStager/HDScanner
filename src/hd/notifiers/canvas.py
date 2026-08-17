@@ -10,7 +10,7 @@ import asyncio
 import json
 import shlex
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -84,13 +84,34 @@ async def get_active_deals(settings: Settings) -> dict[str, list[dict[str, Any]]
                     StoreSnapshot.item_id == first_price_sub.c.item_id,
                 ),
             )
-            .where(StoreSnapshot.clearance_value.isnot(None))
+            .where(
+                StoreSnapshot.clearance_value.isnot(None),
+                # Freshness: items unseen by recent scans left the catalog
+                StoreSnapshot.ts
+                >= datetime.now(timezone.utc)
+                - timedelta(hours=settings.deal_freshness_hours),
+            )
         )
-        clearance_rows = clearance_result.all()
+        # Same actionability rule as alerting: drop deals that are OOS locally
+        # with a clearance price not purchasable online — and deals the user
+        # dismissed as not real (they resurface only if the price gets deeper).
+        from hd.pipeline.diff import _load_dismissals, clearance_purchasable
+        dismissals = await _load_dismissals(settings)
+
+        def _dismissed(snap) -> bool:
+            key = (snap.store_id, snap.item_id)
+            if key not in dismissals:
+                return False
+            dv = dismissals[key]
+            return dv is None or snap.clearance_value is None or float(snap.clearance_value) >= dv
+
+        clearance_rows = [
+            row for row in clearance_result.all()
+            if clearance_purchasable(row[0]) and not _dismissed(row[0])
+        ]
 
         # ── Prong 2: Online deals (validated by recent alerts) ───────────
         # Get (store_id, item_id) pairs with deal alerts in the last 7 days
-        from datetime import timedelta
         alert_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
         _online_types = {
             AlertType.PRICE_DROP,

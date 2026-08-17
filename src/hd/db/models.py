@@ -114,3 +114,28 @@ class Alert(Base):
     alert_type: Mapped[AlertType] = mapped_column(Enum(AlertType), nullable=False)
     severity: Mapped[Severity] = mapped_column(Enum(Severity), nullable=False)
     payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class DismissedDeal(Base):
+    """A deal the user marked as not real (phantom clearance, bad data).
+
+    One row per (store_id, item_id); item_id-scope uses store_id "online" for
+    the online tab. dismissed_value records the deal price at dismissal time —
+    the deal stays hidden while the current price is at or above it, and
+    resurfaces automatically if the deal later gets deeper.
+    """
+
+    __tablename__ = "dismissed_deals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    store_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    item_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    dismissed_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    __table_args__ = (
+        Index("ix_dismissed_store_item", "store_id", "item_id", unique=True),
+    )
