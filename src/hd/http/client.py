@@ -93,7 +93,7 @@ class HDClient:
     that the HD API expects from browser-like clients.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, request_budget: int | None = None) -> None:
         self._settings = settings
         self._rate_limiter = TokenBucketRateLimiter(
             rps=settings.rate_limit_rps,
@@ -107,7 +107,9 @@ class HDClient:
         )
         self._query_cache: str | None = None
         self._request_count: int = 0
-        self._request_budget: int = settings.request_budget
+        self._request_budget: int = (
+            request_budget if request_budget is not None else settings.request_budget
+        )
         self._throttled: bool = False
         self._failures: dict[str, int] = {}
 

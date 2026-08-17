@@ -42,15 +42,42 @@ See `src/hd/config.py` for the full list of settings.
 ```
 hd init-db                             Create/migrate tables, seed configured stores
 hd add-store <id> [--name] [--state]   Add a store to the database
-hd discover [--brand] [--pages]        Populate products table from HD API
-hd snapshot [--stores] [--limit]       Fetch pricing/inventory snapshots
-hd run-once                            Full pipeline: discover + snapshot + diff + alerts
+hd browse [--stores] [--tier]          Facet-driven brand browse: discover + snapshot by category
+hd daily-deals [--force]               Price today's Daily Deals set for configured brands
+hd discover [--brand] [--pages]        Populate products table from HD API (legacy keyword mode)
+hd snapshot [--stores] [--limit]       Fetch pricing/inventory snapshots (legacy keyword mode)
+hd run-once                            Full pipeline: browse (or discover+snapshot) + diff + alerts
 hd alerts [--limit] [--type] [--since] Print recent alerts
 hd notify [--dry-run] [--reset]        Send alerts to Slack via OpenClaw webhook
 hd health                              Print last run health status
 hd prune [--days] [--dry-run]          Delete old snapshots beyond retention period
 hd serve [--host] [--port]             Start NiceGUI web dashboard (requires dashboard extra)
 ```
+
+## Browse Mode (default scan strategy)
+
+`hd browse` (and `hd run-once` when `BROWSE_ENABLED=true`, the default) walks the
+brand's own category facets instead of keyword searches. Keyword search misses
+clearance deals structurally: HD's relevance excludes brand items outside the
+scanned category (real missed deals lived in Plumbing and Garage), and the API
+rejects `startIndex > 720`, so big result sets can't be paged to the end.
+
+Browse mode reads the `dimensions` facet block (the website's left-nav data) to
+get every category token with per-store counts, then walks each category:
+
+- **shelf tier** (`storefilter=IN_STORE` = the BOPIS "Pick Up Today" facet):
+  every item physically assorted to the store, swept fully each run.
+- **network tier** (`storefilter=ALL`): the full brand set, which also carries
+  ship-to-store (BOSS) clearance that IN_STORE hides. Categories rotate across
+  runs via `BROWSE_CURSOR_PATH`; each is covered completely when its turn comes.
+
+Both tiers upsert products and append snapshots from the same pages, so a newly
+discovered item is price-monitored the same run it's first seen. Categories over
+the 744-item API ceiling are split by subcategory facets, then price brackets;
+anything still unreachable is logged as truncated — never silently skipped.
+
+Config: `BRAND_TOKENS` (e.g. `Milwaukee:zv`, DEWALT is `4j2`), `ROOT_NAV_PARAM`,
+`BROWSE_NETWORK_CATEGORIES_PER_RUN`, `BROWSE_REQUEST_BUDGET`.
 
 ## Slack Notifications via OpenClaw
 

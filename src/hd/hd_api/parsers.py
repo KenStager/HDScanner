@@ -173,6 +173,72 @@ def _extract_inventory(item: dict, store_id: str) -> dict | None:
     return None
 
 
+def has_any_fulfillment(item: dict[str, Any] | None) -> bool | None:
+    """Whether a raw product item can be bought through any fulfillment path.
+
+    Scans every fulfillment location (ship-to-home, express delivery,
+    ship-to-store, BOPIS) for an in-stock signal. Returns False only when
+    fulfillment data exists and nothing is in stock; None when the item
+    carries no fulfillment data at all (unknown, not confirmed OOS).
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        options = (item.get("fulfillment") or {}).get("fulfillmentOptions") or []
+    except (AttributeError, TypeError):
+        return None
+    saw_location = False
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        for service in option.get("services") or []:
+            if not isinstance(service, dict):
+                continue
+            for location in service.get("locations") or []:
+                if not isinstance(location, dict):
+                    continue
+                saw_location = True
+                inv = location.get("inventory") or {}
+                if inv.get("isInStock") or (inv.get("quantity") or 0) > 0:
+                    return True
+    return False if saw_location else None
+
+
+def parse_dimensions(raw_response: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Extract facet dimensions from a searchModel response.
+
+    Returns {dimension_label: [{"label", "token", "count"}, ...]}. Refinements
+    missing a token are dropped; a missing/None count is preserved as None.
+    """
+    dimensions: dict[str, list[dict[str, Any]]] = {}
+    try:
+        raw_dims = raw_response.get("data", {}).get("searchModel", {}).get("dimensions") or []
+    except (AttributeError, TypeError):
+        return dimensions
+
+    for dim in raw_dims:
+        if not isinstance(dim, dict):
+            continue
+        label = dim.get("label")
+        if not label:
+            continue
+        refinements = []
+        for ref in dim.get("refinements") or []:
+            if not isinstance(ref, dict):
+                continue
+            token = ref.get("refinementKey")
+            if not token:
+                continue
+            refinements.append({
+                "label": ref.get("label"),
+                "token": token,
+                "count": _safe_int(ref.get("recordCount")),
+            })
+        dimensions[label] = refinements
+
+    return dimensions
+
+
 def matches_product_line(product: NormalizedProduct, filters: list[str]) -> bool:
     """Check if a product matches any of the product line filters (e.g. M12, M18)."""
     if not filters:

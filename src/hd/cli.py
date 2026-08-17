@@ -151,6 +151,67 @@ def snapshot(
 
 
 @app.command()
+def browse(
+    stores: Optional[str] = typer.Option(None, help="Comma-separated store IDs (default: config)"),
+    tier: str = typer.Option("both", help="Tier to run: shelf, network, or both"),
+) -> None:
+    """Facet-driven brand browse: discover + snapshot every brand item by category."""
+    setup_logging()
+    settings = Settings()
+
+    async def _browse():
+        from hd.db.base import init_db as _init_tables, close_db
+        from hd.pipeline.browse import run_browse
+
+        await _init_tables(settings)
+        store_ids = [s.strip() for s in stores.split(",")] if stores else settings.store_list
+        tiers = ("shelf", "network") if tier == "both" else (tier,)
+        summary = await run_browse(settings=settings, store_ids=store_ids, tiers=tiers)
+        await close_db()
+        return summary
+
+    summary = _run(_browse())
+    msg = (
+        f"[green]Browse complete: {summary.products} products, "
+        f"{summary.snapshots} snapshots across {summary.walks} walk(s)."
+    )
+    if summary.truncated_walks:
+        msg += f" [yellow]Truncated: {', '.join(summary.truncated_walks)}[/yellow]"
+    if summary.aborted:
+        msg += " [red](aborted early — throttled)[/red]"
+    msg += "[/green]"
+    console.print(msg)
+
+
+@app.command()
+def daily_deals(
+    force: bool = typer.Option(False, "--force", help="Re-process even if today's set was already swept"),
+) -> None:
+    """Price today's Daily Deals set (Special Buy of the Day) for configured brands."""
+    setup_logging()
+    settings = Settings()
+
+    async def _daily():
+        from hd.db.base import init_db as _init_tables, close_db
+        from hd.pipeline.daily_deals import run_daily_deals
+
+        await _init_tables(settings)
+        summary = await run_daily_deals(settings, force=force)
+        await close_db()
+        return summary
+
+    s = _run(_daily())
+    if s.skipped:
+        console.print("[yellow]Skipped — set already processed or page unavailable "
+                      "(use --force to re-run).[/yellow]")
+    else:
+        console.print(
+            f"[green]Daily deals ({s.end_date}): {s.items_checked} items checked, "
+            f"{s.brand_matches} brand match(es), {s.snapshots} snapshot(s).[/green]"
+        )
+
+
+@app.command()
 def run_once(
     mode: str = typer.Option("auto", help="Run mode: auto, full, snapshot-only"),
 ) -> None:
@@ -183,32 +244,66 @@ def run_once(
             hour = datetime.now(timezone.utc).hour
             effective_mode = "full" if hour == 0 else "snapshot-only"
 
-        log.info("Pipeline starting", mode=effective_mode)
+        log.info("Pipeline starting", mode=effective_mode, browse=settings.browse_enabled)
         await _init_tables(settings)
 
-        shared_client = HDClient(settings)
+        if settings.browse_enabled:
+            shared_client = HDClient(settings, request_budget=settings.browse_request_budget)
+        else:
+            shared_client = HDClient(settings)
         product_count = 0
         snapshot_count = 0
 
         try:
-            if effective_mode == "full":
-                product_count = await run_discovery(
+            if settings.browse_enabled:
+                # Facet-driven browse replaces keyword discovery + snapshots:
+                # both tiers upsert products and append snapshots per page.
+                from hd.pipeline.browse import run_browse
+
+                summary = await run_browse(
                     settings=settings,
-                    brands=settings.brand_list,
-                    max_pages=settings.max_pages,
+                    store_ids=settings.store_list,
                     client=shared_client,
                 )
-                log.info("Discovery complete", products=product_count, requests=shared_client.request_count)
+                product_count = summary.products
+                snapshot_count = summary.snapshots
+                effective_mode = "browse"
 
-                if settings.stage_delay_seconds > 0:
-                    await asyncio.sleep(settings.stage_delay_seconds)
+                # Daily Deals sweep: fires only when the day's set is new, so
+                # the 3:10 ET run prices it minutes after launch. Own client —
+                # its request budget must not compete with the browse tiers.
+                if settings.daily_deals_enabled:
+                    from hd.pipeline.daily_deals import run_daily_deals
 
-            snapshot_count = await run_snapshots(
-                settings=settings,
-                store_ids=settings.store_list,
-                client=shared_client,
-            )
-            log.info("Snapshots complete", rows=snapshot_count, requests=shared_client.request_count)
+                    dd = await run_daily_deals(settings)
+                    if not dd.skipped:
+                        product_count += dd.products
+                        snapshot_count += dd.snapshots
+                        log.info(
+                            "Daily deals swept",
+                            end_date=dd.end_date,
+                            brand_matches=dd.brand_matches,
+                            snapshots=dd.snapshots,
+                        )
+            else:
+                if effective_mode == "full":
+                    product_count = await run_discovery(
+                        settings=settings,
+                        brands=settings.brand_list,
+                        max_pages=settings.max_pages,
+                        client=shared_client,
+                    )
+                    log.info("Discovery complete", products=product_count, requests=shared_client.request_count)
+
+                    if settings.stage_delay_seconds > 0:
+                        await asyncio.sleep(settings.stage_delay_seconds)
+
+                snapshot_count = await run_snapshots(
+                    settings=settings,
+                    store_ids=settings.store_list,
+                    client=shared_client,
+                )
+            log.info("Scan complete", products=product_count, rows=snapshot_count, requests=shared_client.request_count)
         finally:
             await shared_client.close()
 

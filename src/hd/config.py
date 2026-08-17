@@ -61,6 +61,37 @@ class Settings(BaseSettings):
     scan_keywords: str = ""           # CSV of keyword groups for split scanning (e.g. "Milwaukee M18,Milwaukee M12")
     snapshot_storefilter: str = "ALL" # StoreFilter enum: "ALL", "IN_STORE", or "ONLINE"
 
+    # Facet-driven brand browse (replaces keyword scans when enabled).
+    # Keyword search excludes items outside the Tools category and drops some
+    # brand items entirely; browse mode walks the brand's own category facets.
+    browse_enabled: bool = True
+    root_nav_param: str = "N-5yc1v"           # catalog root; brand/category tokens append with Z
+    brand_tokens: str = "Milwaukee:zv"        # CSV of Brand:facet-token (DEWALT is 4j2)
+    api_max_start_index: int = 720            # API rejects startIndex > 720 ("Invalid start index range")
+    browse_network_categories_per_run: int = 3  # ALL-tier categories walked per store per run
+    browse_cursor_path: str = ".hd_browse_cursor"
+    browse_request_budget: int = 280          # replaces request_budget for browse runs
+    browse_max_split_depth: int = 3           # facet-split recursion guard
+
+    # A deal is only current if its item was seen by a recent scan. Items that
+    # drop out of the catalog stop being deals — without this, their last
+    # snapshot lingers on the boards forever at a months-old price.
+    deal_freshness_hours: int = 48
+
+    # Daily Deals sweep. The daily-deals page refreshes at 3:00 ET; its HTML
+    # embeds the day's exact itemId list (specialBuyMetadata dealType=DAY).
+    # Each run checks the page and prices the listed items when the set is new,
+    # so the 3:10 ET scheduled run captures the fresh set minutes after launch.
+    daily_deals_enabled: bool = True
+    daily_deals_url: str = "https://www.homedepot.com/daily-deals"
+    daily_deals_cursor_path: str = ".hd_dailydeals_cursor"
+    daily_deals_max_items: int = 250
+
+    # True-savings verdicts need real history: an item first seen minutes ago
+    # has a "30-day high" equal to today's price, which would wrongly label a
+    # fresh deal as "flat price". Below this age, say "no price history".
+    price_history_min_days: int = 3
+
     # Inter-keyword pacing
     keyword_pause_min_seconds: float = 3.0
     keyword_pause_max_seconds: float = 8.0
@@ -125,3 +156,13 @@ class Settings(BaseSettings):
     @property
     def scan_keyword_list(self) -> list[str]:
         return _parse_csv(self.scan_keywords)
+
+    @property
+    def brand_token_list(self) -> list[tuple[str, str]]:
+        """Parse brand_tokens CSV into (brand, facet_token) pairs, skipping malformed entries."""
+        pairs = []
+        for entry in _parse_csv(self.brand_tokens):
+            brand, sep, token = entry.partition(":")
+            if sep and brand.strip() and token.strip():
+                pairs.append((brand.strip(), token.strip()))
+        return pairs

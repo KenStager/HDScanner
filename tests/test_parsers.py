@@ -221,3 +221,44 @@ class TestMatchesProductLine:
     def test_handles_none_both(self):
         p = NormalizedProduct(item_id="1", title=None, model_number=None)
         assert matches_product_line(p, ["M12", "M18"]) is False
+
+
+class TestHasAnyFulfillment:
+    def _item(self, locations):
+        return {
+            "fulfillment": {
+                "fulfillmentOptions": [{
+                    "type": "delivery",
+                    "services": [{"type": "sth", "locations": locations}],
+                }],
+            }
+        }
+
+    def test_in_stock_location(self):
+        from hd.hd_api.parsers import has_any_fulfillment
+        item = self._item([{"locationId": "x", "inventory": {"isInStock": True}}])
+        assert has_any_fulfillment(item) is True
+
+    def test_quantity_only(self):
+        from hd.hd_api.parsers import has_any_fulfillment
+        item = self._item([{"locationId": "x", "inventory": {"quantity": 4}}])
+        assert has_any_fulfillment(item) is True
+
+    def test_all_locations_oos(self):
+        from hd.hd_api.parsers import has_any_fulfillment
+        item = self._item([
+            {"locationId": "x", "inventory": {"isInStock": False, "isOutOfStock": True}},
+            {"locationId": "y", "inventory": {"isInStock": False}},
+        ])
+        assert has_any_fulfillment(item) is False
+
+    def test_no_fulfillment_data_is_unknown(self):
+        from hd.hd_api.parsers import has_any_fulfillment
+        assert has_any_fulfillment({"fulfillment": None}) is None
+        assert has_any_fulfillment({}) is None
+        assert has_any_fulfillment(None) is None
+
+    def test_null_safe_on_malformed(self):
+        from hd.hd_api.parsers import has_any_fulfillment
+        item = {"fulfillment": {"fulfillmentOptions": [None, {"services": [None, {"locations": [None]}]}]}}
+        assert has_any_fulfillment(item) is None

@@ -25,6 +25,8 @@ hd_launchd.*.log
 hd_dashboard.*.log
 .hd_notify_cursor
 .hd_rotation_cursor
+.hd_browse_cursor
+.hd_dailydeals_cursor
 raw_responses/
 screenshots/
 *.png

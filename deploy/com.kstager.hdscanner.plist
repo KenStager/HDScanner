@@ -15,7 +15,9 @@
   <key>StartCalendarInterval</key>
   <array>
     <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <!-- 3:10 ET: Home Depot's daily deals go live at 3:00 ET — catch the new
+         set minutes after it posts instead of an hour later. -->
+    <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>10</integer></dict>
     <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
     <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
     <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
