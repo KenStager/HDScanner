@@ -15,7 +15,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from hd.config import Settings
 from hd.db.base import get_session
-from hd.db.models import Alert, AlertType, Product, Severity, Store, StoreSnapshot
+from hd.db.models import (
+    Alert,
+    AlertType,
+    DismissedDeal,
+    Product,
+    Severity,
+    Store,
+    StoreSnapshot,
+)
 
 
 def _latest_snapshots_subquery():
@@ -97,7 +105,9 @@ async def get_overview_stats(settings: Settings) -> dict[str, Any]:
             )
         ).scalar() or 0
 
-        # Clearance count: latest snapshots with savings_center == 'CLEARANCE'
+        # Clearance count: latest snapshots carrying an actionable in-store
+        # clearance price (pricing.clearance), same rule as alerting — shelf
+        # stock, or an online price at/below the clearance price.
         latest_sub = _latest_snapshots_subquery()
         clearance_count = (
             await session.execute(
@@ -111,7 +121,17 @@ async def get_overview_stats(settings: Settings) -> dict[str, Any]:
                         StoreSnapshot.ts == latest_sub.c.max_ts,
                     ),
                 )
-                .where(StoreSnapshot.savings_center == "CLEARANCE")
+                .where(
+                    StoreSnapshot.clearance_value.isnot(None),
+                    StoreSnapshot.ts
+                    >= datetime.now(timezone.utc)
+                    - timedelta(hours=settings.deal_freshness_hours),
+                    (
+                        StoreSnapshot.in_stock.is_(True)
+                        | (func.coalesce(StoreSnapshot.inventory_qty, 0) > 0)
+                        | (StoreSnapshot.price_value <= StoreSnapshot.clearance_value)
+                    ),
+                )
             )
         ).scalar() or 0
 
@@ -141,17 +161,32 @@ async def get_overview_stats(settings: Settings) -> dict[str, Any]:
             )
         ).scalar() or 0
 
-        # Health status: check for recent HEALTH_DEGRADED alert
+        # Health status reflects the present, not history:
+        #   DEGRADED — a HEALTH_DEGRADED alert fired within the last 24h
+        #   STALE    — no snapshot in the last 12h (scans should run ~4-hourly)
+        #   OK       — otherwise
         degraded = (
             await session.execute(
                 select(Alert)
-                .where(Alert.alert_type == AlertType.HEALTH_DEGRADED)
+                .where(
+                    Alert.alert_type == AlertType.HEALTH_DEGRADED,
+                    Alert.ts >= cutoff_24h,
+                )
                 .order_by(desc(Alert.ts))
                 .limit(1)
             )
         ).scalar_one_or_none()
 
-        health_status = "DEGRADED" if degraded else "HEALTHY"
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+        snapshot_ts = latest_snapshot_ts
+        if snapshot_ts is not None and snapshot_ts.tzinfo is None:
+            snapshot_ts = snapshot_ts.replace(tzinfo=timezone.utc)
+        if degraded:
+            health_status = "DEGRADED"
+        elif snapshot_ts is None or snapshot_ts < stale_cutoff:
+            health_status = "STALE"
+        else:
+            health_status = "OK"
 
     return {
         "active_products": active_products,
@@ -444,3 +479,325 @@ async def get_store_summary(settings: Settings) -> list[dict[str, Any]]:
             })
 
         return summaries
+
+
+async def get_deal_board(settings: Settings) -> dict[str, Any]:
+    """Current actionable deals per store for the Deal Board landing page.
+
+    A deal is a latest snapshot with an actionable in-store clearance price
+    (same purchasability rule as alerting). Each deal carries what the hunter
+    needs to act: image, prices, depth, stock, freshness, and the product URL.
+    first_seen_ts is the earliest snapshot that carried this clearance price,
+    so "new" means the deal is new — not the product.
+    """
+    latest_sub = _latest_snapshots_subquery()
+
+    first_deal_sub = (
+        select(
+            StoreSnapshot.store_id,
+            StoreSnapshot.item_id,
+            func.min(StoreSnapshot.ts).label("first_deal_ts"),
+        )
+        .where(StoreSnapshot.clearance_value.isnot(None))
+        .group_by(StoreSnapshot.store_id, StoreSnapshot.item_id)
+        .subquery()
+    )
+
+    async with get_session(settings) as session:
+        result = await session.execute(
+            select(
+                StoreSnapshot,
+                Product.title,
+                Product.canonical_url,
+                Product.image_url,
+                first_deal_sub.c.first_deal_ts,
+            )
+            .join(
+                latest_sub,
+                and_(
+                    StoreSnapshot.store_id == latest_sub.c.store_id,
+                    StoreSnapshot.item_id == latest_sub.c.item_id,
+                    StoreSnapshot.ts == latest_sub.c.max_ts,
+                ),
+            )
+            .outerjoin(Product, StoreSnapshot.item_id == Product.item_id)
+            .outerjoin(
+                first_deal_sub,
+                and_(
+                    StoreSnapshot.store_id == first_deal_sub.c.store_id,
+                    StoreSnapshot.item_id == first_deal_sub.c.item_id,
+                ),
+            )
+            .where(
+                StoreSnapshot.clearance_value.isnot(None),
+                # Freshness: an item unseen by recent scans left the catalog —
+                # its old clearance price is no longer a deal.
+                StoreSnapshot.ts
+                >= datetime.now(timezone.utc) - timedelta(hours=settings.deal_freshness_hours),
+                (
+                    StoreSnapshot.in_stock.is_(True)
+                    | (func.coalesce(StoreSnapshot.inventory_qty, 0) > 0)
+                    | (StoreSnapshot.price_value <= StoreSnapshot.clearance_value)
+                ),
+            )
+        )
+        rows = result.all()
+
+        store_rows = (await session.execute(select(Store))).scalars().all()
+        store_names = {s.store_id: s.name for s in store_rows if s.name}
+
+    now = datetime.now(timezone.utc)
+    deals_by_store: dict[str, list[dict[str, Any]]] = {}
+    for snap, title, canonical_url, image_url, first_deal_ts in rows:
+        clearance = float(snap.clearance_value)
+        online = float(snap.price_value) if snap.price_value is not None else None
+        pct = snap.clearance_percentage_off
+        if pct is None and online and online > 0 and clearance < online:
+            pct = round((online - clearance) / online * 100)
+        if first_deal_ts is not None and first_deal_ts.tzinfo is None:
+            first_deal_ts = first_deal_ts.replace(tzinfo=timezone.utc)
+        url = (
+            f"https://www.homedepot.com{canonical_url}"
+            if canonical_url
+            else f"https://www.homedepot.com/s/{snap.item_id}"
+        )
+        deals_by_store.setdefault(snap.store_id, []).append({
+            "item_id": snap.item_id,
+            "title": title or f"Item {snap.item_id}",
+            "url": url,
+            "image_url": image_url,
+            "clearance_value": clearance,
+            "online_price": online,
+            "pct_off": pct or 0,
+            "qty": snap.inventory_qty,
+            "in_stock": bool(snap.in_stock),
+            "first_seen_ts": first_deal_ts,
+            "is_new": bool(first_deal_ts and (now - first_deal_ts) <= timedelta(hours=24)),
+            "snapshot_ts": snap.ts,
+        })
+
+    # Every configured store gets a tab, even with zero deals — absence is data
+    for sid in settings.store_list:
+        deals_by_store.setdefault(sid, [])
+
+    # Split out user-dismissed deals (they resurface if the deal deepens)
+    dismissals = await get_dismissals(settings)
+    hidden_by_store: dict[str, list[dict[str, Any]]] = {}
+    for sid, deals in deals_by_store.items():
+        visible, hidden = [], []
+        for d in deals:
+            if _is_dismissed(dismissals, sid, d["item_id"], d["clearance_value"]):
+                hidden.append(d)
+            else:
+                visible.append(d)
+        deals_by_store[sid] = visible
+        hidden_by_store[sid] = hidden
+
+    for deals in deals_by_store.values():
+        deals.sort(key=lambda d: (-(d["pct_off"] or 0), d["title"]))
+
+    return {
+        "stores": deals_by_store,
+        "hidden": hidden_by_store,
+        "store_names": store_names,
+    }
+
+
+ONLINE_STORE_KEY = "online"
+
+
+async def get_dismissals(settings: Settings) -> dict[tuple[str, str], float | None]:
+    """Map of (store_id, item_id) -> dismissed price for all dismissed deals."""
+    async with get_session(settings) as session:
+        rows = (await session.execute(select(DismissedDeal))).scalars().all()
+    return {
+        (d.store_id, d.item_id): float(d.dismissed_value) if d.dismissed_value is not None else None
+        for d in rows
+    }
+
+
+def _is_dismissed(
+    dismissals: dict[tuple[str, str], float | None],
+    store_id: str,
+    item_id: str,
+    current_value: float | None,
+) -> bool:
+    """Hidden while the current deal price is at or above the dismissed price.
+
+    A deal that got deeper since dismissal is a new situation — it resurfaces.
+    A dismissal recorded without a price hides the item unconditionally.
+    """
+    key = (store_id, item_id)
+    if key not in dismissals:
+        return False
+    dismissed_value = dismissals[key]
+    if dismissed_value is None or current_value is None:
+        return True
+    return current_value >= dismissed_value
+
+
+async def dismiss_deal(
+    settings: Settings,
+    store_id: str,
+    item_id: str,
+    value: float | None,
+    reason: str | None = None,
+) -> None:
+    """Mark a deal as not real. Replaces any prior dismissal for the pair."""
+    async with get_session(settings) as session:
+        existing = (
+            await session.execute(
+                select(DismissedDeal).where(
+                    DismissedDeal.store_id == store_id,
+                    DismissedDeal.item_id == item_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            existing.dismissed_value = Decimal(str(value)) if value is not None else None
+            existing.reason = reason
+            existing.ts = datetime.now(timezone.utc)
+        else:
+            session.add(DismissedDeal(
+                store_id=store_id,
+                item_id=item_id,
+                dismissed_value=Decimal(str(value)) if value is not None else None,
+                reason=reason,
+            ))
+
+
+async def restore_deal(settings: Settings, store_id: str, item_id: str) -> None:
+    """Un-dismiss a deal so it shows again."""
+    async with get_session(settings) as session:
+        existing = (
+            await session.execute(
+                select(DismissedDeal).where(
+                    DismissedDeal.store_id == store_id,
+                    DismissedDeal.item_id == item_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            await session.delete(existing)
+
+
+async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
+    """Online deals (special buys, price drops) with honest savings.
+
+    Uses the latest snapshot per item at the reference store. claimed_pct is
+    what HD advertises; true_pct compares today's price to our own 30-day
+    high — the number that exposes inflated "was" prices.
+    """
+    ref_store = settings.store_list[0] if settings.store_list else None
+    if ref_store is None:
+        return []
+
+    latest_sub = _latest_snapshots_subquery()
+    cutoff_30d = datetime.now(timezone.utc) - timedelta(days=settings.baseline_window_days)
+    baseline_sub = (
+        select(
+            StoreSnapshot.item_id,
+            func.max(StoreSnapshot.price_value).label("high_30d"),
+            func.min(StoreSnapshot.ts).label("first_ts"),
+        )
+        .where(
+            StoreSnapshot.store_id == ref_store,
+            StoreSnapshot.ts >= cutoff_30d,
+            StoreSnapshot.price_value.isnot(None),
+        )
+        .group_by(StoreSnapshot.item_id)
+        .subquery()
+    )
+
+    async with get_session(settings) as session:
+        rows = (
+            await session.execute(
+                select(
+                    StoreSnapshot,
+                    Product.title,
+                    Product.canonical_url,
+                    Product.image_url,
+                    baseline_sub.c.high_30d,
+                    baseline_sub.c.first_ts,
+                )
+                .join(
+                    latest_sub,
+                    and_(
+                        StoreSnapshot.store_id == latest_sub.c.store_id,
+                        StoreSnapshot.item_id == latest_sub.c.item_id,
+                        StoreSnapshot.ts == latest_sub.c.max_ts,
+                    ),
+                )
+                .outerjoin(Product, StoreSnapshot.item_id == Product.item_id)
+                .outerjoin(baseline_sub, StoreSnapshot.item_id == baseline_sub.c.item_id)
+                .where(
+                    StoreSnapshot.store_id == ref_store,
+                    StoreSnapshot.price_value.isnot(None),
+                    # Freshness: unseen by recent scans = gone from the catalog
+                    StoreSnapshot.ts
+                    >= datetime.now(timezone.utc)
+                    - timedelta(hours=settings.deal_freshness_hours),
+                    (
+                        StoreSnapshot.special_buy.is_(True)
+                        | (func.coalesce(StoreSnapshot.percentage_off, 0) > 0)
+                        | (StoreSnapshot.price_original > StoreSnapshot.price_value)
+                    ),
+                )
+            )
+        ).all()
+
+    dismissals = await get_dismissals(settings)
+
+    from hd.hd_api.parsers import has_any_fulfillment
+
+    now = datetime.now(timezone.utc)
+    min_history = timedelta(days=settings.price_history_min_days)
+
+    deals: list[dict[str, Any]] = []
+    for snap, title, canonical_url, image_url, high_30d, first_ts in rows:
+        # A price is not a deal if nothing can actually be bought: skip items
+        # whose fulfillment data confirms every path is out of stock.
+        if has_any_fulfillment(snap.raw_json) is False:
+            continue
+        value = float(snap.price_value)
+        original = float(snap.price_original) if snap.price_original is not None else None
+
+        claimed = snap.percentage_off or 0
+        if not claimed and original and original > value:
+            claimed = round((original - value) / original * 100)
+
+        # Only issue a history verdict when the history is old enough to mean
+        # something — a just-discovered item has no basis for "flat price".
+        if first_ts is not None and first_ts.tzinfo is None:
+            first_ts = first_ts.replace(tzinfo=timezone.utc)
+        has_history = first_ts is not None and (now - first_ts) >= min_history
+        high = float(high_30d) if has_history and high_30d is not None else None
+        true_pct = 0
+        if high and high > value:
+            true_pct = round((high - value) / high * 100)
+
+        if max(claimed, true_pct) < 10:
+            continue
+
+        deal = {
+            "item_id": snap.item_id,
+            "title": title or f"Item {snap.item_id}",
+            "url": (
+                f"https://www.homedepot.com{canonical_url}"
+                if canonical_url
+                else f"https://www.homedepot.com/s/{snap.item_id}"
+            ),
+            "image_url": image_url,
+            "price": value,
+            "original": original,
+            "claimed_pct": claimed,
+            "true_pct": true_pct,
+            "high_30d": high,
+            "special_buy": bool(snap.special_buy),
+            "snapshot_ts": snap.ts,
+            "dismissed": _is_dismissed(dismissals, ONLINE_STORE_KEY, snap.item_id, value),
+        }
+        deals.append(deal)
+
+    deals.sort(key=lambda d: (-d["true_pct"], -d["claimed_pct"], d["title"]))
+    return deals[:60]

@@ -22,6 +22,7 @@ from hd.db.models import (
 )
 from hd.dashboard.queries import (
     get_alerts,
+    get_deal_board,
     get_overview_stats,
     get_product_detail,
     get_products_with_latest,
@@ -102,7 +103,9 @@ async def seeded_settings(dashboard_settings: Settings) -> Settings:
             price_value=Decimal("149.00"),
             savings_center="CLEARANCE",
             percentage_off=25,
-            in_stock=True, out_of_stock=False,
+            clearance_value=Decimal("99.00"),
+            clearance_percentage_off=50,
+            in_stock=True, out_of_stock=False, inventory_qty=3,
         ))
 
         # Product 100002: one snapshot — OOS
@@ -172,7 +175,8 @@ class TestOverviewStats:
 
     async def test_clearance_detection(self, seeded_settings: Settings):
         stats = await get_overview_stats(seeded_settings)
-        assert stats["clearance_count"] == 1  # only 100001@2619 latest is CLEARANCE
+        # only 100001@2619 latest carries an actionable clearance_value
+        assert stats["clearance_count"] == 1
 
     async def test_oos_count(self, seeded_settings: Settings):
         stats = await get_overview_stats(seeded_settings)
@@ -180,7 +184,7 @@ class TestOverviewStats:
 
     async def test_health_healthy(self, seeded_settings: Settings):
         stats = await get_overview_stats(seeded_settings)
-        assert stats["health_status"] == "HEALTHY"
+        assert stats["health_status"] == "OK"
 
     async def test_latest_snapshot_ts_present(self, seeded_settings: Settings):
         stats = await get_overview_stats(seeded_settings)
@@ -303,3 +307,271 @@ class TestStoreSummary:
         s8425 = next(s for s in summaries if s["store_id"] == "8425")
         # The seeded alert for 8425 is 30h old, within the 7d window
         assert s8425["price_drops_7d"] == 1
+
+
+class TestDealBoard:
+    async def test_actionable_clearance_appears_with_details(self, seeded_settings: Settings):
+        board = await get_deal_board(seeded_settings)
+        deals = board["stores"].get("2619", [])
+        assert [d["item_id"] for d in deals] == ["100001"]
+        deal = deals[0]
+        assert deal["clearance_value"] == 99.0
+        assert deal["pct_off"] == 50
+        assert deal["qty"] == 3
+        assert deal["url"].startswith("https://www.homedepot.com")
+        assert deal["is_new"] is True  # first clearance snapshot is 2h old
+
+    async def test_unpurchasable_clearance_excluded(self, seeded_settings: Settings):
+        """OOS + online price above clearance → not on the board."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="8425", item_id="100002",
+                ts=datetime.now(timezone.utc) - timedelta(minutes=5),
+                price_value=Decimal("99.00"),
+                clearance_value=Decimal("40.00"),
+                in_stock=False, out_of_stock=True, inventory_qty=None,
+            ))
+        board = await get_deal_board(seeded_settings)
+        assert "100002" not in [d["item_id"] for d in board["stores"].get("8425", [])]
+
+    async def test_store_names_returned(self, seeded_settings: Settings):
+        board = await get_deal_board(seeded_settings)
+        assert isinstance(board["store_names"], dict)
+
+
+class TestDismissals:
+    async def test_dismissed_deal_hidden_from_board(self, seeded_settings: Settings):
+        from hd.dashboard.queries import dismiss_deal
+
+        await dismiss_deal(seeded_settings, "2619", "100001", 99.0)
+        board = await get_deal_board(seeded_settings)
+        assert board["stores"]["2619"] == []
+        assert [d["item_id"] for d in board["hidden"]["2619"]] == ["100001"]
+
+    async def test_deeper_deal_resurfaces(self, seeded_settings: Settings):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import dismiss_deal
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        await dismiss_deal(seeded_settings, "2619", "100001", 99.0)
+        # Clearance drops below the dismissed price → new situation
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100001",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("149.00"),
+                clearance_value=Decimal("75.00"),
+                clearance_percentage_off=62,
+                in_stock=True, inventory_qty=2,
+            ))
+        board = await get_deal_board(seeded_settings)
+        assert [d["item_id"] for d in board["stores"]["2619"]] == ["100001"]
+
+    async def test_restore_deal(self, seeded_settings: Settings):
+        from hd.dashboard.queries import dismiss_deal, restore_deal
+
+        await dismiss_deal(seeded_settings, "2619", "100001", 99.0)
+        await restore_deal(seeded_settings, "2619", "100001")
+        board = await get_deal_board(seeded_settings)
+        assert [d["item_id"] for d in board["stores"]["2619"]] == ["100001"]
+
+    async def test_zero_deal_store_still_listed(self, seeded_settings: Settings):
+        board = await get_deal_board(seeded_settings)
+        assert "8425" in board["stores"]
+        assert board["stores"]["8425"] == []
+
+
+class TestOnlineDeals:
+    async def test_special_buy_with_history_shows_true_savings(self, seeded_settings: Settings):
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            # history: $199 ten days ago, now special buy at $99 claiming 50% off $199
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now - timedelta(days=10),
+                price_value=Decimal("199.00"), in_stock=True,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True,
+                in_stock=True,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["claimed_pct"] == 50
+        assert deal["true_pct"] == 50  # 199 -> 99 in our own history
+        assert deal["special_buy"] is True
+
+    async def test_inflated_was_price_shows_flat_history(self, seeded_settings: Settings):
+        """Price claims 50% off but our 30d history says it never changed."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            for days_ago in (20, 10):
+                session.add(StoreSnapshot(
+                    store_id="2619", item_id="100002",
+                    ts=now - timedelta(days=days_ago),
+                    price_value=Decimal("99.00"), in_stock=True,
+                ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                in_stock=True,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["claimed_pct"] == 50
+        assert deal["true_pct"] == 0  # $99 for 20+ days — the discount is fiction
+
+    async def test_online_dismissal_flag(self, seeded_settings: Settings):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import ONLINE_STORE_KEY, dismiss_deal, get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, in_stock=True,
+            ))
+        await dismiss_deal(seeded_settings, ONLINE_STORE_KEY, "100002", 99.0)
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["dismissed"] is True
+
+
+class TestOnlineDealsAvailability:
+    async def test_confirmed_oos_deal_excluded(self, seeded_settings: Settings):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        oos_raw = {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": False, "isOutOfStock": True}},
+            ]}],
+        }]}}
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, in_stock=False,
+                raw_json=oos_raw,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        assert "100002" not in [d["item_id"] for d in deals]
+
+    async def test_unknown_fulfillment_kept(self, seeded_settings: Settings):
+        """No raw fulfillment data — keep the deal rather than false-negative it."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, in_stock=False,
+                raw_json=None,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        assert "100002" in [d["item_id"] for d in deals]
+
+
+class TestDealFreshness:
+    async def test_stale_online_deal_excluded(self, seeded_settings: Settings):
+        """An item unseen for 10 days is out of the catalog — not a deal."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc) - timedelta(days=10),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, in_stock=True,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        assert "100002" not in [d["item_id"] for d in deals]
+
+    async def test_stale_clearance_excluded_from_board(self, seeded_settings: Settings):
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="8425", item_id="100002",
+                ts=datetime.now(timezone.utc) - timedelta(days=10),
+                price_value=Decimal("199.00"),
+                clearance_value=Decimal("50.00"),
+                in_stock=True, inventory_qty=5,
+            ))
+        board = await get_deal_board(seeded_settings)
+        assert board["stores"]["8425"] == []
+
+
+class TestOnlineDealsHistoryDepth:
+    async def test_fresh_item_gets_no_history_verdict(self, seeded_settings: Settings):
+        """An item first seen today must not be labeled 'flat price'."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True, in_stock=True,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["high_30d"] is None   # no verdict — history too shallow
+        assert deal["true_pct"] == 0
+        assert deal["claimed_pct"] == 50

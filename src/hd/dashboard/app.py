@@ -32,6 +32,7 @@ def run_dashboard(settings: Settings) -> None:
         host=settings.dashboard_host,
         port=settings.dashboard_port,
         title=settings.dashboard_title,
+        favicon="🏷️",
         dark=settings.dashboard_dark_mode,
         reload=False,
         show=False,
