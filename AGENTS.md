@@ -1,6 +1,6 @@
 # AGENTS.md — Home Depot Clearance Monitor
 
-This file is the primary context document for Codex. Read it in full before writing any code.
+This file is the primary context document for coding agents. Read it in full before writing any code.
 
 ---
 
@@ -141,7 +141,17 @@ hd snapshot [--stores] [--limit]      # fetch + store pricing/inventory snapshot
 hd run-once                           # full pipeline: browse (or discover+snapshot)+diff+alerts
 hd alerts [--limit] [--type] [--since]# print recent alerts
 hd health                             # print last run health status
+hd backfill-stats                     # rebuild item_price_stats from raw snapshots
+hd prune [--days] [--dry-run]         # delete snapshots past retention (guarded)
 ```
+
+**`store_snapshots` is raw and disposable; `item_price_stats` is the durable record.**
+`hd prune` deletes everything past `snapshot_retention_days`. The price facts the deal
+board reasons about — lowest price ever witnessed and when, running sum/count behind the
+average, distinct days observed — are folded into `item_price_stats` as each snapshot
+lands, so they outlive that deletion. `prune` refuses to run while any item's history is
+uncaptured; run `hd backfill-stats` first. Never rebuild the aggregate from
+`store_snapshots` in normal operation — the rows it came from may already be gone.
 
 ---
 

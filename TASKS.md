@@ -1,4 +1,4 @@
-# TASKS — Home Depot Clearance Monitor (coding agents Build Plan)
+# TASKS — Home Depot Clearance Monitor (Build Plan)
 
 > **Historical.** This is the original v1 planning document, kept as a record of
 > the initial design. It refers to the two stores and single brand this started

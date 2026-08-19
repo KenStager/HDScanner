@@ -8,7 +8,7 @@
 **Status:** v1.0 — Active  
 **Last Updated:** 2026-02-26  
 **Owner:** Ken  
-**Audience:** coding agents, developers  
+**Audience:** developers and coding agents  
 
 ---
 
