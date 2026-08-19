@@ -15,6 +15,7 @@ from sqlalchemy import select
 from hd.config import Settings
 from hd.db.base import get_session
 from hd.db.models import Product, StoreSnapshot
+from hd.db.price_stats import record_observations
 from hd.hd_api.graphql import search, is_valid_search_response, failure_reason
 from hd.hd_api.parsers import parse_snapshots
 from hd.http.client import HDClient
@@ -306,6 +307,21 @@ async def _insert_snapshots(
                 out_of_stock=snap.out_of_stock,
                 raw_json=snap.raw,
             ))
+
+        # Fold into the durable aggregate in the same transaction — these stats
+        # outlive the snapshots above, which prune deletes at retention age.
+        await record_observations(
+            session,
+            store_id,
+            [
+                (
+                    s.item_id,
+                    Decimal(str(s.price_value)) if s.price_value is not None else None,
+                    now,
+                )
+                for s in matched_snapshots
+            ],
+        )
     return len(matched_snapshots)
 
 

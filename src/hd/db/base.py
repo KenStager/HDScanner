@@ -70,6 +70,12 @@ class Database:
                 ))
             except Exception:
                 pass  # Column already exists
+            try:
+                await conn.execute(text(
+                    "ALTER TABLE stores ADD COLUMN city VARCHAR(100)"
+                ))
+            except Exception:
+                pass  # Column already exists
             for col in ("clearance_value", "clearance_dollar_off", "clearance_percentage_off"):
                 try:
                     col_type = "NUMERIC(10,2)" if "value" in col or "dollar" in col else "INTEGER"

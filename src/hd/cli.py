@@ -56,8 +56,9 @@ def add_store(
     name: Optional[str] = typer.Option(None, help="Store name"),
     state: Optional[str] = typer.Option(None, help="Store state"),
     zip_code: Optional[str] = typer.Option(None, "--zip", help="Store ZIP code"),
+    city: Optional[str] = typer.Option(None, help="Store city (defaults to name)"),
 ) -> None:
-    """Add a store to the database."""
+    """Add a store, or update the details of one that already exists."""
     setup_logging()
     settings = Settings()
 
@@ -74,23 +75,33 @@ def add_store(
             )
             existing = result.scalar_one_or_none()
             if existing:
-                console.print(f"[yellow]Store {store_id} already exists.[/yellow]")
+                # Update in place: store location details are filled in after
+                # the row is first seeded, and refusing here left them empty.
+                updates = {"name": name, "state": state, "zip": zip_code, "city": city}
+                applied = [k for k, v in updates.items() if v is not None]
+                for key in applied:
+                    setattr(existing, key, updates[key])
                 await close_db()
-                return False
+                return "updated" if applied else "exists"
 
             session.add(Store(
                 store_id=store_id,
                 name=name,
                 state=state,
                 zip=zip_code,
+                city=city,
             ))
 
         await close_db()
-        return True
+        return "added"
 
-    added = _run(_add())
-    if added:
+    result = _run(_add())
+    if result == "added":
         console.print(f"[green]Store {store_id} added.[/green]")
+    elif result == "updated":
+        console.print(f"[green]Store {store_id} updated.[/green]")
+    else:
+        console.print(f"[yellow]Store {store_id} already exists — pass fields to update.[/yellow]")
 
 
 @app.command()
@@ -589,6 +600,9 @@ def health() -> None:
 def prune(
     days: int = typer.Option(0, help="Retention days (0 = use config)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show count without deleting"),
+    force: bool = typer.Option(
+        False, "--force", help="Prune even if price stats have not captured every item"
+    ),
 ) -> None:
     """Delete old snapshot rows beyond retention period."""
     setup_logging()
@@ -598,7 +612,7 @@ def prune(
         from datetime import datetime, timedelta, timezone
         from sqlalchemy import select, func, delete
         from hd.db.base import init_db as _init_tables, get_session, close_db
-        from hd.db.models import StoreSnapshot
+        from hd.db.models import ItemPriceStat, StoreSnapshot
 
         await _init_tables(settings)
 
@@ -614,22 +628,75 @@ def prune(
                 )
                 count = count_result.scalar() or 0
 
+                # Deleting a snapshot is only safe once its price facts live in
+                # item_price_stats; otherwise an item's entire recorded history
+                # can vanish with nothing left to say it existed.
+                observed = (await session.execute(
+                    select(func.count()).select_from(
+                        select(StoreSnapshot.store_id, StoreSnapshot.item_id)
+                        .where(StoreSnapshot.price_value.isnot(None))
+                        .distinct().subquery()
+                    )
+                )).scalar() or 0
+                captured = (await session.execute(
+                    select(func.count()).select_from(ItemPriceStat)
+                )).scalar() or 0
+                uncaptured = max(0, observed - captured)
+
                 if dry_run:
-                    return count, 0
+                    return count, 0, uncaptured
+                if uncaptured and not force:
+                    return count, -1, uncaptured
 
                 if count > 0:
                     await session.execute(
                         delete(StoreSnapshot).where(StoreSnapshot.ts < cutoff)
                     )
-                return count, count
+                return count, count, uncaptured
         finally:
             await close_db()
 
-    eligible, deleted = _run(_prune())
+    eligible, deleted, uncaptured = _run(_prune())
     if dry_run:
         console.print(f"[yellow]Dry run: {eligible} snapshots eligible for deletion.[/yellow]")
+        if uncaptured:
+            console.print(
+                f"[red]{uncaptured} item(s) have price history not yet captured "
+                f"in item_price_stats — run 'hd backfill-stats' first.[/red]"
+            )
+    elif deleted < 0:
+        console.print(
+            f"[red]Refusing to prune: {uncaptured} item(s) have price history that "
+            f"only exists in store_snapshots.[/red]\n"
+            f"Run [bold]hd backfill-stats[/bold] first, or pass --force to delete anyway."
+        )
+        raise typer.Exit(code=1)
     else:
         console.print(f"[green]Pruned {deleted} old snapshots.[/green]")
+
+
+@app.command("backfill-stats")
+def backfill_stats(
+    chunk: int = typer.Option(50_000, help="Rows to read per batch"),
+) -> None:
+    """Rebuild item_price_stats from the raw snapshots that still exist."""
+    setup_logging()
+    settings = Settings()
+
+    async def _backfill():
+        from hd.db.base import init_db as _init_tables, close_db
+        from hd.db.price_stats import backfill
+
+        await _init_tables(settings)
+        try:
+            return await backfill(settings, chunk_size=chunk)
+        finally:
+            await close_db()
+
+    scanned, items = _run(_backfill())
+    console.print(
+        f"[green]Captured {items:,} item(s) from {scanned:,} priced snapshots.[/green]"
+    )
 
 
 @app.command()

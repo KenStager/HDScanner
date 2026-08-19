@@ -67,6 +67,10 @@ class Store(Base):
     name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     state: Mapped[str | None] = mapped_column(String(2), nullable=True)
     zip: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Home Depot store pages live at /l/<name>/<state>/<city>/<zip>/<store_id>.
+    # City is usually the store name but not always ("N. Cambridge" in Cambridge),
+    # so it is stored rather than assumed.
+    city: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
 
 class StoreSnapshot(Base):
@@ -114,6 +118,47 @@ class Alert(Base):
     alert_type: Mapped[AlertType] = mapped_column(Enum(AlertType), nullable=False)
     severity: Mapped[Severity] = mapped_column(Enum(Severity), nullable=False)
     payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class ItemPriceStat(Base):
+    """Durable per-(store, item) price facts that outlive snapshot pruning.
+
+    store_snapshots is the raw record, and `hd prune` deletes everything past
+    snapshot_retention_days — today that is 94% of the table, including every
+    row for items last seen before the cutoff. The verdicts on the deal board
+    rest on that history, so the parts a verdict needs are folded in here as
+    each snapshot lands: the lowest price ever witnessed and when, the running
+    sum and count behind the average, and how many distinct days back it.
+
+    Maintained incrementally and never rebuilt from store_snapshots in normal
+    operation — the rows it was derived from may already be gone. `hd
+    backfill-stats` reconstructs it only while the raw history still exists.
+    """
+
+    __tablename__ = "item_price_stats"
+
+    store_id: Mapped[str] = mapped_column(String(10), primary_key=True)
+    item_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+
+    low_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    low_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    high_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    high_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # mean = price_sum / obs_count, kept as running totals so the average
+    # survives the deletion of the observations that produced it
+    price_sum: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"))
+    obs_count: Mapped[int] = mapped_column(Integer, default=0)
+    # distinct calendar days, the sample measure worth gating a verdict on —
+    # six scans in one afternoon are not six days of evidence
+    obs_days: Mapped[int] = mapped_column(Integer, default=0)
+
+    first_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_item_price_stats_item", "item_id"),
+    )
 
 
 class DismissedDeal(Base):
