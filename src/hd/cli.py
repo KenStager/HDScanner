@@ -22,19 +22,39 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _require_configured(settings: Settings, *, needs_brands: bool = False) -> None:
-    """Stop with a pointer to setup rather than scanning nothing.
+def _need_stores(store_ids: list[str]) -> list[str]:
+    """Stop unless there is at least one store to work on.
 
-    The shipped defaults are empty on purpose — a default store id would send
-    a stranger's install at somebody else's neighbourhood — so an unconfigured
-    run has to say so instead of succeeding against an empty list.
+    Checked against the resolved list rather than the config, so an explicit
+    `--stores` still works on an install that has never been configured. The
+    shipped defaults are empty on purpose — a default store id would point a
+    stranger's install at somebody else's neighbourhood — so the unconfigured
+    case has to say so instead of succeeding against an empty list.
     """
-    if not settings.store_list:
+    if not store_ids:
         console.print("[red]No stores configured.[/red] Run [cyan]hd setup[/cyan] first.")
         raise typer.Exit(1)
-    if needs_brands and settings.browse_enabled and not settings.brand_token_list:
+    return store_ids
+
+
+def _need_brands(brands: list[str]) -> list[str]:
+    """Stop unless there is at least one brand name to scan."""
+    if not brands:
+        console.print("[red]No brands configured.[/red] Run [cyan]hd setup[/cyan] first.")
+        raise typer.Exit(1)
+    return brands
+
+
+def _need_brand_tokens(settings: Settings) -> None:
+    """Stop when browse mode has no facet tokens to walk.
+
+    Browse walks only brands present in brand_tokens, so without them the run
+    succeeds having scanned nothing — the failure this guard exists to prevent.
+    Discovery does not use tokens at all and is deliberately not gated on them.
+    """
+    if settings.browse_enabled and not settings.brand_token_list:
         console.print(
-            "[red]No brands configured.[/red] Browse mode walks only brands with a "
+            "[red]No brand tokens configured.[/red] Browse mode walks only brands with a "
             "facet token, so this would scan nothing. Run [cyan]hd setup[/cyan] first."
         )
         raise typer.Exit(1)
@@ -141,14 +161,13 @@ def discover(
     """Run product discovery pipeline."""
     setup_logging()
     settings = Settings()
-    _require_configured(settings, needs_brands=True)
+    brands = _need_brands(brand if brand else settings.brand_list)
 
     async def _discover():
         from hd.db.base import init_db as _init_tables, close_db
         from hd.pipeline.discovery import run_discovery
 
         await _init_tables(settings)
-        brands = brand if brand else settings.brand_list
         max_pages = pages if pages > 0 else settings.max_pages
         count = await run_discovery(
             settings=settings,
@@ -171,14 +190,15 @@ def snapshot(
     """Fetch pricing/inventory snapshots for active products."""
     setup_logging()
     settings = Settings()
-    _require_configured(settings)
+    store_ids = _need_stores(
+        [s.strip() for s in stores.split(",") if s.strip()] if stores else settings.store_list
+    )
 
     async def _snapshot():
         from hd.db.base import init_db as _init_tables, close_db
         from hd.pipeline.snapshot import run_snapshots
 
         await _init_tables(settings)
-        store_ids = stores.split(",") if stores else settings.store_list
         count = await run_snapshots(
             settings=settings,
             store_ids=store_ids,
@@ -199,14 +219,16 @@ def browse(
     """Facet-driven brand browse: discover + snapshot every brand item by category."""
     setup_logging()
     settings = Settings()
-    _require_configured(settings, needs_brands=True)
+    store_ids = _need_stores(
+        [s.strip() for s in stores.split(",") if s.strip()] if stores else settings.store_list
+    )
+    _need_brand_tokens(settings)
 
     async def _browse():
         from hd.db.base import init_db as _init_tables, close_db
         from hd.pipeline.browse import run_browse
 
         await _init_tables(settings)
-        store_ids = [s.strip() for s in stores.split(",")] if stores else settings.store_list
         tiers = ("shelf", "network") if tier == "both" else (tier,)
         summary = await run_browse(settings=settings, store_ids=store_ids, tiers=tiers)
         await close_db()
@@ -232,7 +254,8 @@ def daily_deals(
     """Price today's Daily Deals set (Special Buy of the Day) for configured brands."""
     setup_logging()
     settings = Settings()
-    _require_configured(settings, needs_brands=True)
+    _need_stores(settings.store_list)
+    _need_brand_tokens(settings)
 
     async def _daily():
         from hd.db.base import init_db as _init_tables, close_db
@@ -267,7 +290,8 @@ def run_once(
     """
     setup_logging()
     settings = Settings()
-    _require_configured(settings, needs_brands=True)
+    _need_stores(settings.store_list)
+    _need_brand_tokens(settings)
 
     async def _run_once():
         from pathlib import Path
@@ -436,7 +460,7 @@ def catch_up(
     """One-time scan: alert on anything currently ≥50% off or in Special Buys that has never been alerted."""
     setup_logging()
     settings = Settings()
-    _require_configured(settings)
+    _need_stores(settings.store_list)
 
     async def _catch_up():
         from hd.db.base import init_db as _init_tables, close_db
@@ -665,17 +689,28 @@ def prune(
                 # Deleting a snapshot is only safe once its price facts live in
                 # item_price_stats; otherwise an item's entire recorded history
                 # can vanish with nothing left to say it existed.
-                observed = (await session.execute(
-                    select(func.count()).select_from(
-                        select(StoreSnapshot.store_id, StoreSnapshot.item_id)
-                        .where(StoreSnapshot.price_value.isnot(None))
-                        .distinct().subquery()
+                # An anti-join, not a count comparison. item_price_stats is
+                # designed to outlive the snapshots it was folded from, so once
+                # anything has been pruned `captured` includes rows whose
+                # snapshots are gone while `observed` shrinks — the difference
+                # goes negative, max(0, ...) swallows it, and the guard silently
+                # stops guarding exactly as the history it protects grows.
+                seen = (
+                    select(StoreSnapshot.store_id, StoreSnapshot.item_id)
+                    .where(StoreSnapshot.price_value.isnot(None))
+                    .distinct()
+                    .subquery()
+                )
+                uncaptured = (await session.execute(
+                    select(func.count()).select_from(seen).where(
+                        ~select(ItemPriceStat)
+                        .where(
+                            ItemPriceStat.store_id == seen.c.store_id,
+                            ItemPriceStat.item_id == seen.c.item_id,
+                        )
+                        .exists()
                     )
                 )).scalar() or 0
-                captured = (await session.execute(
-                    select(func.count()).select_from(ItemPriceStat)
-                )).scalar() or 0
-                uncaptured = max(0, observed - captured)
 
                 if dry_run:
                     return count, 0, uncaptured
@@ -858,6 +893,14 @@ def canvas_update(
     settings = Settings()
 
     if reset:
+        if not settings.canvas_enabled:
+            # Deleting the id here would orphan the existing canvas: re-enabling
+            # later creates a duplicate instead of resuming it.
+            console.print(
+                "[yellow]Canvas is disabled (CANVAS_ENABLED=false); leaving the "
+                "stored canvas id alone.[/yellow]"
+            )
+            raise typer.Exit(0)
         canvas_path = Path(settings.canvas_id_path)
         if canvas_path.exists():
             canvas_path.unlink()

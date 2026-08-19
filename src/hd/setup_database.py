@@ -17,6 +17,7 @@ URL carries its password.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +37,10 @@ _DRIVERS = {
 }
 
 
+class SchemaError(RuntimeError):
+    """The schema could not be created in full."""
+
+
 @dataclass
 class DbCheck:
     """Outcome of inspecting a database URL."""
@@ -47,13 +52,23 @@ class DbCheck:
     warnings: list[str] = field(default_factory=list)
 
 
+# Matches the password in scheme://user:password@host even when the URL is too
+# malformed for SQLAlchemy to parse — a single missing colon is the likeliest
+# typo in a connection string, and it must not put a password on screen.
+_PASSWORD_RE = re.compile(r"(//[^/@\s]*?:)[^@/\s]+(@)")
+
+
 def redact(url: str) -> str:
-    """A connection string safe to print."""
+    """A connection string safe to print.
+
+    Falls back to a regex rather than returning the raw string: an unparseable
+    URL is exactly the case where the user mistyped, and the password is still
+    in there.
+    """
     try:
-        parsed = make_url(url)
-    except Exception:  # noqa: BLE001 - unparseable strings are shown as-is
-        return url
-    return parsed.render_as_string(hide_password=True)
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001 - fall through to the blunt instrument
+        return _PASSWORD_RE.sub(r"\1***\2", url)
 
 
 def describe(url: str) -> str:
@@ -61,11 +76,24 @@ def describe(url: str) -> str:
     try:
         parsed = make_url(url)
     except Exception:  # noqa: BLE001
-        return url
+        return redact(url)
     if parsed.get_backend_name() == "sqlite":
         return f"SQLite file {parsed.database or ':memory:'}"
     where = parsed.host or "localhost"
     return f"{parsed.get_backend_name()} database {parsed.database!r} on {where}"
+
+
+def _split_drivername(url) -> tuple[str, str]:
+    """(backend, driver) taken from the URL string itself.
+
+    Deliberately avoids URL.get_driver_name(), which loads the dialect plugin
+    to answer and therefore raises NoSuchModuleError for exactly the malformed
+    URLs this needs to describe — `postgres://…`, as printed by Heroku,
+    Supabase and Railway.
+    """
+    name = getattr(url, "drivername", "") or ""
+    backend, _, driver = name.partition("+")
+    return backend, driver
 
 
 def driver_for(url: str) -> tuple[str | None, str | None]:
@@ -74,7 +102,7 @@ def driver_for(url: str) -> tuple[str | None, str | None]:
         parsed = make_url(url)
     except Exception:  # noqa: BLE001
         return None, None
-    return _DRIVERS.get(parsed.get_driver_name() or "", (None, None))
+    return _DRIVERS.get(_split_drivername(parsed)[1], (None, None))
 
 
 def _driver_installed(module: str) -> bool:
@@ -94,6 +122,26 @@ async def check_connection(url: str) -> DbCheck:
     except Exception as exc:  # noqa: BLE001
         return DbCheck(False, f"Not a valid database URL: {exc}", "Check DATABASE_URL syntax.")
 
+    backend, driver = _split_drivername(parsed)
+
+    # postgresql:// (no driver) is what hosting providers print, and postgres://
+    # is what Heroku/Supabase/Railway print. Both reach SQLAlchemy as a sync or
+    # unknown dialect and explode on import, so they are named explicitly.
+    if backend in {"postgresql", "postgres"} and driver != "asyncpg":
+        suggested = parsed.set(drivername="postgresql+asyncpg")
+        return DbCheck(
+            False,
+            f"This tool needs the async PostgreSQL driver, but the URL asks for "
+            f"{driver or 'the default sync driver'}.",
+            f"Use postgresql+asyncpg://… instead, e.g. {suggested.render_as_string(hide_password=True)}",
+        )
+    if backend not in {"sqlite", "postgresql"}:
+        return DbCheck(
+            False,
+            f"{backend or 'That'} is not a supported database.",
+            "Use SQLite (the default) or PostgreSQL.",
+        )
+
     module, extra = driver_for(url)
     if module and not _driver_installed(module):
         hint = f'pip install -e ".[{extra}]"' if extra else f"pip install {module}"
@@ -103,7 +151,7 @@ async def check_connection(url: str) -> DbCheck:
             f"Install it with: {hint}",
         )
 
-    if parsed.get_backend_name() == "sqlite" and parsed.database:
+    if backend == "sqlite" and parsed.database:
         parent = Path(parsed.database).expanduser().resolve().parent
         if not parent.exists():
             return DbCheck(False, f"Directory {parent} does not exist.", "Create it, or pick another path.")
@@ -115,8 +163,11 @@ async def check_connection(url: str) -> DbCheck:
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy import text
 
-    engine = create_async_engine(url)
+    engine = None
     try:
+        # Constructed inside the try: an unsupported or missing dialect raises
+        # here, and a traceback out of setup is not an error message.
+        engine = create_async_engine(url)
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
         return DbCheck(True, f"Connected to {describe(url)}")
@@ -140,7 +191,8 @@ async def check_connection(url: str) -> DbCheck:
             )
         return DbCheck(False, message.splitlines()[0][:200], "")
     finally:
-        await engine.dispose()
+        if engine is not None:
+            await engine.dispose()
 
 
 async def create_database(url: str) -> DbCheck:
@@ -167,7 +219,8 @@ async def create_database(url: str) -> DbCheck:
         async with engine.connect() as conn:
             # Identifier, so it cannot be bound as a parameter. Quoted to make
             # an odd-but-legal name safe.
-            await conn.execute(text(f'CREATE DATABASE "{target}"'))
+            safe = target.replace('"', '""')
+            await conn.execute(text(f'CREATE DATABASE "{safe}"'))
         log.info("Created database", database=target)
         return DbCheck(True, f"Created database {target!r}.")
     except Exception as exc:  # noqa: BLE001
@@ -203,8 +256,10 @@ async def initialise_schema(settings: Settings) -> list[str]:
     finally:
         await engine.dispose()
 
-    expected = set(Base.metadata.tables)
-    missing = expected - set(names)
+    missing = set(Base.metadata.tables) - set(names)
     if missing:
         log.warning("Tables missing after init", missing=sorted(missing))
+        raise SchemaError(
+            "The schema was not fully created — missing: " + ", ".join(sorted(missing))
+        )
     return sorted(names)

@@ -25,18 +25,29 @@ Two properties of the API shape this module:
 
 from __future__ import annotations
 
+import asyncio
 import difflib
+import random
 from dataclasses import dataclass
 
 from hd.config import Settings
 from hd.http.client import HDClient
 from hd.logging import get_logger
+from hd.hd_api.graphql import failure_reason, is_valid_search_response, search
 from hd.pipeline.browse import build_nav, fetch_facets
 
 log = get_logger("pipeline.brands")
 
 BRAND_DIMENSION = "Brand"
 DEFAULT_ATTEMPTS = 3
+
+# The smallest Brand facet ever observed was 166 entries. A read far below that
+# is degraded, and concluding "your brand does not exist" from it would be a
+# lie. Absence is only believed from a plausible read.
+MIN_PLAUSIBLE_BRANDS = 100
+
+# Retries are useless inside a single degradation window.
+RETRY_PAUSE_SECONDS = (2.0, 5.0)
 
 
 class BrandResolutionError(RuntimeError):
@@ -85,7 +96,7 @@ async def read_brand_facet(
     )
     if client.is_throttled:
         raise BrandThrottled(
-            "Home Depot is rate limiting requests. Wait a minute and try again."
+            "Home Depot is rate limiting requests. Restart setup in a few minutes."
         )
 
     refinements = dimensions.get(BRAND_DIMENSION) or []
@@ -135,29 +146,52 @@ async def _search_facet(
 
     Responses degrade silently — the same read has returned 166 brands once and
     225 moments later — so a brand missing from a single response is not
-    evidence it is absent. Keeps the widest response seen, for suggestions.
+    evidence it is absent.
 
-    Returns (widest_seen, entry_or_None).
+    Every read is consulted, and results are unioned rather than keeping only
+    the widest: tokens are catalog-global and stable, so a later read can only
+    omit a brand, never legitimately contradict one. Keeping the widest map and
+    querying that instead would make the retries inert whenever the first read
+    happened to be the widest — which is the common case.
+
+    Returns (everything_seen, entry_or_None). Raises rather than returning None
+    when absence cannot honestly be concluded.
     """
-    widest: dict[str, tuple[str, int | None]] = {}
+    attempts = max(1, attempts)
+    seen: dict[str, tuple[str, int | None]] = {}
+    reads = 0
+
     for attempt in range(1, attempts + 1):
         brands = await read_brand_facet(client, settings, store_id)
-        if len(brands) > len(widest):
-            widest = brands
-        entry = widest.get(wanted)
+        if brands:
+            reads += 1
+            seen.update(brands)
+
+        entry = brands.get(wanted) or seen.get(wanted)
         if entry is not None:
-            return widest, entry
+            return seen, entry
+
         if attempt < attempts:
             log.info(
                 "Brand absent from this read, retrying in case it was degraded",
                 brand=wanted, attempt=attempt, seen=len(brands),
             )
+            # Three reads inside one degradation window are barely better than
+            # one; pause so the retry is worth making.
+            await asyncio.sleep(random.uniform(*RETRY_PAUSE_SECONDS))
 
-    if not widest:
+    if not seen:
         raise BrandResolutionError(
             "Could not read Home Depot's brand list. Check connectivity and try again."
         )
-    return widest, None
+    if reads < 2 and len(seen) < MIN_PLAUSIBLE_BRANDS:
+        # One short read is not grounds for telling someone their brand does
+        # not exist.
+        raise BrandResolutionError(
+            f"Home Depot returned only {len(seen)} brands, too few to trust. "
+            "Try again in a minute."
+        )
+    return seen, None
 
 
 def suggest_brands(name: str, available: dict[str, tuple[str, int | None]], limit: int = 5) -> list[str]:
@@ -180,15 +214,42 @@ async def verify_token(
 ) -> int | None:
     """Products reachable by walking this token, or None if it resolves to nothing.
 
-    A wrong token is not rejected by the API — it simply returns no total. This
+    A wrong token is not rejected by the API — it simply returns no total, which
     is what keeps an unusable token out of the config.
+
+    The request is made directly rather than through fetch_facets because that
+    helper collapses "the request failed" and "the response carried no total"
+    into the same (None, {}) return. Believing that conflation would report a
+    perfectly good brand as nonexistent whenever a verify read happened to fail
+    — and the facet read above is retried precisely because reads do fail.
     """
+    if "Z" in token:
+        # navParams join on "Z"; a token containing one would silently walk a
+        # different facet path than the caller asked for.
+        raise BrandResolutionError(f"{token!r} is not a valid facet token")
+
     nav = build_nav(settings.root_nav_param, token)
-    total, _ = await fetch_facets(client, settings, nav, store_id, storefilter)
+    raw = await search(
+        client,
+        keyword=None,
+        nav_param=nav,
+        store_id=store_id,
+        start_index=0,
+        page_size=1,
+        storefilter=storefilter,
+    )
+
     if client.is_throttled:
         raise BrandThrottled(
-            "Home Depot is rate limiting requests. Wait a minute and try again."
+            "Home Depot is rate limiting requests. Restart setup in a few minutes."
         )
+    if not is_valid_search_response(raw):
+        raise BrandResolutionError(
+            f"Could not verify the token for this brand ({failure_reason(raw) or 'api_error'})."
+        )
+
+    search_model = raw.get("data", {}).get("searchModel") or {}
+    total = (search_model.get("searchReport") or {}).get("totalProducts")
     return total or None
 
 
@@ -220,7 +281,21 @@ async def resolve_brand(
     token, count = entry
     verified: int | None = None
     if verify:
-        verified = await verify_token(client, settings, token, store_id)
+        last: Exception | None = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                verified = await verify_token(client, settings, token, store_id)
+                break
+            except BrandThrottled:
+                raise
+            except BrandResolutionError as exc:
+                last = exc
+                if attempt < attempts:
+                    await asyncio.sleep(random.uniform(*RETRY_PAUSE_SECONDS))
+        else:
+            # Could not check — say so rather than claiming the brand is absent.
+            raise BrandResolutionError(str(last))
+
         if not verified:
             log.warning("Brand token resolved but returned no products", brand=wanted, token=token)
             return None

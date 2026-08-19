@@ -15,7 +15,10 @@ after the deals went up. The local equivalent is computed instead.
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import sys
+from xml.sax.saxutils import escape as xml_escape
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -42,6 +45,19 @@ class ScheduleSlot:
     minute: int = 0
 
 
+def _shell(path: Path | str) -> str:
+    """Quote a path for /bin/bash. Spaces in a home directory are the norm on
+    macOS, and an unquoted `cd` there fails with "too many arguments" — at
+    04:00, into a log nobody reads."""
+    return shlex.quote(str(path))
+
+
+def _xml(value: Path | str) -> str:
+    """Escape a value for XML text. An ampersand in a path — "Home & Garden" —
+    otherwise produces a plist launchd refuses to load."""
+    return xml_escape(str(value))
+
+
 def _to_local(hour: int, minute: int, *, tz=None, on: datetime | None = None) -> ScheduleSlot:
     """Convert an Eastern wall-clock time to the machine's local wall clock.
 
@@ -58,8 +74,8 @@ def _to_local(hour: int, minute: int, *, tz=None, on: datetime | None = None) ->
 
 def daily_deals_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
     """Local time to catch Home Depot's Daily Deals just after they publish."""
-    minute = HD_DEALS_REFRESH.minute + DEALS_GRACE_MINUTES
-    return _to_local(HD_DEALS_REFRESH.hour, minute, tz=tz, on=on)
+    carry, minute = divmod(HD_DEALS_REFRESH.minute + DEALS_GRACE_MINUTES, 60)
+    return _to_local(HD_DEALS_REFRESH.hour + carry, minute, tz=tz, on=on)
 
 
 def scan_slots(*, tz=None, on: datetime | None = None) -> list[ScheduleSlot]:
@@ -74,14 +90,22 @@ def prune_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
     return _to_local(PRUNE_HOUR_ET, 30, tz=tz, on=on)
 
 
-def hd_executable() -> Path:
-    """Absolute path to the `hd` console script for the running interpreter.
+def hd_executable() -> Path | None:
+    """Absolute path to the `hd` console script, or None if it cannot be found.
 
     Better than sourcing the virtualenv in the job: launchd runs with a bare
     environment, and an absolute path cannot be defeated by a missing shell
     profile or a renamed venv directory.
+
+    Returns None rather than a guess when there is no `hd` beside the
+    interpreter — under pipx, uv tool or `python -m hd` — so the caller can
+    refuse to write a job that would fail silently at every scheduled time.
     """
-    return Path(sys.executable).parent / "hd"
+    beside = Path(sys.executable).parent / "hd"
+    if beside.exists():
+        return beside
+    found = shutil.which("hd")
+    return Path(found) if found else None
 
 
 def label_for(base: str = DEFAULT_LABEL_BASE, user: str | None = None) -> str:
@@ -107,13 +131,13 @@ def render_scan_plist(
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>{label}</string>
+  <string>{_xml(label)}</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>export PYTHONUNBUFFERED=1; cd {workdir} &amp;&amp; {hd_path} run-once &amp;&amp; {hd_path} notify</string>
+    <string>export PYTHONUNBUFFERED=1; cd {_xml(_shell(workdir))} &amp;&amp; {_xml(_shell(hd_path))} run-once &amp;&amp; {_xml(_shell(hd_path))} notify</string>
   </array>
 
   <!-- Local times. One slot tracks Home Depot's 3:00 ET Daily Deals refresh,
@@ -125,12 +149,12 @@ def render_scan_plist(
   </array>
 
   <key>WorkingDirectory</key>
-  <string>{workdir}</string>
+  <string>{_xml(workdir)}</string>
 
   <key>StandardOutPath</key>
-  <string>{workdir}/hd_launchd.stdout.log</string>
+  <string>{_xml(str(workdir) + "/hd_launchd.stdout.log")}</string>
   <key>StandardErrorPath</key>
-  <string>{workdir}/hd_launchd.stderr.log</string>
+  <string>{_xml(str(workdir) + "/hd_launchd.stderr.log")}</string>
 
   <!-- launchd catches up a missed run when the Mac wakes, so RunAtLoad is not
        needed to avoid gaps and would fire an extra scan on every login. -->
@@ -150,13 +174,13 @@ def render_prune_plist(label: str, workdir: Path, hd_path: Path, slot: ScheduleS
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>{label}</string>
+  <string>{_xml(label)}</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>export PYTHONUNBUFFERED=1; cd {workdir} &amp;&amp; {hd_path} prune</string>
+    <string>export PYTHONUNBUFFERED=1; cd {_xml(_shell(workdir))} &amp;&amp; {_xml(_shell(hd_path))} prune</string>
   </array>
 
   <key>StartCalendarInterval</key>
@@ -165,12 +189,12 @@ def render_prune_plist(label: str, workdir: Path, hd_path: Path, slot: ScheduleS
   </array>
 
   <key>WorkingDirectory</key>
-  <string>{workdir}</string>
+  <string>{_xml(workdir)}</string>
 
   <key>StandardOutPath</key>
-  <string>{workdir}/hd_prune.stdout.log</string>
+  <string>{_xml(str(workdir) + "/hd_prune.stdout.log")}</string>
   <key>StandardErrorPath</key>
-  <string>{workdir}/hd_prune.stderr.log</string>
+  <string>{_xml(str(workdir) + "/hd_prune.stderr.log")}</string>
 
   <key>RunAtLoad</key>
   <false/>
@@ -183,14 +207,17 @@ def render_crontab(
     workdir: Path, hd_path: Path, slots: list[ScheduleSlot], prune: ScheduleSlot
 ) -> str:
     """The equivalent crontab for Linux, where launchd does not exist."""
+    work, hd = _shell(workdir), _shell(hd_path)
     lines = [
         "# Home Depot clearance monitor",
         "# Times are local. One slot tracks Home Depot's 3:00 ET Daily Deals refresh.",
+        '# MAILTO="" so six runs a day do not mail you.',
+        'MAILTO=""',
     ]
-    for s in slots:
-        lines.append(f"{s.minute} {s.hour} * * * cd {workdir} && {hd_path} run-once && {hd_path} notify")
+    for slot in slots:
+        lines.append(f"{slot.minute} {slot.hour} * * * cd {work} && {hd} run-once && {hd} notify")
     lines.append("# Retention — nothing else deletes old snapshots.")
-    lines.append(f"{prune.minute} {prune.hour} * * * cd {workdir} && {hd_path} prune")
+    lines.append(f"{prune.minute} {prune.hour} * * * cd {work} && {hd} prune")
     return "\n".join(lines) + "\n"
 
 

@@ -13,6 +13,21 @@ from hd.config import Settings
 from hd.db.models import Base
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_shared_engine():
+    """Dispose the module-level engine after every test.
+
+    hd.db.base keeps one Database instance whose engine is bound to the event
+    loop that created it. pytest-asyncio gives each test a fresh loop, so an
+    engine left open is reused from a loop that no longer exists and its
+    aiosqlite worker thread raises "Event loop is closed" at shutdown.
+    """
+    yield
+    from hd.db.base import close_db
+
+    await close_db()
+
+
 @pytest.fixture
 def sample_response() -> dict:
     """Load the sample searchModel response fixture."""

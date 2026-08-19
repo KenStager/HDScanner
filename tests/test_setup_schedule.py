@@ -126,10 +126,16 @@ class TestRenderCrontab:
             Path("/srv/hd"), Path("/srv/hd/.venv/bin/hd"),
             [ScheduleSlot(0, 0), ScheduleSlot(3, 10)], ScheduleSlot(4, 30),
         )
-        rows = [l for l in out.splitlines() if l and not l.startswith("#")]
+        rows = [l for l in out.splitlines() if l and not l.startswith("#") and "*" in l]
         assert len(rows) == 3
         assert "10 3 * * *" in out
         assert "30 4 * * * cd /srv/hd && /srv/hd/.venv/bin/hd prune" in out
+
+    def test_silences_cron_mail(self):
+        """Six runs a day would otherwise mail the user six times."""
+        out = render_crontab(Path("/srv/hd"), Path("/srv/hd/.venv/bin/hd"),
+                             [ScheduleSlot(0, 0)], ScheduleSlot(4, 30))
+        assert 'MAILTO=""' in out
 
 
 class TestLabelAndExecutable:
@@ -143,3 +149,80 @@ class TestLabelAndExecutable:
     def test_hd_executable_sits_beside_the_interpreter(self):
         assert hd_executable().name == "hd"
         assert hd_executable().is_absolute()
+
+
+class TestHostilePaths:
+    """A home directory with a space or an ampersand is ordinary on macOS.
+
+    Unquoted, `cd /Users/bob/My Projects` fails with "too many arguments" and
+    the && chain stops — the scanner simply never runs, at 4am, silently. An
+    unescaped ampersand produces a plist launchd refuses to load.
+    """
+
+    SPACED = Path("/Users/bob/My Projects/HDScanner")
+    NASTY = Path("/Users/bob/Home & Garden/HD <Scanner>")
+    HD = Path("/Users/bob/My Projects/.venv/bin/hd")
+
+    def _command(self, text: str) -> str:
+        import plistlib
+
+        return plistlib.loads(text.encode())["ProgramArguments"][2]
+
+    def test_scan_plist_parses_with_metacharacters(self):
+        import plistlib
+
+        text = render_scan_plist("com.bob.hd&co", self.NASTY, self.HD, [ScheduleSlot(3, 10)])
+        parsed = plistlib.loads(text.encode())
+        assert parsed["Label"] == "com.bob.hd&co"
+        assert parsed["WorkingDirectory"] == str(self.NASTY)
+
+    def test_prune_plist_parses_with_metacharacters(self):
+        import plistlib
+
+        text = render_prune_plist("com.bob.hd.prune", self.NASTY, self.HD, ScheduleSlot(4, 30))
+        assert plistlib.loads(text.encode())["WorkingDirectory"] == str(self.NASTY)
+
+    def test_spaces_are_shell_quoted(self):
+        cmd = self._command(render_scan_plist("l", self.SPACED, self.HD, [ScheduleSlot(0, 0)]))
+        assert "'/Users/bob/My Projects/HDScanner'" in cmd
+        assert "cd /Users/bob/My Projects/HDScanner &&" not in cmd
+
+    def test_crontab_quotes_paths(self):
+        out = render_crontab(self.SPACED, self.HD, [ScheduleSlot(0, 0)], ScheduleSlot(4, 30))
+        assert "'/Users/bob/My Projects/HDScanner'" in out
+
+
+class TestDealsSlotCarry:
+    def test_grace_period_never_produces_an_invalid_minute(self):
+        """divmod, not raw addition — 3:55 + 10 must roll the hour."""
+        import hd.setup_schedule as sched
+
+        original = sched.HD_DEALS_REFRESH
+        try:
+            sched.HD_DEALS_REFRESH = sched.dtime(3, 55)
+            slot = daily_deals_slot(tz=EASTERN, on=WINTER)
+            assert slot == ScheduleSlot(4, 5)
+        finally:
+            sched.HD_DEALS_REFRESH = original
+
+
+class TestExecutableDiscovery:
+    def test_missing_executable_returns_none(self, monkeypatch, tmp_path):
+        """Better to warn than to write a job that can never run.
+
+        Under pipx, uv tool or `python -m hd` there is no `hd` beside the
+        interpreter, and a plist naming a nonexistent binary fails silently at
+        every scheduled time.
+        """
+        import hd.setup_schedule as sched
+
+        monkeypatch.setattr(sched.sys, "executable", str(tmp_path / "bin" / "python"))
+        monkeypatch.setattr(sched.shutil, "which", lambda name: None)
+        assert hd_executable() is None
+
+    def test_falls_back_to_path_lookup(self, monkeypatch, tmp_path):
+        import hd.setup_schedule as sched
+
+        monkeypatch.setattr(sched.sys, "executable", str(tmp_path / "bin" / "python"))
+        monkeypatch.setattr(sched.shutil, "which", lambda name: "/usr/local/bin/hd")
+        assert hd_executable() == Path("/usr/local/bin/hd")

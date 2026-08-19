@@ -198,3 +198,102 @@ class TestTransport:
         monkeypatch.setattr(st.subprocess, "run", _boom)
         with pytest.raises(StoreLookupError):
             await search_stores("01035")
+
+
+class TestErrorPrecedence:
+    """A benign marker must not mask a real failure.
+
+    The gateway can return both. Reporting the benign one turns a genuine
+    error into "no stores in range", so setup widens the radius against a
+    failure and eventually tells the user no Home Depot exists near them.
+    """
+
+    def test_real_error_alongside_a_benign_one_wins(self):
+        assert _classify([
+            {"message": "Kaboom"},
+            {"message": "Store Search records not found"},
+        ]) == "Kaboom"
+
+    def test_first_message_is_reported_not_the_last(self):
+        assert _classify([{"message": "first"}, {"message": "second"}]) == "first"
+
+    def test_input_error_preferred_over_no_records(self):
+        assert _classify([
+            {"message": "Store Search records not found"},
+            {"message": "Invalid value for zipCode: "},
+        ]) == "invalid_zip"
+
+    async def test_masked_error_does_not_read_as_empty(self, monkeypatch):
+        monkeypatch.setattr(st, "_post", _fake_post(errors=[
+            {"message": "Kaboom"},
+            {"message": "Store Search records not found"},
+        ]))
+        with pytest.raises(StoreLookupError):
+            await search_stores("01035")
+
+
+class TestUnexplainedResponses:
+    """A null payload with no errors is not "nothing found".
+
+    Both genuine not-found conditions arrive as GraphQL errors, and a null
+    payload is exactly the shape of a 206 throttle body — so treating it as an
+    empty result would send a user with a valid ZIP away from setup.
+    """
+
+    async def test_null_store_search_raises(self, monkeypatch):
+        monkeypatch.setattr(st, "_post", _fake_post({"storeSearch": None}))
+        with pytest.raises(StoreLookupError):
+            await search_stores("01035")
+
+    async def test_empty_list_is_still_a_legitimate_no_result(self, monkeypatch):
+        monkeypatch.setattr(st, "_post", _fake_post({"storeSearch": []}))
+        assert await search_stores("01035") == []
+
+    async def test_absent_store_details_raises(self, monkeypatch):
+        monkeypatch.setattr(st, "_post", _fake_post({}))
+        with pytest.raises(StoreLookupError):
+            await get_store("8452")
+
+
+class TestTransportEdges:
+    async def test_missing_curl_is_reported_not_raised_raw(self, monkeypatch):
+        """curl absent is a real first-run condition on minimal images."""
+        def _boom(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory", "curl")
+
+        monkeypatch.setattr(st.subprocess, "run", _boom)
+        with pytest.raises(StoreLookupError) as exc:
+            await search_stores("01035")
+        assert "curl" in str(exc.value)
+
+    async def test_206_with_an_empty_body_is_still_throttling(self, monkeypatch):
+        """The documented throttle shape carries no body at all.
+
+        Pins the status check ahead of JSON parsing: a body-carrying fixture
+        alone would stay green if the order were reversed.
+        """
+        def _run(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout="\n206", stderr="")
+
+        monkeypatch.setattr(st.subprocess, "run", _run)
+        with pytest.raises(StoreLookupThrottled):
+            await search_stores("01035")
+
+    async def test_zip_travels_in_the_body_never_the_url(self, monkeypatch):
+        """Pins the injection-safe construction: variables, not interpolation."""
+        captured = {}
+
+        def _run(cmd, *a, **k):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(
+                returncode=0, stdout='{"data":{"storeSearch":[]}}\n200', stderr=""
+            )
+
+        monkeypatch.setattr(st.subprocess, "run", _run)
+        await search_stores("01035")
+        cmd = captured["cmd"]
+        url = cmd[cmd.index("--url") + 1]
+        assert "01035" not in url
+        payload = cmd[cmd.index("-d") + 1]
+        assert '"zipCode": "01035"' in payload
+        assert "shell" not in cmd

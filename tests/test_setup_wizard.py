@@ -300,3 +300,57 @@ class TestVerifyInstall:
         )
         await sw.verify_install(settings, "6542")
         assert seen["budget"] == sw.VERIFY_REQUEST_BUDGET
+
+
+class TestMarkupSafety:
+    """Console output must survive text containing square brackets.
+
+    rich parses [...] as markup, so a ZIP, brand name, store name or path with
+    brackets either vanishes from the message or raises MarkupError mid-run.
+    An unbalanced closing tag is the crash case; a balanced one silently eats
+    the text — which produced a wrong `pip install` command in real output.
+    """
+
+    HOSTILE = ["[/x]", "[bogus]", "[work]", "[dim]x[/dim]", "[[nested]]"]
+
+    @pytest.mark.parametrize("text", HOSTILE)
+    def test_escaped_text_neither_raises_nor_disappears(self, text):
+        from rich.console import Console
+        from rich.markup import escape
+
+        console = Console(file=__import__("io").StringIO(), width=200, no_color=True)
+        console.print(f"  [yellow]value: {escape(text)}[/yellow]")
+        out = console.file.getvalue()
+        assert text in out, f"{text!r} was swallowed by markup parsing"
+
+    @pytest.mark.parametrize("text", HOSTILE)
+    def test_unescaped_text_is_the_bug_being_prevented(self, text):
+        """Demonstrates why the escaping matters — do not remove it."""
+        import io
+
+        from rich.console import Console
+        from rich.errors import MarkupError
+
+        console = Console(file=io.StringIO(), width=200, no_color=True)
+        try:
+            console.print(f"  [yellow]value: {text}[/yellow]")
+        except MarkupError:
+            return  # crash path
+        assert text not in console.file.getvalue()  # or silent loss
+
+    def test_every_interpolated_print_escapes(self):
+        """Static guard: no console.print f-string may interpolate raw text."""
+        import re
+        from pathlib import Path
+
+        source = Path(sw.__file__).read_text()
+        offenders = []
+        for line_no, line in enumerate(source.splitlines(), 1):
+            if "console.print(f" not in line:
+                continue
+            for expr in re.findall(r"\{([^{}]+)\}", line):
+                expr = expr.strip()
+                if expr.startswith("_e(") or ":" in expr.split("!")[0]:
+                    continue  # escaped, or a format spec like {n:,} / {r:.0f}
+                offenders.append(f"{line_no}: {{{expr}}}")
+        assert not offenders, "unescaped interpolations: " + "; ".join(offenders)

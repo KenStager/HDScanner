@@ -34,13 +34,53 @@ DEGRADED = {"Brand": [{"label": "DEWALT", "token": "4j2", "count": 30}]}
 class FakeClient:
     """Stands in for HDClient; only is_throttled is consulted."""
 
-    def __init__(self, throttled: bool = False):
+    def __init__(self, throttled: bool = False, throttle_after: int | None = None):
         self.is_throttled = throttled
+        self._throttle_after = throttle_after
+        self.reads = 0
+
+    def note_read(self) -> None:
+        """Let a fake flip the client to throttled mid-sequence, as the real
+        latching client does, rather than only ever being throttled up front."""
+        self.reads += 1
+        if self._throttle_after is not None and self.reads >= self._throttle_after:
+            self.is_throttled = True
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """Retry pauses are real in production and pointless in tests."""
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(br.asyncio, "sleep", _instant)
 
 
 @pytest.fixture
 def settings() -> Settings:
     return Settings(database_url="sqlite+aiosqlite:///:memory:", store_raw_json=False)
+
+
+def _search(*totals):
+    """Fake hd.pipeline.brands.search. An int yields a valid response with that
+    total; None yields a tagged failure, which is what a failed read looks like."""
+    from hd.http.client import failure_response
+
+    calls = {"n": 0}
+
+    async def _inner(client, **kwargs):
+        i = min(calls["n"], len(totals) - 1)
+        calls["n"] += 1
+        note = getattr(client, "note_read", None)
+        if note:
+            note()
+        total = totals[i]
+        if total is None:
+            return failure_response("api_error")
+        return {"data": {"searchModel": {"searchReport": {"totalProducts": total}}}}
+
+    _inner.calls = calls
+    return _inner
 
 
 def _facets(*responses):
@@ -50,6 +90,9 @@ def _facets(*responses):
     async def _inner(client, settings, nav_param, store_id, storefilter):
         i = min(calls["n"], len(responses) - 1)
         calls["n"] += 1
+        note = getattr(client, "note_read", None)
+        if note:
+            note()
         return responses[i]
 
     _inner.calls = calls
@@ -88,7 +131,8 @@ class TestListBrands:
 
 class TestResolveBrand:
     async def test_resolves_and_verifies(self, monkeypatch, settings):
-        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL), (2419, {})))
+        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
+        monkeypatch.setattr(br, "search", _search(2419))
         m = await resolve_brand(FakeClient(), settings, "ryobi", "8452")
         assert m.name == "RYOBI"
         assert m.token == "m5d"
@@ -99,8 +143,31 @@ class TestResolveBrand:
         self, monkeypatch, settings
     ):
         """The core guard: a short response must not be believed."""
-        fake = _facets((1356, DEGRADED), (34707, FULL), (2419, {}))
+        fake = _facets((1356, DEGRADED), (34707, FULL))
         monkeypatch.setattr(br, "fetch_facets", fake)
+        monkeypatch.setattr(br, "search", _search(9306))
+        m = await resolve_brand(FakeClient(), settings, "Milwaukee", "8452")
+        assert m is not None and m.token == "zv"
+
+    async def test_brand_found_only_in_a_narrower_later_read(self, monkeypatch, settings):
+        """The retry must consult each read, not the widest seen so far.
+
+        Keeping only the widest map made retries inert whenever the first read
+        happened to be the widest — the common case — and discarded a brand
+        that appeared in a smaller later response.
+        """
+        wide_without = {"Brand": [
+            {"label": "DEWALT", "token": "4j2", "count": 1},
+            {"label": "RYOBI", "token": "m5d", "count": 1},
+            {"label": "HUSKY", "token": "rd", "count": 1},
+            {"label": "BOSCH", "token": "9u", "count": 1},
+        ]}
+        narrow_with = {"Brand": [
+            {"label": "MILWAUKEE", "token": "zv", "count": 9306},
+            {"label": "DEWALT", "token": "4j2", "count": 1},
+        ]}
+        monkeypatch.setattr(br, "fetch_facets", _facets((34707, wide_without), (1356, narrow_with)))
+        monkeypatch.setattr(br, "search", _search(9306))
         m = await resolve_brand(FakeClient(), settings, "Milwaukee", "8452")
         assert m is not None and m.token == "zv"
 
@@ -109,9 +176,38 @@ class TestResolveBrand:
         assert await resolve_brand(FakeClient(), settings, "Hilti", "8452", attempts=2) is None
 
     async def test_token_that_returns_no_products_is_rejected(self, monkeypatch, settings):
-        """A token in the facet but unusable must not reach the config."""
-        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL), (None, {})))
+        """A token in the facet but genuinely empty must not reach the config."""
+        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
+        monkeypatch.setattr(br, "search", _search(0))
         assert await resolve_brand(FakeClient(), settings, "RYOBI", "8452") is None
+
+    async def test_failed_verification_is_not_reported_as_absence(self, monkeypatch, settings):
+        """A verify read that fails means "could not check", not "no such brand".
+
+        Reporting it as absence would tell a user with a valid brand that it
+        does not exist, and leave them with a config that scans nothing.
+        """
+        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
+        monkeypatch.setattr(br, "search", _search(None))
+        with pytest.raises(BrandResolutionError):
+            await resolve_brand(FakeClient(), settings, "RYOBI", "8452", attempts=2)
+
+    async def test_short_read_is_not_grounds_for_declaring_absence(self, monkeypatch, settings):
+        """One implausibly small response must not settle the question."""
+        tiny = {"Brand": [{"label": "WELLER", "token": "1lw", "count": 3}]}
+        monkeypatch.setattr(br, "fetch_facets", _facets((10, tiny), (None, {})))
+        with pytest.raises(BrandResolutionError):
+            await resolve_brand(FakeClient(), settings, "MILWAUKEE", "8452", attempts=2)
+
+    async def test_throttling_partway_through_is_reported_as_throttling(
+        self, monkeypatch, settings
+    ):
+        """The real client latches throttled mid-sequence."""
+        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
+        monkeypatch.setattr(br, "search", _search(2419))
+        client = FakeClient(throttle_after=2)
+        with pytest.raises(BrandThrottled):
+            await resolve_brand(client, settings, "RYOBI", "8452")
 
     async def test_skipping_verification_keeps_the_match(self, monkeypatch, settings):
         monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
@@ -130,12 +226,27 @@ class TestResolveBrand:
 
 class TestVerifyToken:
     async def test_returns_total(self, monkeypatch, settings):
-        monkeypatch.setattr(br, "fetch_facets", _facets((2419, {})))
+        monkeypatch.setattr(br, "search", _search(2419))
         assert await verify_token(FakeClient(), settings, "m5d", "8452") == 2419
 
-    async def test_bogus_token_returns_none(self, monkeypatch, settings):
-        monkeypatch.setattr(br, "fetch_facets", _facets((None, {})))
+    async def test_token_with_no_products_returns_none(self, monkeypatch, settings):
+        monkeypatch.setattr(br, "search", _search(0))
         assert await verify_token(FakeClient(), settings, "zzzz9", "8452") is None
+
+    async def test_failed_read_raises_rather_than_returning_none(self, monkeypatch, settings):
+        monkeypatch.setattr(br, "search", _search(None))
+        with pytest.raises(BrandResolutionError):
+            await verify_token(FakeClient(), settings, "m5d", "8452")
+
+    async def test_throttled_client_raises(self, monkeypatch, settings):
+        monkeypatch.setattr(br, "search", _search(2419))
+        with pytest.raises(BrandThrottled):
+            await verify_token(FakeClient(throttled=True), settings, "m5d", "8452")
+
+    async def test_token_containing_the_nav_separator_is_rejected(self, settings):
+        """navParams join on "Z"; such a token would walk a different path."""
+        with pytest.raises(BrandResolutionError):
+            await verify_token(FakeClient(), settings, "aZb", "8452")
 
 
 class TestSuggestBrands:

@@ -164,7 +164,8 @@ async def _post(
     cmd = [
         "curl", "-s", "-w", "\n%{http_code}",
         "-X", "POST",
-        f"{endpoint}?opname={operation}",
+        # --url, so an endpoint starting with "-" cannot be parsed as an option.
+        "--url", f"{endpoint}?opname={operation}",
         "--compressed",
         "--max-filesize", "5242880",
         "-d", json.dumps(payload),
@@ -178,6 +179,12 @@ async def _post(
         )
     except subprocess.TimeoutExpired as exc:
         raise StoreLookupError("Store lookup timed out after 30s") from exc
+    except FileNotFoundError as exc:
+        raise StoreLookupError(
+            "curl is required for store lookup but was not found on PATH."
+        ) from exc
+    except OSError as exc:
+        raise StoreLookupError(f"Could not run curl: {exc}") from exc
 
     if result.returncode != 0:
         raise StoreLookupError(f"Could not reach Home Depot (curl exit {result.returncode})")
@@ -206,22 +213,41 @@ async def _post(
 
 
 def _classify(errors: list[dict[str, Any]]) -> str:
-    """Reduce a GraphQL error array to a known kind, or fall back to its message.
+    """Reduce a GraphQL error array to a known kind, or its first message.
 
     Kinds: 'no_records' (nothing matched), 'invalid_zip' (bad ZIP),
     'invalid_store' (no such store id).
+
+    A real error anywhere in the array wins over a benign marker. The gateway
+    can return both, and returning the benign one would turn a genuine failure
+    into "no stores in range" — which sends a user with a perfectly good ZIP
+    away from setup, widening the radius against an error.
     """
-    message = ""
+    kinds: list[str] = []
+    first_message = ""
     for err in errors:
         message = str(err.get("message") or "")
+        if message and not first_message:
+            first_message = message
         lowered = message.lower()
         if _NO_RECORDS_MARKER in lowered:
-            return "no_records"
-        if _INVALID_ZIP_MARKER in lowered:
-            return "invalid_zip"
-        if _INVALID_STORE_MARKER in lowered:
-            return "invalid_store"
-    return message or "unknown error"
+            kinds.append("no_records")
+        elif _INVALID_ZIP_MARKER in lowered:
+            kinds.append("invalid_zip")
+        elif _INVALID_STORE_MARKER in lowered:
+            kinds.append("invalid_store")
+        else:
+            # Unrecognised means unexplained; report it rather than a benign
+            # sibling.
+            return message or "unknown error"
+
+    if not kinds:
+        return first_message or "unknown error"
+    # Input errors are more specific than "nothing found"; prefer them.
+    for preferred in ("invalid_zip", "invalid_store", "no_records"):
+        if preferred in kinds:
+            return preferred
+    return kinds[0]
 
 
 async def search_stores(
@@ -258,7 +284,15 @@ async def search_stores(
             raise InvalidZipCode(f"{zip_code!r} is not a ZIP code Home Depot recognises")
         raise StoreLookupError(f"Store search failed: {kind}")
 
-    stores = [s for s in (_to_result(r) for r in (data.get("storeSearch") or [])) if s]
+    raw_stores = data.get("storeSearch")
+    if raw_stores is None:
+        # Both genuine not-found conditions arrive as GraphQL errors, so a null
+        # payload with none is unexplained — and it is exactly the shape a 206
+        # throttle body has. Reporting it as "no stores near you" would send a
+        # user with a good ZIP away.
+        raise StoreLookupError("Home Depot returned an empty response for that search.")
+
+    stores = [s for s in (_to_result(r) for r in raw_stores) if s]
     stores.sort(key=lambda s: (s.distance_miles is None, s.distance_miles or 0.0))
 
     log.info("Store search complete", zip=zip_code, radius=radius_miles, found=len(stores))
@@ -288,6 +322,9 @@ async def get_store(store_id: str, *, endpoint: str = DEFAULT_ENDPOINT) -> Store
             log.info("No such store", store_id=store_id)
             return None
         raise StoreLookupError(f"Store lookup failed: {kind}")
+
+    if "storeDetails" not in data:
+        raise StoreLookupError("Home Depot returned an empty response for that store.")
 
     raw = data.get("storeDetails")
     return _to_result(raw) if raw else None

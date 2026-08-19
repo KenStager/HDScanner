@@ -29,6 +29,13 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("store_snapshots", "clearance_percentage_off", "INTEGER"),
 )
 
+# Indexes have the same gap as columns: create_all adds them only alongside a
+# table it creates, never to one that already exists.
+_INDEX_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("ix_snapshot_store_item_ts", "store_snapshots", "store_id, item_id, ts"),
+    ("ix_snapshot_ts", "store_snapshots", "ts"),
+)
+
 
 def _get_engine_kwargs(url: str) -> dict:
     kwargs: dict = {}
@@ -89,13 +96,12 @@ class Database:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
+        def _reflect(sync_conn) -> dict[str, set[str]]:
+            insp = inspect(sync_conn)
+            return {t: {c["name"] for c in insp.get_columns(t)} for t in insp.get_table_names()}
+
         async with engine.connect() as conn:
-            existing = await conn.run_sync(
-                lambda sync_conn: {
-                    table: {c["name"] for c in inspect(sync_conn).get_columns(table)}
-                    for table in inspect(sync_conn).get_table_names()
-                }
-            )
+            existing = await conn.run_sync(_reflect)
 
         for table, column, col_type in _COLUMN_MIGRATIONS:
             if column in existing.get(table, set()):
@@ -112,6 +118,46 @@ class Database:
                 log.warning(
                     "Could not add column", table=table, column=column, error=str(exc)[:120]
                 )
+
+        for index, table, columns in _INDEX_MIGRATIONS:
+            if table not in existing:
+                continue
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({columns})")
+                    )
+            except Exception as exc:  # noqa: BLE001 - migration is best effort
+                log.warning("Could not create index", index=index, error=str(exc)[:120])
+
+        await self._ensure_enum_values(engine)
+
+    async def _ensure_enum_values(self, engine) -> None:
+        """Add enum members PostgreSQL cannot learn from create_all.
+
+        A database created before an AlertType member was added keeps the old
+        enum, and the first alert of that kind fails with "invalid input value
+        for enum". ALTER TYPE ... ADD VALUE cannot run inside a transaction
+        block, so this takes an AUTOCOMMIT connection rather than begin().
+        SQLite stores the enum as a string and needs none of it.
+        """
+        if engine.dialect.name != "postgresql":
+            return
+
+        from hd.db.models import AlertType
+
+        try:
+            async with engine.connect() as conn:
+                await conn.execution_options(isolation_level="AUTOCOMMIT")
+                for member in AlertType:
+                    await conn.execute(
+                        text(
+                            "ALTER TYPE alerttype ADD VALUE IF NOT EXISTS "
+                            f"'{member.name}'"
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - best effort, fresh installs need none
+            log.warning("Could not reconcile alerttype enum", error=str(exc)[:120])
 
     async def close_db(self) -> None:
         """Dispose of the engine."""
