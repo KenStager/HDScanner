@@ -23,6 +23,16 @@ def _run(coro):
 
 
 @app.command()
+def setup() -> None:
+    """Interactive first-run setup: find your stores and brands, write .env."""
+    from pathlib import Path
+
+    from hd.setup_wizard import run_setup
+
+    raise typer.Exit(_run(run_setup(Path.cwd())))
+
+
+@app.command()
 def init_db() -> None:
     """Create/migrate tables and seed default stores."""
     setup_logging()
