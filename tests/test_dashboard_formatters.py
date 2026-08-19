@@ -7,7 +7,9 @@ from decimal import Decimal
 
 from hd.dashboard.components.formatters import (
     alert_type_icon,
+    fmt_history_span,
     fmt_inventory_qty,
+    fmt_low_date,
     fmt_observed_drop,
     fmt_pct,
     fmt_pct_nonzero,
@@ -20,6 +22,7 @@ from hd.dashboard.components.formatters import (
     product_status_badge,
     severity_color,
     stock_badge,
+    store_price_verdict,
 )
 
 
@@ -394,3 +397,104 @@ class TestFormatAlertDetails:
         payload = {"product_title": "Milwaukee M18 FUEL Hammer Drill"}
         result = format_alert_details("BACK_IN_STOCK", payload)
         assert "Milwaukee" in result
+
+
+class TestFmtHistorySpan:
+    def test_reports_observed_days(self):
+        assert fmt_history_span(3, 90) == "3d"
+        assert fmt_history_span(17, 90) == "17d"
+
+    def test_caps_at_window_ceiling(self):
+        """Past the retention edge the true span is unknowable — stop counting."""
+        assert fmt_history_span(90, 90) == "3mo+"
+        assert fmt_history_span(400, 90) == "3mo+"
+
+    def test_no_history(self):
+        assert fmt_history_span(None, 90) == "-"
+
+    def test_cap_label_follows_window(self):
+        assert fmt_history_span(60, 60) == "2mo+"
+        assert fmt_history_span(30, 30) == "1mo+"
+
+
+class TestFmtLowDate:
+    def test_same_year_omits_it(self):
+        now = datetime.now(timezone.utc)
+        assert fmt_low_date(datetime(now.year, 5, 10)) == "May 10"
+
+    def test_other_year_is_disambiguated(self):
+        now = datetime.now(timezone.utc)
+        assert fmt_low_date(datetime(now.year - 1, 5, 10)).endswith(str(now.year - 1))
+
+    def test_accepts_iso_string(self):
+        now = datetime.now(timezone.utc)
+        assert fmt_low_date(f"{now.year}-05-10 20:07:06") == "May 10"
+
+    def test_missing_or_unparseable(self):
+        assert fmt_low_date(None) == ""
+        assert fmt_low_date("not-a-date") == ""
+
+
+class TestStorePriceVerdict:
+    """The one-chip verdict on a store card, from witnessed facts only."""
+
+    def _stats(self, low, high, obs_days=10, low_ts=None, first_ts=None):
+        now = datetime.now(timezone.utc)
+        return {
+            "low_price": low,
+            "high_price": high,
+            "obs_days": obs_days,
+            "low_ts": low_ts or now.replace(month=5, day=10),
+            "first_ts": first_ts or now.replace(month=3, day=4),
+        }
+
+    def test_silent_without_stats(self):
+        assert store_price_verdict(59.97, None) is None
+        assert store_price_verdict(59.97, {}) is None
+
+    def test_silent_without_price(self):
+        assert store_price_verdict(None, self._stats(50, 60)) is None
+
+    def test_silent_on_single_observation(self):
+        """One data point is not evidence — no chip, per the empty-state rule."""
+        assert store_price_verdict(59.97, self._stats(59.97, 59.97, obs_days=1)) is None
+
+    def test_below_recorded_low(self):
+        """A clearance price under everything witnessed — the strongest signal."""
+        label, cls = store_price_verdict(21.00, self._stats(59.97, 59.97))
+        assert label == "below recorded low"
+        assert cls == "best"
+
+    def test_lowest_recorded_when_matching_varied_low(self):
+        label, cls = store_price_verdict(99.00, self._stats(99.00, 169.00))
+        assert label == "lowest recorded"
+        assert cls == "best"
+
+    def test_seen_lower_is_dated(self):
+        """The date is what makes the anchor auditable."""
+        label, cls = store_price_verdict(169.00, self._stats(99.00, 169.00))
+        assert label.startswith("seen $99.00")
+        assert "May 10" in label
+        assert cls == "above"
+
+    def test_flat_history_is_dated(self):
+        label, cls = store_price_verdict(59.97, self._stats(59.97, 59.97, obs_days=3))
+        assert label.startswith("flat since ")
+        assert "Mar 4" in label
+        assert cls == "flat"
+
+
+class TestFormatPriceChangeInStoreClearance:
+    def test_with_previous_value_shows_transition(self):
+        payload = {
+            "clearance_value": 21.00,
+            "clearance_percentage_off": 65,
+            "prev_clearance_value": 53.97,
+        }
+        result = format_price_change("IN_STORE_CLEARANCE", payload)
+        assert result == "In-store clearance $53.97 → $21.00 (65% off)"
+
+    def test_without_previous_value(self):
+        payload = {"clearance_value": 53.97, "clearance_percentage_off": 10}
+        result = format_price_change("IN_STORE_CLEARANCE", payload)
+        assert result == "In-store clearance $53.97 (10% off)"

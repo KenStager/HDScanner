@@ -15,7 +15,12 @@ import html as _html
 from nicegui import ui
 
 from hd.dashboard import _state
-from hd.dashboard.components.formatters import fmt_ts, fmt_ts_relative
+from hd.dashboard.components.formatters import (
+    fmt_history_span,
+    fmt_low_date,
+    fmt_ts,
+    fmt_ts_relative,
+)
 from hd.dashboard.components.header import render_header
 from hd.dashboard.pipeline_runner import run_pipeline_background
 from hd.dashboard.queries import (
@@ -66,6 +71,10 @@ async def overview_page() -> None:
 
         online_visible = [d for d in online if not d["dismissed"]]
         online_hidden = [d for d in online if d["dismissed"]]
+        # The grid is the best of the best; "we saw it cheaper" cards live in
+        # a small labeled strip below it, not in grid slots.
+        online_grid = [d for d in online_visible if d.get("tier") != "warned"]
+        online_warned = [d for d in online_visible if d.get("tier") == "warned"]
 
         # Tabs: one per store + ONLINE
         with ui.row().classes("w-full px-6 gap-8 mt-2"):
@@ -80,7 +89,7 @@ async def overview_page() -> None:
             active = "active" if view["store"] == ONLINE_TAB else ""
             ui.html(
                 f'<button class="hd-storetab {active}">'
-                f'Online <span class="count">{len(online_visible)}</span></button>'
+                f'Online <span class="count">{len(online_grid)}</span></button>'
             ).on("click", lambda _: _set(view, "store", ONLINE_TAB, content))
 
         is_online = view["store"] == ONLINE_TAB
@@ -108,10 +117,11 @@ async def overview_page() -> None:
                       lambda: _set(view, "sort", "newest", content))
 
         if is_online:
-            deals = online_visible
+            deals = online_grid
             if view["min_pct"]:
                 deals = [d for d in deals
-                         if max(d["claimed_pct"], d["true_pct"]) >= view["min_pct"]]
+                         if max(d["claimed_pct"], d.get("evidence_pct") or 0)
+                         >= view["min_pct"]]
         else:
             deals = list(deals_by_store.get(view["store"], []))
             if view["min_pct"]:
@@ -128,9 +138,19 @@ async def overview_page() -> None:
                     _render_deal(d, is_online, _dismiss, store_key)
         else:
             with ui.column().classes("w-full items-center py-12"):
-                label = "No online deals right now" if is_online and not online_visible \
+                label = "No online deals right now" if is_online and not online_grid \
                     else "Nothing matches these filters"
                 ui.label(label).classes("text-grey")
+
+        # The warning strip: HD claims a discount, we watched it sell for less.
+        # Still possibly today's best available price — shown, but apart.
+        if is_online and online_warned:
+            ui.html('<div class="hd-section-label px-6 mt-6">'
+                    'HD claims — we\'ve seen these cheaper</div>') \
+                .classes("w-full")
+            with ui.element("div").classes("deal-grid w-full px-6 mt-2"):
+                for d in online_warned:
+                    _render_deal(d, True, _dismiss, ONLINE_TAB)
 
         # Hidden deals — dimmed, with restore
         if view["show_hidden"] and hidden_here:
@@ -148,12 +168,16 @@ async def overview_page() -> None:
 def _render_deal(d: dict, is_online: bool, dismiss, store_key: str,
                  hidden: bool = False, restore=None) -> None:
     """One deal card with its hide/restore control layered on top."""
-    html = _online_card_html(d) if is_online else _deal_card_html(d)
+    cap_days = _state.settings.deal_history_window_days
+    html = _online_card_html(d, cap_days) if is_online else _deal_card_html(d)
     wrap_cls = "deal-wrap dimmed" if hidden else "deal-wrap"
     value = d["price"] if is_online else d["clearance_value"]
 
     with ui.element("div").classes(wrap_cls):
-        ui.html(html)
+        # sanitize=False: NiceGUI's sanitizer drops target=, so the card opened
+        # in the same tab. Safe here because every interpolated value in the
+        # card builders is html-escaped where it is inserted.
+        ui.html(html, sanitize=False)
         if hidden and restore is not None:
             ui.button(icon="visibility",
                       on_click=lambda _, s=store_key, i=d["item_id"]: restore(s, i)) \
@@ -200,7 +224,7 @@ def _deal_card_html(d: dict) -> str:
     pct = int(d["pct_off"] or 0)
     hot = " hot" if pct >= 50 else ""
     title = _html.escape(d["title"])
-    url = _html.escape(d["url"], quote=True)
+    url = f'/products/{_html.escape(str(d["item_id"]), quote=True)}'
 
     if d.get("image_url"):
         img = f'<img src="{_html.escape(d["image_url"], quote=True)}" alt="" loading="lazy">'
@@ -240,10 +264,17 @@ def _deal_card_html(d: dict) -> str:
     )
 
 
-def _online_card_html(d: dict) -> str:
-    """Online deal shelf tag: HD's claim on the flash, the truth in the chips."""
+def _online_card_html(d: dict, cap_days: int) -> str:
+    """Online deal shelf tag.
+
+    The flash carries OUR number: a verified card headlines the depth our
+    record measured, and HD's claim is demoted to the word "claims" (on
+    unverified cards) or a small disagreement chip (when their number and
+    ours part ways). The chips carry the evidence — dated, with the span
+    that backs it — so a 3-day verdict can never pose as a 30-day one.
+    """
     title = _html.escape(d["title"])
-    url = _html.escape(d["url"], quote=True)
+    url = f'/products/{_html.escape(str(d["item_id"]), quote=True)}'
 
     if d.get("image_url"):
         img = f'<img src="{_html.escape(d["image_url"], quote=True)}" alt="" loading="lazy">'
@@ -251,32 +282,63 @@ def _online_card_html(d: dict) -> str:
         img = '<div class="placeholder">🔧</div>'
 
     price = f"${d['price']:,.2f}"
+    tier = d.get("tier", "unverified")
+    claimed = int(d["claimed_pct"] or 0)
+    true_pct = int(d["true_pct"] or 0)
+    witnessed = int(d.get("witnessed_pct") or 0)
+    evidence = int(d.get("evidence_pct") or 0)
+    label = "Special Buy" if d.get("special_buy") else "Online Deal"
+
+    if tier == "verified":
+        flash_pct = f"−{evidence}%"
+        # The struck price is one our own record saw it sell for, never HD's
+        # asserted original.
+        was_val = d.get("high_all") if witnessed >= true_pct else d.get("high_window")
+    else:
+        flash_pct = f"claims {claimed}%" if claimed else ""
+        was_val = d.get("original")
+
     was = (
-        f'<span class="deal-was">${d["original"]:,.2f}</span>'
-        if d.get("original") and d["original"] > d["price"]
+        f'<span class="deal-was">${was_val:,.2f}</span>'
+        if was_val and was_val > d["price"]
         else ""
     )
 
-    label = "Special Buy" if d.get("special_buy") else "Online Deal"
-    claimed = int(d["claimed_pct"] or 0)
-    true_pct = int(d["true_pct"] or 0)
+    chips = ""
+    if d.get("is_new"):
+        chips += '<span class="deal-chip new">NEW</span>'
 
-    # The honesty chip: our 30-day history vs HD's claimed discount
-    if true_pct >= 10:
-        truth = f'<span class="deal-chip true">true −{true_pct}% vs 30d</span>'
-    elif d.get("high_30d") is not None:
-        truth = '<span class="deal-chip flat">flat 30d price</span>'
+    span = fmt_history_span(d.get("history_days"), cap_days)
+    low = d.get("low_price")
+    if tier == "verified":
+        if true_pct >= witnessed:
+            chips += f'<span class="deal-chip true">true −{true_pct}% vs {span}</span>'
+        elif low is not None and d["price"] <= low:
+            watched = fmt_history_span(d.get("obs_days"), cap_days)
+            chips += f'<span class="deal-chip best">lowest recorded · {watched}</span>'
+        elif d.get("high_all") is not None:
+            watched = fmt_history_span(d.get("obs_days"), cap_days)
+            chips += (f'<span class="deal-chip">high ${d["high_all"]:,.0f}'
+                      f' · {watched}</span>')
+        # HD's number gets a chip only when it materially disagrees with ours
+        if claimed and abs(claimed - evidence) > 5:
+            chips += f'<span class="deal-chip">HD claims {claimed}%</span>'
+    elif tier == "warned":
+        when = fmt_low_date(d.get("low_ts"))
+        chips += (f'<span class="deal-chip above">seen ${low:,.2f}'
+                  f'{" · " + when if when else ""}</span>')
     else:
-        truth = '<span class="deal-chip">no price history</span>'
-
-    chips = truth
-    if d.get("high_30d") and d["high_30d"] > d["price"]:
-        chips += f'<span class="deal-chip">high ${d["high_30d"]:,.0f}</span>'
+        # Unverified: the record is too young to speak. Say what little we
+        # know, or nothing — a chip on 3 of every 4 cards is noise.
+        if d.get("high_window") is not None and true_pct < 10:
+            chips += f'<span class="deal-chip flat">flat {span} price</span>'
+        if low is not None and d.get("price_varied") and d["price"] <= low:
+            chips += '<span class="deal-chip best">lowest recorded</span>'
 
     return (
         f'<a class="deal-card" href="{url}" target="_blank" rel="noopener">'
         f'<div class="deal-img">{img}</div>'
-        f'<div class="deal-flash online"><span>{label}</span><span>{claimed}% off</span></div>'
+        f'<div class="deal-flash online"><span>{label}</span><span>{flash_pct}</span></div>'
         f'<div class="deal-price-row"><span class="deal-price">{price}</span>{was}</div>'
         f'<div class="deal-title">{title}</div>'
         f'<div class="deal-foot">{chips}</div>'

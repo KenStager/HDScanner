@@ -92,6 +92,17 @@ class Settings(BaseSettings):
     # fresh deal as "flat price". Below this age, say "no price history".
     price_history_min_days: int = 3
 
+    # The honesty chip compares today's price to the highest price we observed
+    # in this window, and labels itself with the span it actually saw rather
+    # than a fixed "30d" the data may not support. Bounded by
+    # snapshot_retention_days — older snapshots are pruned, so a wider window
+    # would claim history that no longer exists. At or above this span the
+    # label caps at "3mo+". Kept separate from baseline_window_days, which
+    # drives alerting in the diff stage. Do not raise this past ~95 days: the
+    # scanner was parked May 15 - Aug 15 2026, and a wider window would reach
+    # back over that gap and score today's prices against pre-parking ones.
+    deal_history_window_days: int = 90
+
     # Inter-keyword pacing
     keyword_pause_min_seconds: float = 3.0
     keyword_pause_max_seconds: float = 8.0

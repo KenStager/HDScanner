@@ -15,6 +15,7 @@ from hd.db.models import (
     Alert,
     AlertType,
     Base,
+    ItemPriceStat,
     Product,
     Severity,
     Store,
@@ -155,6 +156,23 @@ async def seeded_settings(dashboard_settings: Settings) -> Settings:
             payload={},
         ))
 
+        # Durable price stats — one configured store, one retired store id
+        # that must never leak onto the product page
+        session.add(ItemPriceStat(
+            store_id="2619", item_id="100001",
+            low_price=Decimal("149.00"), low_ts=now - timedelta(hours=2),
+            high_price=Decimal("199.00"), high_ts=now - timedelta(days=20),
+            price_sum=Decimal("348.00"), obs_count=2, obs_days=2,
+            first_ts=now - timedelta(days=20), last_ts=now - timedelta(hours=2),
+        ))
+        session.add(ItemPriceStat(
+            store_id="9999", item_id="100001",
+            low_price=Decimal("1.00"), low_ts=now,
+            high_price=Decimal("1.00"), high_ts=now,
+            price_sum=Decimal("1.00"), obs_count=1, obs_days=1,
+            first_ts=now, last_ts=now,
+        ))
+
     yield dashboard_settings
 
     await db_base._default.close_db()
@@ -241,6 +259,28 @@ class TestProductDetail:
         assert detail["product"] is None
         assert detail["snapshots"] == []
         assert detail["alerts"] == []
+        assert detail["price_stats"] == {}
+
+    async def test_snapshots_carry_clearance_fields(self, seeded_settings: Settings):
+        """The page leads with the price you'd pay — clearance must be there."""
+        detail = await get_product_detail(seeded_settings, "100001")
+        latest_2619 = [s for s in detail["snapshots"] if s["store_id"] == "2619"][-1]
+        assert latest_2619["clearance_value"] == 99.00
+        assert latest_2619["clearance_percentage_off"] == 50
+
+    async def test_price_stats_per_store(self, seeded_settings: Settings):
+        detail = await get_product_detail(seeded_settings, "100001")
+        stats = detail["price_stats"]["2619"]
+        assert stats["low_price"] == 149.00
+        assert stats["high_price"] == 199.00
+        assert stats["obs_days"] == 2
+        assert stats["low_ts"] is not None
+        assert stats["first_ts"] is not None
+
+    async def test_price_stats_exclude_unconfigured_store(self, seeded_settings: Settings):
+        """Retired store ids in item_price_stats must not leak onto the page."""
+        detail = await get_product_detail(seeded_settings, "100001")
+        assert "9999" not in detail["price_stats"]
 
 
 class TestAlerts:
@@ -572,6 +612,223 @@ class TestOnlineDealsHistoryDepth:
             ))
         deals = await get_online_deals(seeded_settings)
         deal = next(d for d in deals if d["item_id"] == "100002")
-        assert deal["high_30d"] is None   # no verdict — history too shallow
+        assert deal["high_window"] is None   # no verdict — history too shallow
+        assert deal["history_days"] is None
         assert deal["true_pct"] == 0
         assert deal["claimed_pct"] == 50
+
+    async def test_verdict_reports_the_span_it_observed(self, seeded_settings: Settings):
+        """A verdict must carry the age of the history behind it, not a fixed window."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now - timedelta(days=20),
+                price_value=Decimal("199.00"), in_stock=True,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002", ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True, in_stock=True,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["history_days"] == 20
+        assert deal["high_window"] == 199.00
+        assert deal["true_pct"] == 50
+
+    async def test_history_predating_the_window_is_not_counted(self, seeded_settings: Settings):
+        """Snapshots older than the window are pruned territory — never claim them."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        window = seeded_settings.deal_history_window_days
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(   # far outside the window
+                store_id="2619", item_id="100002",
+                ts=now - timedelta(days=window + 60),
+                price_value=Decimal("999.00"), in_stock=True,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now - timedelta(days=10),
+                price_value=Decimal("199.00"), in_stock=True,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002", ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True, in_stock=True,
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["history_days"] == 10       # not window + 60
+        assert deal["high_window"] == 199.00    # the $999 outlier is out of scope
+
+
+class TestOnlineDealPriceAnchor:
+    """The witnessed-low anchor: durable, dated, and suppressed when it says nothing."""
+
+    async def _seed(self, settings, *, low, high, low_days_ago, price):
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.db import base as db_base
+        from hd.db.models import ItemPriceStat, StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002", ts=now,
+                price_value=Decimal(str(price)), price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True, in_stock=True,
+            ))
+            session.add(ItemPriceStat(
+                store_id="2619", item_id="100002",
+                low_price=Decimal(str(low)), low_ts=now - timedelta(days=low_days_ago),
+                high_price=Decimal(str(high)), high_ts=now - timedelta(days=30),
+                price_sum=Decimal("500.00"), obs_count=5, obs_days=5,
+                first_ts=now - timedelta(days=40), last_ts=now,
+            ))
+
+    async def test_exposes_a_witnessed_lower_price(self, seeded_settings: Settings):
+        from hd.dashboard.queries import get_online_deals
+
+        await self._seed(seeded_settings, low=42.93, high=99.00, low_days_ago=100, price=49.97)
+        deal = next(d for d in await get_online_deals(seeded_settings)
+                    if d["item_id"] == "100002")
+        assert deal["low_price"] == 42.93
+        assert deal["price_varied"] is True
+        assert deal["low_is_older"] is True
+
+    async def test_flat_price_item_reports_no_variation(self, seeded_settings: Settings):
+        """low == high means the price never moved; the anchor must stay silent."""
+        from hd.dashboard.queries import get_online_deals
+
+        await self._seed(seeded_settings, low=49.97, high=49.97, low_days_ago=100, price=49.97)
+        deal = next(d for d in await get_online_deals(seeded_settings)
+                    if d["item_id"] == "100002")
+        assert deal["price_varied"] is False
+
+    async def test_low_set_today_is_not_treated_as_history(self, seeded_settings: Settings):
+        """An item seen once is at its low by definition — not a fact worth showing."""
+        from hd.dashboard.queries import get_online_deals
+
+        await self._seed(seeded_settings, low=42.93, high=99.00, low_days_ago=0, price=42.93)
+        deal = next(d for d in await get_online_deals(seeded_settings)
+                    if d["item_id"] == "100002")
+        assert deal["low_is_older"] is False
+
+    async def test_missing_stats_leave_the_anchor_empty(self, seeded_settings: Settings):
+        """Items with no aggregate row must not break the card."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002", ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"), price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True, in_stock=True,
+            ))
+        deal = next(d for d in await get_online_deals(seeded_settings)
+                    if d["item_id"] == "100002")
+        assert deal["low_price"] is None
+        assert deal["price_varied"] is False
+
+
+class TestDealTier:
+    """Evidence classifies the card; the grid leads with what we can vouch for."""
+
+    def _deal(self, **kw):
+        d = {"price": 100.0, "claimed_pct": 40, "true_pct": 0,
+             "evidence_pct": 0, "witnessed_pct": 0, "obs_days": None,
+             "low_price": None, "low_ts": None, "low_is_older": False,
+             "price_varied": False}
+        d.update(kw)
+        return d
+
+    def test_claim_only_card_is_unverified(self):
+        from hd.dashboard.queries import deal_tier
+        assert deal_tier(self._deal()) == "unverified"
+
+    def test_measured_depth_makes_it_verified(self):
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(evidence_pct=40, witnessed_pct=40,
+                       low_price=100.0, low_is_older=True, price_varied=True)
+        assert deal_tier(d) == "verified"
+
+    def test_above_recorded_low_is_warned(self):
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, low_price=100.0, low_is_older=True,
+                       price_varied=True, evidence_pct=15)
+        assert deal_tier(d) == "warned"
+
+    def test_warning_outranks_a_verified_discount(self):
+        """"We watched it sell for less" is decisive, even beside a real drop."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, true_pct=30, evidence_pct=30,
+                       low_price=100.0, low_is_older=True, price_varied=True)
+        assert deal_tier(d) == "warned"
+
+    def test_long_watched_flat_claim_is_hollow(self):
+        """A 'was' price that never existed in 10+ watched days is disproven."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price_varied=False, obs_days=12)
+        assert deal_tier(d) == "hollow"
+
+    def test_briefly_watched_flat_claim_stays_on_the_board(self):
+        """The record is young — a 3-day flat watch proves nothing yet."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price_varied=False, obs_days=3)
+        assert deal_tier(d) == "unverified"
+
+
+class TestStorePageUrl:
+    """Home Depot store pages — the only way to point a browser at a store."""
+
+    def _store(self, **kw):
+        from hd.db.models import Store
+        base = dict(store_id="8452", name="Hadley", state="MA",
+                    zip="01035", city="Hadley")
+        base.update(kw)
+        return Store(**base)
+
+    def test_builds_the_verified_format(self):
+        from hd.dashboard.queries import store_page_url
+        assert store_page_url(self._store()) == (
+            "https://www.homedepot.com/l/Hadley/MA/Hadley/01035/8452"
+        )
+
+    def test_city_falls_back_to_store_name(self):
+        from hd.dashboard.queries import store_page_url
+        assert store_page_url(self._store(city=None)) == (
+            "https://www.homedepot.com/l/Hadley/MA/Hadley/01035/8452"
+        )
+
+    def test_city_differing_from_name_is_respected(self):
+        """A store named for a neighbourhood still sits in its city."""
+        from hd.dashboard.queries import store_page_url
+        url = store_page_url(self._store(name="N. Cambridge", city="Cambridge"))
+        assert url == (
+            "https://www.homedepot.com/l/N.-Cambridge/MA/Cambridge/01035/8452"
+        )
+
+    def test_missing_details_yield_no_link(self):
+        """The stale 8425 row has no location — it must not produce a bad URL."""
+        from hd.dashboard.queries import store_page_url
+        assert store_page_url(self._store(zip=None)) is None
+        assert store_page_url(self._store(name=None, city=None)) is None
+        assert store_page_url(self._store(state=None)) is None

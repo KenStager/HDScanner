@@ -99,7 +99,9 @@ a.deal-card:focus-visible { outline: 3px solid var(--hd-orange); outline-offset:
 }
 .deal-foot {
   display: flex; gap: 6px; align-items: center; padding: 0 10px 10px 10px;
-  flex-wrap: nowrap; overflow: hidden; min-height: 30px;
+  /* wrap rather than clip: nowrap+hidden amputated the anchor chip, which
+     renders last and carries the evidence */
+  flex-wrap: wrap; row-gap: 4px; min-height: 30px;
 }
 .deal-chip { white-space: nowrap; }
 .deal-chip {
@@ -110,6 +112,9 @@ a.deal-card:focus-visible { outline: 3px solid var(--hd-orange); outline-offset:
 .deal-chip.new { background: var(--hd-orange); color: #fff; }
 .deal-chip.true { background: #1a7f37; color: #fff; }
 .deal-chip.flat { background: #FFF3BF; color: #6b5d00; }
+/* durable price anchors: witnessed best price vs paying above a witnessed one */
+.deal-chip.best { background: #0b6bcb; color: #fff; }
+.deal-chip.above { background: var(--hd-red); color: #fff; }
 
 /* online deal flash */
 .deal-flash.online { background: var(--hd-orange); color: #fff; }
@@ -147,6 +152,129 @@ a.deal-card:focus-visible { outline: 3px solid var(--hd-orange); outline-offset:
 .hd-section-label {
   font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 0.95rem;
   letter-spacing: 0.12em; text-transform: uppercase; color: var(--hd-muted);
+}
+
+/* ---- product detail: the item's dossier ---- */
+.pd-wrap { max-width: 1160px; margin: 0 auto; width: 100%; padding: 0 24px; }
+.pd-back {
+  font-size: 0.8rem; font-weight: 500; color: var(--hd-muted);
+  text-decoration: none;
+}
+.pd-back:hover { color: var(--hd-text); }
+
+.pd-identity { display: flex; gap: 20px; align-items: flex-start; margin-top: 14px; }
+.pd-img {
+  width: 108px; height: 108px; background: #FFFFFF; border-radius: 6px;
+  flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+}
+.pd-img img { max-width: 86%; max-height: 86%; object-fit: contain; }
+.pd-img .placeholder { color: #C9CCD1; font-size: 2.4rem; }
+.pd-title {
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
+  font-size: 1.85rem; line-height: 1.12; color: var(--hd-text); margin: 0;
+}
+.pd-meta {
+  display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px;
+  color: var(--hd-muted); font-size: 0.82rem;
+}
+.pd-meta a { color: var(--hd-orange); text-decoration: none; }
+.pd-meta a:hover { text-decoration: underline; }
+
+/* store verdict cards */
+.pd-stores {
+  display: grid; gap: 16px; margin-top: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+}
+.pd-store { background: var(--hd-surface); border-radius: 8px; overflow: hidden; }
+.pd-store-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 12px 16px 0 16px;
+}
+.pd-store-name {
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 600;
+  font-size: 1.2rem; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--hd-text); display: flex; align-items: center; gap: 8px;
+}
+.pd-store-scan { color: var(--hd-muted); font-size: 0.75rem; }
+.pd-flash {
+  margin-top: 10px; padding: 4px 16px;
+  background: var(--hd-yellow); color: #111;
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
+  font-size: 1rem; letter-spacing: 0.08em; text-transform: uppercase;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.pd-flash.hot { background: var(--hd-red); color: #fff; }
+.pd-flash.online { background: var(--hd-orange); color: #fff; }
+.pd-price-row {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 12px 16px 0 16px;
+}
+.pd-price {
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
+  font-size: 2.5rem; line-height: 1; color: var(--hd-text);
+}
+.pd-was { color: var(--hd-muted); font-size: 0.95rem; text-decoration: line-through; }
+.pd-stock {
+  display: flex; align-items: center; gap: 8px; padding: 8px 16px 0 16px;
+  color: var(--hd-muted); font-size: 0.85rem;
+}
+.pd-store-links { padding: 12px 16px 14px 16px; font-size: 0.8rem; line-height: 1.6; }
+.pd-store-links a { color: var(--hd-muted); text-decoration: underline; }
+.pd-store-links a:hover { color: var(--hd-text); }
+.pd-store-links .hint { color: var(--hd-muted); opacity: 0.7; font-size: 0.72rem; }
+
+/* store hue dots — same assignment as the chart series */
+.pd-dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+/* price record — witnessed facts from item_price_stats */
+.pd-record { background: var(--hd-surface); border-radius: 8px; padding: 4px 16px; }
+.pd-record-row {
+  display: flex; align-items: baseline; gap: 12px 28px; flex-wrap: wrap;
+  padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.pd-record-row:last-child { border-bottom: none; }
+.pd-record-store {
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 600;
+  font-size: 1.05rem; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--hd-text); min-width: 110px;
+  display: flex; align-items: center; gap: 8px;
+}
+.pd-fact { display: flex; align-items: baseline; gap: 7px; }
+.pd-fact .k {
+  color: var(--hd-muted); font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.pd-fact .v {
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
+  font-size: 1.25rem; color: var(--hd-text);
+}
+.pd-fact .d { color: var(--hd-muted); font-size: 0.8rem; }
+.pd-record-note { color: var(--hd-muted); font-size: 0.85rem; }
+
+/* chart + section panels */
+.pd-section { margin-top: 26px; }
+.pd-panel { background: var(--hd-surface); border-radius: 8px; padding: 14px 16px 8px 16px; margin-top: 10px; }
+
+/* activity feed */
+.pd-feed { background: var(--hd-surface); border-radius: 8px; padding: 4px 16px; margin-top: 10px; }
+.pd-feed-row {
+  display: flex; gap: 14px; align-items: baseline; padding: 9px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 0.85rem;
+}
+.pd-feed-row:last-child { border-bottom: none; }
+.pd-feed-when { color: var(--hd-muted); flex: 0 0 118px; font-size: 0.78rem; }
+.pd-feed-store { color: var(--hd-text); flex: 0 0 96px; }
+.pd-feed-what { color: var(--hd-text); }
+.pd-feed-what .sev { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 8px; vertical-align: middle; }
+.pd-feed-what .sev.high { background: var(--hd-red); }
+.pd-feed-what .sev.medium { background: var(--hd-orange); }
+.pd-feed-what .sev.low { background: #3fb950; }
+
+.pd-empty { color: var(--hd-muted); font-size: 0.9rem; padding: 8px 0; }
+
+@media (max-width: 640px) {
+  .pd-identity { flex-direction: column; }
+  .pd-feed-row { flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {

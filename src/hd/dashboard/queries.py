@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy import and_, case, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,7 @@ from hd.db.models import (
     Alert,
     AlertType,
     DismissedDeal,
+    ItemPriceStat,
     Product,
     Severity,
     Store,
@@ -287,7 +289,8 @@ async def get_product_detail(
         ).scalar_one_or_none()
 
         if product is None:
-            return {"product": None, "snapshots": [], "alerts": []}
+            return {"product": None, "snapshots": [], "alerts": [],
+                    "store_names": {}, "store_urls": {}, "price_stats": {}}
 
         # Snapshots within time window, ordered ASC
         cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
@@ -309,7 +312,45 @@ async def get_product_detail(
         )
         alert_rows = alerts_result.scalars().all()
 
+        # Store names so the page can say "Greenfield", the way the deal board
+        # labels its tabs, rather than a bare store number.
+        store_rows = (await session.execute(select(Store))).scalars().all()
+        store_names = {st.store_id: st.name for st in store_rows if st.name}
+        store_urls = {
+            st.store_id: url
+            for st in store_rows
+            if (url := store_page_url(st)) is not None
+        }
+
+        # Durable per-store price facts — the record that outlives pruning and
+        # the coverage gap. Filtered to configured stores so retired store rows
+        # (e.g. a reseeded store id) can't leak onto the page.
+        stats_rows = (
+            await session.execute(
+                select(ItemPriceStat).where(
+                    ItemPriceStat.item_id == item_id,
+                    ItemPriceStat.store_id.in_(settings.store_list),
+                )
+            )
+        ).scalars().all()
+        price_stats = {
+            st.store_id: {
+                "low_price": float(st.low_price) if st.low_price is not None else None,
+                "low_ts": st.low_ts,
+                "high_price": float(st.high_price) if st.high_price is not None else None,
+                "high_ts": st.high_ts,
+                "obs_count": st.obs_count,
+                "obs_days": st.obs_days,
+                "first_ts": st.first_ts,
+                "last_ts": st.last_ts,
+            }
+            for st in stats_rows
+        }
+
         return {
+            "store_names": store_names,
+            "store_urls": store_urls,
+            "price_stats": price_stats,
             "product": {
                 "item_id": product.item_id,
                 "brand": product.brand,
@@ -328,6 +369,11 @@ async def get_product_detail(
                     "price_original": float(s.price_original) if s.price_original is not None else None,
                     "savings_center": s.savings_center,
                     "percentage_off": s.percentage_off,
+                    "special_buy": s.special_buy,
+                    "clearance_value": (
+                        float(s.clearance_value) if s.clearance_value is not None else None
+                    ),
+                    "clearance_percentage_off": s.clearance_percentage_off,
                     "inventory_qty": s.inventory_qty,
                     "in_stock": s.in_stock,
                     "out_of_stock": s.out_of_stock,
@@ -681,29 +727,130 @@ async def restore_deal(settings: Settings, store_id: str, item_id: str) -> None:
             await session.delete(existing)
 
 
+# The online grid's job is "best of the best": deals our own record can vouch
+# for lead, ranked by our measured depth rather than HD's claim. Claim-only
+# deals are not excluded — the record is young and most items simply haven't
+# been watched yet — but they rotate through a reserved block of slots behind
+# the evidence-backed tier, and graduate (or die) as their history develops.
+ONLINE_DISPLAY_LIMIT = 60
+# Rotation reserve: slots the unverified tier always keeps, so newly appearing
+# claims surface while their evidence is still developing instead of being
+# crowded out by a settled verified tier.
+ONLINE_UNVERIFIED_SLOTS = 15
+# The warning strip under the grid: deals we watched sell for less. A current
+# price can still be the best available today, so they stay visible — but as
+# a small labeled strip, not competitors for grid slots.
+ONLINE_WARNING_SLOTS = 6
+# A claim-only card whose price we have watched this many distinct days
+# without a single move is disproven — the "was" price never existed while we
+# were looking — and leaves the board entirely.
+HOLLOW_CLAIM_MIN_DAYS = 10
+# Minimum measured depth for the evidence-backed tier
+VERIFIED_MIN_PCT = 10
+
+
+def deal_tier(deal: dict[str, Any]) -> str:
+    """Classify a candidate by the strength of our own evidence.
+
+    'verified'   — our record vouches for a real discount: a measured drop in
+                   the recent window, or the price sits at our witnessed low
+                   with a witnessed high meaningfully above it.
+    'warned'     — we watched it sell for less than today's "deal".
+    'hollow'     — claim-only, and we watched the price long enough to say the
+                   claimed "was" never existed. Dropped from the board.
+    'unverified' — HD's claim is all there is, and our record is too young to
+                   corroborate or contradict it.
+    """
+    low = deal.get("low_price")
+    if (
+        low is not None and deal.get("price_varied") and deal.get("low_is_older")
+        and deal["price"] > low
+    ):
+        return "warned"
+    if deal.get("evidence_pct", 0) >= VERIFIED_MIN_PCT:
+        return "verified"
+    if (
+        not deal.get("price_varied")
+        and (deal.get("obs_days") or 0) >= HOLLOW_CLAIM_MIN_DAYS
+    ):
+        return "hollow"
+    return "unverified"
+
+
+def store_page_url(store: Store) -> str | None:
+    """Home Depot's page for one store, or None if we lack the parts.
+
+    Verified format: /l/<name>/<state>/<city>/<zip>/<store_id>. The site
+    localizes by cookie and honours no store query parameter, so this page —
+    and its "Shop This Store" button — is the only way to point a browser at a
+    specific store. City falls back to the store name, which is correct for
+    stores whose name is their city.
+    """
+    city = store.city or store.name
+    if not (store.name and store.state and city and store.zip and store.store_id):
+        return None
+    parts = [store.name, store.state, city, store.zip, store.store_id]
+    return "https://www.homedepot.com/l/" + "/".join(
+        quote(str(p).replace(" ", "-"), safe="") for p in parts
+    )
+
+
+def _is_older_day(low_ts, snapshot_ts) -> bool:
+    """Was the low set on an earlier day than the reading we are showing?
+
+    An item observed once is at its all-time low by definition, which is not a
+    fact worth a badge. Requiring an earlier day keeps "lowest recorded" to
+    items whose price we actually watched hold.
+    """
+    if low_ts is None or snapshot_ts is None:
+        return False
+    return low_ts.date() < snapshot_ts.date()
+
+
 async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
     """Online deals (special buys, price drops) with honest savings.
 
     Uses the latest snapshot per item at the reference store. claimed_pct is
-    what HD advertises; true_pct compares today's price to our own 30-day
-    high — the number that exposes inflated "was" prices.
+    what HD advertises; true_pct compares today's price to the highest price
+    we observed in the history window — the number that exposes inflated "was"
+    prices. history_days reports how much history actually backs that verdict,
+    so the UI can label its own confidence instead of implying a fixed span.
     """
     ref_store = settings.store_list[0] if settings.store_list else None
     if ref_store is None:
         return []
 
     latest_sub = _latest_snapshots_subquery()
-    cutoff_30d = datetime.now(timezone.utc) - timedelta(days=settings.baseline_window_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.deal_history_window_days)
     baseline_sub = (
         select(
             StoreSnapshot.item_id,
-            func.max(StoreSnapshot.price_value).label("high_30d"),
+            func.max(StoreSnapshot.price_value).label("high_window"),
             func.min(StoreSnapshot.ts).label("first_ts"),
         )
         .where(
             StoreSnapshot.store_id == ref_store,
-            StoreSnapshot.ts >= cutoff_30d,
+            StoreSnapshot.ts >= cutoff,
             StoreSnapshot.price_value.isnot(None),
+        )
+        .group_by(StoreSnapshot.item_id)
+        .subquery()
+    )
+    # When the promo first appeared — "new" means the deal is new, not the
+    # product, mirroring the in-store board. Drives the rotation the board
+    # needs: fresh deals surface, long-standing ones don't read as news.
+    promo_first_sub = (
+        select(
+            StoreSnapshot.item_id,
+            func.min(StoreSnapshot.ts).label("promo_first_ts"),
+        )
+        .where(
+            StoreSnapshot.store_id == ref_store,
+            (
+                StoreSnapshot.special_buy.is_(True)
+                | (func.coalesce(StoreSnapshot.percentage_off, 0) > 0)
+                | (StoreSnapshot.price_original > StoreSnapshot.price_value)
+            ),
         )
         .group_by(StoreSnapshot.item_id)
         .subquery()
@@ -717,8 +864,13 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
                     Product.title,
                     Product.canonical_url,
                     Product.image_url,
-                    baseline_sub.c.high_30d,
+                    baseline_sub.c.high_window,
                     baseline_sub.c.first_ts,
+                    promo_first_sub.c.promo_first_ts,
+                    ItemPriceStat.low_price,
+                    ItemPriceStat.low_ts,
+                    ItemPriceStat.high_price,
+                    ItemPriceStat.obs_days,
                 )
                 .join(
                     latest_sub,
@@ -730,6 +882,14 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
                 )
                 .outerjoin(Product, StoreSnapshot.item_id == Product.item_id)
                 .outerjoin(baseline_sub, StoreSnapshot.item_id == baseline_sub.c.item_id)
+                .outerjoin(promo_first_sub, StoreSnapshot.item_id == promo_first_sub.c.item_id)
+                .outerjoin(
+                    ItemPriceStat,
+                    and_(
+                        ItemPriceStat.store_id == StoreSnapshot.store_id,
+                        ItemPriceStat.item_id == StoreSnapshot.item_id,
+                    ),
+                )
                 .where(
                     StoreSnapshot.store_id == ref_store,
                     StoreSnapshot.price_value.isnot(None),
@@ -754,7 +914,8 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
     min_history = timedelta(days=settings.price_history_min_days)
 
     deals: list[dict[str, Any]] = []
-    for snap, title, canonical_url, image_url, high_30d, first_ts in rows:
+    for (snap, title, canonical_url, image_url, high_window, first_ts,
+         promo_first_ts, low_price, low_ts, all_high, obs_days) in rows:
         # A price is not a deal if nothing can actually be bought: skip items
         # whose fulfillment data confirms every path is out of stock.
         if has_any_fulfillment(snap.raw_json) is False:
@@ -770,14 +931,32 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
         # something — a just-discovered item has no basis for "flat price".
         if first_ts is not None and first_ts.tzinfo is None:
             first_ts = first_ts.replace(tzinfo=timezone.utc)
-        has_history = first_ts is not None and (now - first_ts) >= min_history
-        high = float(high_30d) if has_history and high_30d is not None else None
+        observed = (now - first_ts) if first_ts is not None else None
+        has_history = observed is not None and observed >= min_history
+        high = float(high_window) if has_history and high_window is not None else None
+        history_days = observed.days if has_history else None
         true_pct = 0
         if high and high > value:
             true_pct = round((high - value) / high * 100)
 
-        if max(claimed, true_pct) < 10:
+        # Witnessed depth: today's price against the highest price we ever saw
+        # this item sell for — a dated fact from item_price_stats, immune to
+        # the coverage gap that starves the window verdict. Only meaningful
+        # when the price actually varied under our watching.
+        witnessed_pct = 0
+        if (
+            low_price is not None and all_high is not None
+            and low_price != all_high and float(all_high) > value
+        ):
+            witnessed_pct = round((float(all_high) - value) / float(all_high) * 100)
+
+        evidence_pct = max(true_pct, witnessed_pct)
+
+        if max(claimed, evidence_pct) < 10:
             continue
+
+        if promo_first_ts is not None and promo_first_ts.tzinfo is None:
+            promo_first_ts = promo_first_ts.replace(tzinfo=timezone.utc)
 
         deal = {
             "item_id": snap.item_id,
@@ -792,12 +971,52 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
             "original": original,
             "claimed_pct": claimed,
             "true_pct": true_pct,
-            "high_30d": high,
+            "high_window": high,
+            "history_days": history_days,
+            # Durable anchor from item_price_stats: a witnessed price, immune to
+            # the coverage gap that makes window-based inference unreliable.
+            "low_price": float(low_price) if low_price is not None else None,
+            "low_ts": low_ts,
+            "low_is_older": _is_older_day(low_ts, snap.ts),
+            "price_varied": (
+                low_price is not None and all_high is not None and low_price != all_high
+            ),
+            "obs_days": obs_days,
+            "witnessed_pct": witnessed_pct,
+            "evidence_pct": evidence_pct,
+            "high_all": float(all_high) if all_high is not None else None,
             "special_buy": bool(snap.special_buy),
             "snapshot_ts": snap.ts,
+            "promo_first_ts": promo_first_ts,
+            "is_new": bool(
+                promo_first_ts and (now - promo_first_ts) <= timedelta(hours=24)
+            ),
             "dismissed": _is_dismissed(dismissals, ONLINE_STORE_KEY, snap.item_id, value),
         }
+        deal["tier"] = deal_tier(deal)
+        if deal["tier"] == "hollow":
+            continue  # the claimed "was" never existed while we watched
         deals.append(deal)
 
-    deals.sort(key=lambda d: (-d["true_pct"], -d["claimed_pct"], d["title"]))
-    return deals[:60]
+    # Evidence leads, HD's claim follows. Within each tier, newer deals break
+    # ties first so the board rotates rather than ossifying.
+    def _recency(d: dict[str, Any]):
+        ts = d["promo_first_ts"] or d["snapshot_ts"]
+        if ts.tzinfo is None:  # ORM timestamps are naive UTC
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+
+    verified = [d for d in deals if d["tier"] == "verified"]
+    unverified = [d for d in deals if d["tier"] == "unverified"]
+    warned = [d for d in deals if d["tier"] == "warned"]
+
+    verified.sort(key=_recency, reverse=True)
+    verified.sort(key=lambda d: -d["evidence_pct"])  # stable: recency breaks ties
+    unverified.sort(key=_recency, reverse=True)
+    unverified.sort(key=lambda d: -d["claimed_pct"])
+    warned.sort(key=lambda d: -d["claimed_pct"])
+
+    reserve = min(len(unverified), ONLINE_UNVERIFIED_SLOTS)
+    keep_verified = verified[: max(0, ONLINE_DISPLAY_LIMIT - reserve)]
+    keep_unverified = unverified[: max(0, ONLINE_DISPLAY_LIMIT - len(keep_verified))]
+    return keep_verified + keep_unverified + warned[:ONLINE_WARNING_SLOTS]

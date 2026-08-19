@@ -127,6 +127,80 @@ def fmt_ts_relative(val: Union[datetime, str, None]) -> str:
     return f"{months}mo ago"
 
 
+def fmt_history_span(days: Union[int, None], cap_days: int) -> str:
+    """Describe how much price history backs a verdict, e.g. '3d' or '3mo+'.
+
+    The honesty chip must not claim more history than it has, so the span is
+    reported as observed and only rounded up once it reaches cap_days — the
+    point beyond which snapshots are pruned and the true span is unknowable.
+    Stays a compact token so it reads as a unit inside a chip ("flat 3mo+
+    price"), matching the 'mo' abbreviation fmt_ts_relative already uses.
+    """
+    if days is None:
+        return "-"
+    if days >= cap_days:
+        return f"{max(1, cap_days // 30)}mo+"
+    return f"{days}d"
+
+
+def fmt_low_date(val: Union[datetime, str, None]) -> str:
+    """Date a witnessed low was set, e.g. 'May 10' — or 'May 10 2025' across years.
+
+    The date is what makes the anchor auditable: a price with no date is a claim,
+    a price with a date is a record the reader can check.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        try:
+            val = datetime.fromisoformat(val)
+        except (ValueError, TypeError):
+            return ""
+    now = datetime.now(timezone.utc)
+    if val.year != now.year:
+        return val.strftime("%b %-d %Y")
+    return val.strftime("%b %-d")
+
+
+def store_price_verdict(
+    effective_price: Union[float, int, None],
+    stats: dict | None,
+) -> tuple[str, str] | None:
+    """Our history's one-chip verdict on the price you'd pay at a store today.
+
+    Returns (label, css_class) in the deal-board chip vocabulary, or None when
+    the record has nothing to say — silence is the correct empty state, and a
+    single observation is not evidence worth a chip.
+
+    The verdict compares against witnessed prices only (gap-immune facts from
+    item_price_stats), never a percentage across the coverage gap.
+    """
+    if effective_price is None or not stats:
+        return None
+    low = stats.get("low_price")
+    high = stats.get("high_price")
+    if low is None or high is None:
+        return None
+    if (stats.get("obs_days") or 0) < 2:
+        return None
+
+    if effective_price < low:
+        # Cheaper than everything we ever witnessed (e.g. a clearance price
+        # under a shelf price that never moved)
+        return ("below recorded low", "best")
+    if low != high:
+        if effective_price <= low:
+            return ("lowest recorded", "best")
+        when = fmt_low_date(stats.get("low_ts"))
+        label = f"seen ${low:,.2f}" + (f" · {when}" if when else "")
+        return (label, "above")
+    # Never varied — say so, dated, so the claim is auditable
+    since = fmt_low_date(stats.get("first_ts"))
+    if since:
+        return (f"flat since {since}", "flat")
+    return None
+
+
 def fmt_observed_drop(
     current_price: Union[float, int, None],
     baseline_price: Union[float, int, None],
@@ -231,7 +305,10 @@ def format_price_change(alert_type: str, payload: dict | None) -> str:
         cl_price = fmt_price(payload.get("clearance_value"))
         pct = payload.get("clearance_percentage_off")
         pct_str = f" ({pct}% off)" if pct else ""
-        return f"In-store: {cl_price}{pct_str}"
+        prev = payload.get("prev_clearance_value")
+        if prev is not None:
+            return f"In-store clearance {fmt_price(prev)} → {cl_price}{pct_str}"
+        return f"In-store clearance {cl_price}{pct_str}"
 
     title = payload.get("product_title", "")
     return title[:50] if title else ""
