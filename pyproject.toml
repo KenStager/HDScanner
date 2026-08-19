@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-postgres = ["asyncpg"]
+postgres = ["asyncpg>=0.29"]
 dashboard = ["nicegui>=2.0"]
 dev = [
     "pytest",

@@ -472,7 +472,16 @@ async def run_setup(root: Path | None = None) -> int:
             console.print("  Nothing changed.")
             return 0
 
-    settings = Settings()
+    try:
+        database_url = await _prompt_database(console, root)
+    except SetupAborted as exc:
+        console.print(f"\n[red]Setup stopped: {exc}[/red]")
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Setup cancelled. Nothing was written.[/yellow]")
+        return 130
+
+    settings = Settings(database_url=database_url)
 
     try:
         stores = await _prompt_stores(console, settings)
@@ -491,14 +500,19 @@ async def run_setup(root: Path | None = None) -> int:
 
     values = build_env_values(stores, brands, filters)
     values.update(slack_values)
+    values["DATABASE_URL"] = database_url
     env.set_many(values)
-    if not env.get("DATABASE_URL"):
-        env.set("DATABASE_URL", "sqlite+aiosqlite:///./dev.db")
     env.save()
     console.print(f"\n[green]Wrote[/green] {env_path}")
 
-    written = await seed_stores(Settings(), stores)
-    console.print(f"[green]Database ready[/green] — {written} store(s) recorded")
+    try:
+        written = await seed_stores(Settings(database_url=database_url), stores)
+    except Exception as exc:  # noqa: BLE001 - reported, not a traceback
+        console.print(f"[red]Could not write stores to the database:[/red] {exc}")
+        console.print("  [dim]The configuration is saved. Fix the database, then run "
+                      "`hd setup` again.[/dim]")
+        return 1
+    console.print(f"[green]Stores recorded[/green] — {written} store(s)")
 
     console.print("\n[bold]Configured:[/bold]")
     for s in stores:
@@ -513,7 +527,7 @@ async def run_setup(root: Path | None = None) -> int:
         console.print("  slack  token saved, no channel — alerts off")
 
     try:
-        await _prompt_verify(console, Settings(), stores[0].store_id)
+        await _prompt_verify(console, Settings(database_url=database_url), stores[0].store_id)
         await _prompt_schedule(console, root)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]Skipped the remaining optional steps.[/dim]")
@@ -756,3 +770,79 @@ async def _prompt_verify(console, settings: Settings, store_id: str) -> None:
             "  [dim]Home Depot throttled the tail of the run, which is normal for a "
             "burst. The scheduled runs are paced.[/dim]"
         )
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+
+async def _prompt_database(console, root: Path) -> str:
+    """Choose and provision the database. Returns a working DATABASE_URL.
+
+    Runs before the interview so a bad URL costs one question, not all of
+    them, and the schema is created here so later steps write into a database
+    already proven to work.
+    """
+    import typer
+
+    from rich.markup import escape
+
+    from hd.setup_database import (
+        SQLITE_DEFAULT,
+        check_connection,
+        create_database,
+        describe,
+        initialise_schema,
+        redact,
+    )
+
+    console.print("\n[bold]Where should the data live?[/bold]")
+    console.print(
+        "[dim]SQLite is a single file and needs nothing installed — right for one "
+        "person watching a few stores. PostgreSQL suits a shared or long-lived "
+        "install.[/dim]"
+    )
+
+    url = SQLITE_DEFAULT
+    if typer.confirm("  Use PostgreSQL instead of SQLite?", default=False):
+        url = typer.prompt(
+            "  Connection URL",
+            default="postgresql+asyncpg://user:password@localhost/hd_monitor",
+        ).strip()
+
+    while True:
+        check = await check_connection(url)
+
+        if check.missing_database:
+            console.print(f"  [yellow]{escape(check.detail)}[/yellow]")
+            if typer.confirm("  Create it now?", default=True):
+                created = await create_database(url)
+                if created.ok:
+                    console.print(f"  [green]{escape(created.detail)}[/green]")
+                    continue
+                console.print(f"  [yellow]{escape(created.detail)}[/yellow]")
+                if created.fix:
+                    console.print(f"  [dim]{escape(created.fix)}[/dim]")
+
+        elif check.ok:
+            console.print(f"  [green]{escape(check.detail)}[/green]")
+            break
+
+        else:
+            console.print(f"  [yellow]{escape(check.detail)}[/yellow]")
+            if check.fix:
+                console.print(f"  [dim]{escape(check.fix)}[/dim]")
+
+        console.print(f"  [dim]Tried: {escape(redact(url))}[/dim]")
+        if typer.confirm("  Enter a different connection URL?", default=True):
+            url = typer.prompt("  Connection URL", default=url).strip()
+            continue
+        if url != SQLITE_DEFAULT and typer.confirm(
+            "  Fall back to a local SQLite file?", default=True
+        ):
+            url = SQLITE_DEFAULT
+            continue
+        raise SetupAborted("No usable database")
+
+    tables = await initialise_schema(Settings(database_url=url))
+    console.print(f"  [green]Schema ready[/green] — {len(tables)} tables in {describe(url)}")
+    return url

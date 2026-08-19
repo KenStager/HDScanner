@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -14,6 +14,20 @@ from sqlalchemy.ext.asyncio import (
 
 from hd.config import Settings
 from hd.db.models import Base
+from hd.logging import get_logger
+
+log = get_logger("db.base")
+
+# Columns added after the original schema. create_all only creates missing
+# tables, never missing columns on tables that already exist, so these are
+# applied by hand for databases predating each addition.
+_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("products", "image_url", "TEXT"),
+    ("stores", "city", "VARCHAR(100)"),
+    ("store_snapshots", "clearance_value", "NUMERIC(10,2)"),
+    ("store_snapshots", "clearance_dollar_off", "NUMERIC(10,2)"),
+    ("store_snapshots", "clearance_percentage_off", "INTEGER"),
+)
 
 
 def _get_engine_kwargs(url: str) -> dict:
@@ -59,38 +73,45 @@ class Database:
                 raise
 
     async def init_db(self, settings: Settings | None = None) -> None:
-        """Create all tables directly (for dev/init use)."""
+        """Create tables, then apply additive column migrations.
+
+        Each statement gets its own transaction. PostgreSQL aborts the whole
+        surrounding transaction when any statement in it fails, so sharing one
+        would let a redundant ALTER roll back the create_all beside it — which
+        is how a fresh Postgres database ended up with no tables at all while
+        SQLite, which tolerates it, appeared to work.
+
+        Existing columns are detected rather than discovered by failure, so the
+        common path raises nothing.
+        """
         engine = self.get_engine(settings)
+
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Migrate: add columns that create_all won't add to existing tables
+
+        async with engine.connect() as conn:
+            existing = await conn.run_sync(
+                lambda sync_conn: {
+                    table: {c["name"] for c in inspect(sync_conn).get_columns(table)}
+                    for table in inspect(sync_conn).get_table_names()
+                }
+            )
+
+        for table, column, col_type in _COLUMN_MIGRATIONS:
+            if column in existing.get(table, set()):
+                continue
+            if table not in existing:
+                continue
             try:
-                await conn.execute(text(
-                    "ALTER TABLE products ADD COLUMN image_url TEXT"
-                ))
-            except Exception:
-                pass  # Column already exists
-            try:
-                await conn.execute(text(
-                    "ALTER TABLE stores ADD COLUMN city VARCHAR(100)"
-                ))
-            except Exception:
-                pass  # Column already exists
-            for col in ("clearance_value", "clearance_dollar_off", "clearance_percentage_off"):
-                try:
-                    col_type = "NUMERIC(10,2)" if "value" in col or "dollar" in col else "INTEGER"
-                    await conn.execute(text(
-                        f"ALTER TABLE store_snapshots ADD COLUMN {col} {col_type}"
-                    ))
-                except Exception:
-                    pass  # Column already exists
-            # Ensure PRICING_ERROR enum value exists (SQLite stores as string)
-            try:
-                await conn.execute(text(
-                    "INSERT INTO alerttype VALUES ('PRICING_ERROR') ON CONFLICT DO NOTHING"
-                ))
-            except Exception:
-                pass  # Table may not exist (SQLite enum-as-string needs no migration)
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                    )
+                log.info("Added column", table=table, column=column)
+            except Exception as exc:  # noqa: BLE001 - migration is best effort
+                log.warning(
+                    "Could not add column", table=table, column=column, error=str(exc)[:120]
+                )
 
     async def close_db(self) -> None:
         """Dispose of the engine."""

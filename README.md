@@ -26,7 +26,12 @@ hd run-once
 hd alerts --since 24
 ```
 
-`hd setup` exists because the settings that matter are not guessable. Store ids
+`hd setup` takes an install from nothing to working: it provisions the database
+(SQLite by default, or PostgreSQL — creating the database and schema for you),
+finds your stores, resolves your brands, and optionally wires up Slack and a
+schedule.
+
+It exists because the settings that matter are not guessable. Store ids
 are not published anywhere obvious, and each brand needs an opaque catalog
 facet token (Milwaukee is `zv`) that has no public lookup. Setup finds your
 stores from a ZIP code, resolves each brand name to its token and walks it to
@@ -42,7 +47,7 @@ neighbourhood out of the box.
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `sqlite+aiosqlite:///./dev.db` | Database connection string |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./dev.db` | SQLite file, or `postgresql+asyncpg://…` with `pip install -e ".[postgres]"` |
 | `STORES` | *(empty)* | Comma-separated store ids. `hd setup` fills this from a ZIP |
 | `BRANDS` | *(empty)* | Comma-separated brand names |
 | `BRAND_TOKENS` | *(empty)* | `Brand:token` pairs. Browse walks **only** these — a brand without one scans nothing |

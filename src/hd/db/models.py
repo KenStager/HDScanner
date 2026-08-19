@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
-    DateTime,
+    DateTime,  # always declared timezone=True: every timestamp here is UTC-aware
     Enum,
     Index,
     Integer,
@@ -51,11 +51,9 @@ class Product(Base):
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    first_seen_ts: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
+    first_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
-    last_seen_ts: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
+    last_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -81,8 +79,7 @@ class StoreSnapshot(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
     store_id: Mapped[str] = mapped_column(String(10), nullable=False)
     item_id: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -110,8 +107,7 @@ class Alert(Base):
     __tablename__ = "alerts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
     store_id: Mapped[str] = mapped_column(String(10), nullable=False)
     item_id: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -141,9 +137,9 @@ class ItemPriceStat(Base):
     item_id: Mapped[str] = mapped_column(String(20), primary_key=True)
 
     low_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    low_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    low_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     high_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    high_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    high_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # mean = price_sum / obs_count, kept as running totals so the average
     # survives the deletion of the observations that produced it
@@ -153,8 +149,8 @@ class ItemPriceStat(Base):
     # six scans in one afternoon are not six days of evidence
     obs_days: Mapped[int] = mapped_column(Integer, default=0)
 
-    first_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    first_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_item_price_stats_item", "item_id"),
@@ -173,8 +169,7 @@ class DismissedDeal(Base):
     __tablename__ = "dismissed_deals"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
     store_id: Mapped[str] = mapped_column(String(10), nullable=False)
     item_id: Mapped[str] = mapped_column(String(20), nullable=False)
