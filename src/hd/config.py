@@ -147,6 +147,10 @@ class Settings(BaseSettings):
     slack_channel_id: str = ""
     notify_cursor_path: str = ".hd_notify_cursor"
     canvas_id_path: str = ".hd_canvas_id"
+    # The deal rundown canvas is optional and unavailable on free Slack
+    # workspaces, which cannot create standalone canvases. Alerts are
+    # unaffected when this is off.
+    canvas_enabled: bool = True
 
     @property
     def store_list(self) -> list[str]:

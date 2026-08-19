@@ -481,6 +481,7 @@ async def run_setup(root: Path | None = None) -> int:
             console.print("[red]No brands configured — nothing would be scanned.[/red]")
             return 1
         filters = _prompt_filters(console)
+        slack_values = await _prompt_slack(console)
     except SetupAborted as exc:
         console.print(f"\n[red]Setup stopped: {exc}[/red]")
         return 1
@@ -489,6 +490,7 @@ async def run_setup(root: Path | None = None) -> int:
         return 130
 
     values = build_env_values(stores, brands, filters)
+    values.update(slack_values)
     env.set_many(values)
     if not env.get("DATABASE_URL"):
         env.set("DATABASE_URL", "sqlite+aiosqlite:///./dev.db")
@@ -505,6 +507,102 @@ async def run_setup(root: Path | None = None) -> int:
         console.print(f"  brand  {b.name} [dim]({b.token}, {b.verified_total:,} products)[/dim]")
     if filters:
         console.print(f"  filters {filters}")
+    if slack_values.get("SLACK_CHANNEL_ID"):
+        console.print(f"  slack  channel {slack_values['SLACK_CHANNEL_ID']}")
+    elif slack_values:
+        console.print("  slack  token saved, no channel — alerts off")
 
     console.print("\n[bold]Next:[/bold] run [cyan]hd run-once[/cyan] for a first scan.")
     return 0
+
+
+# ── Slack ─────────────────────────────────────────────────────────────────────
+
+
+async def _prompt_slack(console) -> dict[str, str]:
+    """Configure Slack delivery. Returns env values, empty if skipped.
+
+    Skipping is a first-class outcome: the dashboard and `hd alerts` work
+    without Slack, so nothing here is allowed to block a working install.
+    """
+    import typer
+
+    from hd.setup_slack import (
+        SCOPE_ALERTS,
+        SCOPE_CANVAS,
+        SlackSetupError,
+        send_test_message,
+        verify_token,
+    )
+
+    console.print("\n[bold]Send deal alerts to Slack? (optional)[/bold]")
+    console.print(
+        "[dim]Needs a Slack app with the chat:write scope. Without this the deals are "
+        "still visible via `hd alerts` and the dashboard.[/dim]"
+    )
+    if not typer.confirm("  Set up Slack?", default=False):
+        return {}
+
+    console.print(
+        "[dim]  Create an app at api.slack.com/apps, add the chat:write bot scope, "
+        "install it, then copy the Bot User OAuth Token (xoxb-...).[/dim]"
+    )
+
+    identity = None
+    token = ""
+    while identity is None:
+        token = typer.prompt("  Bot token", hide_input=True).strip()
+        try:
+            identity = await verify_token(token)
+        except SlackSetupError as exc:
+            console.print(f"  [yellow]{exc}[/yellow]")
+            if not typer.confirm("  Try another token?", default=True):
+                console.print("  [dim]Skipping Slack.[/dim]")
+                return {}
+
+    console.print(f"  [green]Connected[/green] to {identity.team} as {identity.bot_name}")
+
+    for scope in identity.missing(SCOPE_ALERTS):
+        console.print(
+            f"  [yellow]The token is missing {scope}. Add it in OAuth & Permissions, "
+            "reinstall the app, then rerun setup.[/yellow]"
+        )
+
+    values: dict[str, str] = {"SLACK_BOT_TOKEN": token}
+
+    console.print(
+        "\n[dim]  Channel id is on the channel's About tab, e.g. C0123456789. "
+        "Invite the bot first with /invite @your-app.[/dim]"
+    )
+    while True:
+        channel = typer.prompt("  Channel id").strip()
+        try:
+            await send_test_message(
+                token, channel, "Home Depot clearance monitor is connected. Deals will land here."
+            )
+        except SlackSetupError as exc:
+            console.print(f"  [yellow]{exc}[/yellow]")
+            if typer.confirm("  Try a different channel?", default=True):
+                continue
+            console.print("  [dim]Saving the token without a channel; alerts stay off.[/dim]")
+            return values
+
+        console.print("  [green]Test message delivered.[/green] Check the channel.")
+        values["SLACK_CHANNEL_ID"] = channel
+        break
+
+    # Canvas is genuinely optional, and unavailable on free workspaces.
+    if identity.missing(SCOPE_CANVAS):
+        console.print(
+            f"  [dim]Deal rundown canvas needs the {SCOPE_CANVAS} scope, which this token "
+            "lacks. Alerts will still be sent.[/dim]"
+        )
+    else:
+        console.print(
+            "[dim]  A canvas keeps a live rundown of current deals. Free Slack workspaces "
+            "cannot create one; alerts are unaffected either way.[/dim]"
+        )
+        if not typer.confirm("  Enable the deal rundown canvas?", default=True):
+            values["CANVAS_ENABLED"] = "false"
+
+    return values

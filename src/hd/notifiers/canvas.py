@@ -512,8 +512,13 @@ async def run_canvas_update(
 ) -> tuple[str, int]:
     """Query deals, format canvas, create or update in Slack.
 
-    Returns (markdown, deal_count).
+    Returns (markdown, deal_count). Returns ("", 0) when the canvas is
+    disabled, so callers need no special case.
     """
+    if not settings.canvas_enabled:
+        log.info("Canvas disabled — skipping")
+        return "", 0
+
     deals_by_store = await get_active_deals(settings)
     deal_count = sum(len(d) for d in deals_by_store.values())
 
