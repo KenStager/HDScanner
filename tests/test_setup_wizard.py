@@ -249,3 +249,54 @@ class TestSeedStores:
 
         assert len(rows) == 1
         assert rows[0].city == "Hadley"
+
+
+class TestVerifyInstall:
+    """Setup must not claim success it has not observed."""
+
+    @staticmethod
+    def _summary(products=0, snapshots=0, aborted=False):
+        from hd.pipeline.browse import BrowseSummary
+
+        return BrowseSummary(products=products, snapshots=snapshots, aborted=aborted)
+
+    async def test_products_found_is_ok(self, monkeypatch, tmp_path):
+        async def fake_browse(**kw):
+            return self._summary(449, 449)
+
+        monkeypatch.setattr("hd.pipeline.browse.run_browse", fake_browse)
+        settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/v.db")
+        result = await sw.verify_install(settings, "6542")
+        assert result.ok and result.products == 449
+
+    async def test_zero_products_is_not_ok(self, monkeypatch, tmp_path):
+        async def fake_browse(**kw):
+            return self._summary(0, 0)
+
+        monkeypatch.setattr("hd.pipeline.browse.run_browse", fake_browse)
+        settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/v2.db")
+        assert (await sw.verify_install(settings, "6542")).ok is False
+
+    async def test_exception_is_reported_not_swallowed(self, monkeypatch, tmp_path):
+        async def fake_browse(**kw):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr("hd.pipeline.browse.run_browse", fake_browse)
+        settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/v3.db")
+        result = await sw.verify_install(settings, "6542")
+        assert result.ok is False and "network down" in result.error
+
+    async def test_scan_is_budget_capped(self, monkeypatch, tmp_path):
+        """A proof of life, not a first harvest."""
+        seen = {}
+
+        async def fake_browse(*, settings, **kw):
+            seen["budget"] = settings.browse_request_budget
+            return self._summary(10, 10)
+
+        monkeypatch.setattr("hd.pipeline.browse.run_browse", fake_browse)
+        settings = Settings(
+            database_url=f"sqlite+aiosqlite:///{tmp_path}/v4.db", browse_request_budget=280
+        )
+        await sw.verify_install(settings, "6542")
+        assert seen["budget"] == sw.VERIFY_REQUEST_BUDGET

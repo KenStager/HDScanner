@@ -513,11 +513,12 @@ async def run_setup(root: Path | None = None) -> int:
         console.print("  slack  token saved, no channel — alerts off")
 
     try:
+        await _prompt_verify(console, Settings(), stores[0].store_id)
         await _prompt_schedule(console, root)
     except (KeyboardInterrupt, EOFError):
-        console.print("\n[dim]Skipped scheduling.[/dim]")
+        console.print("\n[dim]Skipped the remaining optional steps.[/dim]")
 
-    console.print("\n[bold]Next:[/bold] run [cyan]hd run-once[/cyan] for a first scan.")
+    console.print("\n[bold]Next:[/bold] run [cyan]hd run-once[/cyan] for a full scan.")
     return 0
 
 
@@ -676,3 +677,82 @@ async def _prompt_schedule(console, root: Path) -> bool:
         else:
             console.print(f"  [yellow]Could not load {path.name}: {output}[/yellow]")
     return True
+
+
+# ── Verification ──────────────────────────────────────────────────────────────
+
+
+VERIFY_REQUEST_BUDGET = 15
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    products: int
+    snapshots: int
+    throttled: bool = False
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.products > 0
+
+
+async def verify_install(settings: Settings, store_id: str) -> VerifyResult:
+    """Run one small live scan to prove the configuration actually works.
+
+    Deliberately budget-capped: this is a proof of life, not a first harvest.
+    Partial coverage is expected and is not a failure — no products at all is.
+    """
+    from hd.db.base import close_db, init_db
+    from hd.pipeline.browse import run_browse
+
+    bounded = settings.model_copy(update={"browse_request_budget": VERIFY_REQUEST_BUDGET})
+    try:
+        await init_db(bounded)
+        summary = await run_browse(settings=bounded, store_ids=[store_id], tiers=("shelf",))
+        await close_db()
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        log.warning("Verification scan failed", error=str(exc))
+        return VerifyResult(0, 0, error=str(exc))
+
+    return VerifyResult(
+        products=summary.products, snapshots=summary.snapshots, throttled=summary.aborted
+    )
+
+
+async def _prompt_verify(console, settings: Settings, store_id: str) -> None:
+    """Offer a proof-of-life scan and report what actually came back."""
+    import typer
+
+    console.print("\n[bold]Check it works?[/bold]")
+    console.print(
+        f"[dim]Runs a short scan of one store — about {VERIFY_REQUEST_BUDGET} requests, "
+        "enough to prove the config is right without a full harvest.[/dim]"
+    )
+    if not typer.confirm("  Run a test scan?", default=True):
+        return
+
+    with console.status("  Scanning..."):
+        result = await verify_install(settings, store_id)
+
+    if result.error:
+        console.print(f"  [red]Scan failed:[/red] {result.error}")
+        console.print("  [dim]The config is written; try `hd run-once` once the issue clears.[/dim]")
+        return
+
+    if not result.products:
+        console.print(
+            "  [yellow]The scan completed but found no products.[/yellow] "
+            "That usually means the brand has nothing assorted to this store."
+        )
+        return
+
+    console.print(
+        f"  [green]Working[/green] — {result.products:,} products, "
+        f"{result.snapshots:,} snapshots recorded."
+    )
+    if result.throttled:
+        console.print(
+            "  [dim]Home Depot throttled the tail of the run, which is normal for a "
+            "burst. The scheduled runs are paced.[/dim]"
+        )
