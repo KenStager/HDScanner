@@ -512,6 +512,11 @@ async def run_setup(root: Path | None = None) -> int:
     elif slack_values:
         console.print("  slack  token saved, no channel — alerts off")
 
+    try:
+        await _prompt_schedule(console, root)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[dim]Skipped scheduling.[/dim]")
+
     console.print("\n[bold]Next:[/bold] run [cyan]hd run-once[/cyan] for a first scan.")
     return 0
 
@@ -606,3 +611,68 @@ async def _prompt_slack(console) -> dict[str, str]:
             values["CANVAS_ENABLED"] = "false"
 
     return values
+
+
+# ── Scheduling ────────────────────────────────────────────────────────────────
+
+
+async def _prompt_schedule(console, root: Path) -> bool:
+    """Offer to install the recurring jobs. Returns True if anything was set up."""
+    import typer
+
+    from hd.setup_schedule import (
+        hd_executable,
+        is_macos,
+        label_for,
+        launch_agents_dir,
+        load_agent,
+        prune_slot,
+        render_crontab,
+        render_prune_plist,
+        render_scan_plist,
+        scan_slots,
+        write_agent,
+    )
+
+    console.print("\n[bold]Run the scanner automatically? (optional)[/bold]")
+    slots = scan_slots()
+    pruning = prune_slot()
+    times = ", ".join(f"{s.hour:02d}:{s.minute:02d}" for s in slots)
+    console.print(f"[dim]Scans at {times} local time. One slot tracks Home Depot's "
+                  "3:00 ET Daily Deals refresh, converted to your timezone.[/dim]")
+    console.print(f"[dim]A separate job prunes old snapshots at "
+                  f"{pruning.hour:02d}:{pruning.minute:02d} — nothing else does.[/dim]")
+
+    if not typer.confirm("  Install the schedule?", default=True):
+        return False
+
+    hd_path = hd_executable()
+    scan_label = label_for()
+    prune_label = f"{scan_label}.prune"
+
+    if not is_macos():
+        console.print(
+            "\n[dim]  Not macOS — add these crontab lines with `crontab -e`:[/dim]\n"
+        )
+        console.print(render_crontab(root, hd_path, slots, pruning))
+        return True
+
+    agents = launch_agents_dir()
+    scan_path = write_agent(agents / f"{scan_label}.plist",
+                            render_scan_plist(scan_label, root, hd_path, slots))
+    prune_path = write_agent(agents / f"{prune_label}.plist",
+                             render_prune_plist(prune_label, root, hd_path, pruning))
+    console.print(f"  [green]Wrote[/green] {scan_path}")
+    console.print(f"  [green]Wrote[/green] {prune_path}")
+
+    if not typer.confirm("  Activate them now?", default=True):
+        console.print(f"  [dim]Activate later with: launchctl load {scan_path}[/dim]")
+        return True
+
+    for path in (scan_path, prune_path):
+        ok, output = await load_agent(path)
+        if ok:
+            console.print(f"  [green]Loaded[/green] {path.name}")
+        else:
+            console.print(f"  [yellow]Could not load {path.name}: {output}[/yellow]")
+    return True
