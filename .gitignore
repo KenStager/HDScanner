@@ -27,6 +27,9 @@ hd_dashboard.*.log
 .hd_rotation_cursor
 .hd_browse_cursor
 .hd_dailydeals_cursor
+.hd_canvas_id
+.env.bak*
+hd_prune.*.log
 raw_responses/
 screenshots/
 *.png

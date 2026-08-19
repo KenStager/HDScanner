@@ -1,5 +1,10 @@
 # PRD — Home Depot Clearance Monitor (Milwaukee + DeWalt)
 
+> **Historical.** This is the original v1 planning document, kept as a record of
+> the initial design. It refers to the two stores and single brand this started
+> with; the tool is now configured per install via `hd setup`. See README.md for
+> how it actually works today.
+
 **Status:** v1.0 — Active  
 **Last Updated:** 2026-02-26  
 **Owner:** Ken  

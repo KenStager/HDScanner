@@ -26,7 +26,7 @@ from hd.logging import get_logger
 
 log = get_logger("notifiers.canvas")
 
-CANVAS_TITLE = "Milwaukee Deal Rundown"
+DEFAULT_CANVAS_TITLE = "Deal Rundown"
 MARKDOWN_MAX_CHARS = 35_000
 
 SLACK_CANVAS_CREATE_URL = "https://slack.com/api/canvases.create"
@@ -339,13 +339,14 @@ def format_canvas_markdown(
     deals_by_store: dict[str, list[dict]],
     store_names: dict[str, str],
     store_order: list[str] | None = None,
+    title: str = DEFAULT_CANVAS_TITLE,
 ) -> str:
     """Build the full canvas markdown document."""
     now = datetime.now(timezone.utc)
     ts_str = now.strftime("%b %d, %Y at %I:%M %p UTC")
 
     lines: list[str] = [
-        f"# {CANVAS_TITLE}",
+        f"# {title}",
         f"*Updated: {ts_str}*",
         "",
     ]
@@ -527,7 +528,9 @@ async def run_canvas_update(
         result = await session.execute(select(Store))
         store_names = {s.store_id: s.name for s in result.scalars().all() if s.name}
 
-    markdown = format_canvas_markdown(deals_by_store, store_names, settings.store_list)
+    markdown = format_canvas_markdown(
+        deals_by_store, store_names, settings.store_list, title=settings.canvas_title
+    )
 
     if dry_run:
         return markdown, deal_count
@@ -551,7 +554,7 @@ async def run_canvas_update(
         canvas_id = None
 
     # Create new canvas
-    canvas_id = await create_canvas(settings, CANVAS_TITLE, markdown)
+    canvas_id = await create_canvas(settings, settings.canvas_title, markdown)
     if canvas_id:
         try:
             canvas_path.write_text(canvas_id)

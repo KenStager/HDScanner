@@ -22,6 +22,24 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _require_configured(settings: Settings, *, needs_brands: bool = False) -> None:
+    """Stop with a pointer to setup rather than scanning nothing.
+
+    The shipped defaults are empty on purpose — a default store id would send
+    a stranger's install at somebody else's neighbourhood — so an unconfigured
+    run has to say so instead of succeeding against an empty list.
+    """
+    if not settings.store_list:
+        console.print("[red]No stores configured.[/red] Run [cyan]hd setup[/cyan] first.")
+        raise typer.Exit(1)
+    if needs_brands and settings.browse_enabled and not settings.brand_token_list:
+        console.print(
+            "[red]No brands configured.[/red] Browse mode walks only brands with a "
+            "facet token, so this would scan nothing. Run [cyan]hd setup[/cyan] first."
+        )
+        raise typer.Exit(1)
+
+
 @app.command()
 def setup() -> None:
     """Interactive first-run setup: find your stores and brands, write .env."""
@@ -123,6 +141,7 @@ def discover(
     """Run product discovery pipeline."""
     setup_logging()
     settings = Settings()
+    _require_configured(settings, needs_brands=True)
 
     async def _discover():
         from hd.db.base import init_db as _init_tables, close_db
@@ -152,6 +171,7 @@ def snapshot(
     """Fetch pricing/inventory snapshots for active products."""
     setup_logging()
     settings = Settings()
+    _require_configured(settings)
 
     async def _snapshot():
         from hd.db.base import init_db as _init_tables, close_db
@@ -179,6 +199,7 @@ def browse(
     """Facet-driven brand browse: discover + snapshot every brand item by category."""
     setup_logging()
     settings = Settings()
+    _require_configured(settings, needs_brands=True)
 
     async def _browse():
         from hd.db.base import init_db as _init_tables, close_db
@@ -211,6 +232,7 @@ def daily_deals(
     """Price today's Daily Deals set (Special Buy of the Day) for configured brands."""
     setup_logging()
     settings = Settings()
+    _require_configured(settings, needs_brands=True)
 
     async def _daily():
         from hd.db.base import init_db as _init_tables, close_db
@@ -245,6 +267,7 @@ def run_once(
     """
     setup_logging()
     settings = Settings()
+    _require_configured(settings, needs_brands=True)
 
     async def _run_once():
         from pathlib import Path
@@ -349,7 +372,7 @@ def run_once(
             from hd.dashboard.queries import get_alerts
             from hd.grouping import group_alerts, parse_ts
             from hd.notifiers.formatter import format_slack_blocks
-            from hd.notifiers.webhook import post_to_openclaw
+            from hd.notifiers.webhook import post_to_slack
 
             cursor_path = Path(settings.notify_cursor_path)
             cursor_ts = None
@@ -368,7 +391,7 @@ def run_once(
             if recent:
                 groups = group_alerts(recent)
                 blocks, fallback_text = format_slack_blocks(groups)
-                success = await post_to_openclaw(settings, fallback_text, blocks=blocks)
+                success = await post_to_slack(settings, fallback_text, blocks=blocks)
                 if success:
                     max_ts = max(
                         (parse_ts(a.get("ts")) for a in recent), default=None
@@ -413,6 +436,7 @@ def catch_up(
     """One-time scan: alert on anything currently ≥50% off or in Special Buys that has never been alerted."""
     setup_logging()
     settings = Settings()
+    _require_configured(settings)
 
     async def _catch_up():
         from hd.db.base import init_db as _init_tables, close_db
@@ -715,7 +739,7 @@ def notify(
     dry_run: bool = typer.Option(False, "--dry-run", help="Print without sending"),
     reset: bool = typer.Option(False, "--reset", help="Clear cursor and re-send"),
 ) -> None:
-    """Send recent alerts to Slack via OpenClaw webhook."""
+    """Send recent alerts to Slack."""
     from pathlib import Path
 
     setup_logging()
@@ -746,7 +770,7 @@ def notify(
         from hd.dashboard.queries import get_alerts
         from hd.grouping import group_alerts
         from hd.notifiers.formatter import format_slack_message, format_slack_blocks
-        from hd.notifiers.webhook import post_to_openclaw
+        from hd.notifiers.webhook import post_to_slack
 
         await _init_tables(settings)
 
@@ -799,7 +823,7 @@ def notify(
             await close_db()
             return len(groups), max_ts, False
 
-        success = await post_to_openclaw(settings, fallback_text, blocks=blocks)
+        success = await post_to_slack(settings, fallback_text, blocks=blocks)
         await close_db()
         return len(groups), max_ts, success
 

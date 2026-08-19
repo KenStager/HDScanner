@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hd-clearance-monitor"
 version = "0.1.0"
-description = "Home Depot clearance monitor for Milwaukee M12/M18 tools"
+description = "Track Home Depot clearance, price drops and stock for any brand at your local stores"
 requires-python = ">=3.11"
 dependencies = [
     "sqlalchemy[asyncio]>=2.0",

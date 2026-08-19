@@ -30,9 +30,12 @@ class Settings(BaseSettings):
     api_endpoint: str = "https://apionline.homedepot.com/federation-gateway/graphql"
 
     # Crawl settings — stored as raw strings, parsed via properties
-    stores: str = "2619,8425"
-    brands: str = "Milwaukee"
-    product_line_filters: str = "M12,M18"
+    # No defaults: these are per-install and undiscoverable without `hd setup`,
+    # and a shipped default would silently scan a stranger's stores. Commands
+    # that need them fail with a pointer to setup rather than scanning nothing.
+    stores: str = ""
+    brands: str = ""
+    product_line_filters: str = ""
     tools_nav_param: str = "N-5yc1vZc1xy"
     extra_nav_params: str = ""  # Additional category navParams (CSV), no product_line_filter applied
     clearance_token: str = "1z11adf"
@@ -66,7 +69,7 @@ class Settings(BaseSettings):
     # brand items entirely; browse mode walks the brand's own category facets.
     browse_enabled: bool = True
     root_nav_param: str = "N-5yc1v"           # catalog root; brand/category tokens append with Z
-    brand_tokens: str = "Milwaukee:zv"        # CSV of Brand:facet-token (DEWALT is 4j2)
+    brand_tokens: str = ""                    # CSV of Brand:facet-token, written by `hd setup`
     api_max_start_index: int = 720            # API rejects startIndex > 720 ("Invalid start index range")
     browse_network_categories_per_run: int = 3  # ALL-tier categories walked per store per run
     browse_cursor_path: str = ".hd_browse_cursor"
@@ -98,9 +101,10 @@ class Settings(BaseSettings):
     # snapshot_retention_days — older snapshots are pruned, so a wider window
     # would claim history that no longer exists. At or above this span the
     # label caps at "3mo+". Kept separate from baseline_window_days, which
-    # drives alerting in the diff stage. Do not raise this past ~95 days: the
-    # scanner was parked May 15 - Aug 15 2026, and a wider window would reach
-    # back over that gap and score today's prices against pre-parking ones.
+    # drives alerting in the diff stage. Raising it past snapshot_retention_days
+    # is meaningless — those snapshots are gone. Raising it across a period when
+    # the scanner was not running is worse than meaningless: today's price gets
+    # scored against whatever the catalog looked like before the gap.
     deal_history_window_days: int = 90
 
     # Inter-keyword pacing
@@ -133,6 +137,7 @@ class Settings(BaseSettings):
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8080
     dashboard_title: str = "HD Clearance Monitor"
+    canvas_title: str = "Deal Rundown"
     dashboard_refresh_seconds: int = 300
     dashboard_dark_mode: bool = True
 
@@ -140,9 +145,7 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
     email_smtp_host: str = ""
 
-    # OpenClaw / Slack notifications
-    openclaw_webhook_url: str = ""
-    openclaw_token: str = ""
+    # Slack notifications
     slack_bot_token: str = ""
     slack_channel_id: str = ""
     notify_cursor_path: str = ".hd_notify_cursor"

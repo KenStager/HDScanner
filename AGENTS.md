@@ -6,7 +6,7 @@ This file is the primary context document for Codex. Read it in full before writ
 
 ## What This Project Is
 
-A backend Python CLI tool that monitors **Milwaukee and DeWalt tool products** at **Home Depot stores 2619 and 8425** for clearance events, price drops, and inventory changes. It works by replicating the internal GraphQL API calls that homedepot.com makes in the browser.
+A backend Python CLI tool that monitors the brands you configure at the Home Depot stores you configure for clearance events, price drops, and inventory changes. It works by replicating the internal GraphQL API calls that homedepot.com makes in the browser.
 
 This is a **personal-use, self-hosted tool** with no user-facing UI in v1.
 
@@ -28,7 +28,7 @@ Read these documents before starting any task:
 | Store ID | Notes |
 |---|---|
 | `2619` | Primary store |
-| `8425` | Secondary store |
+| `8452` | Secondary store |
 
 These are the only stores for v1. Both must be pre-seeded during `hd init-db`. Do not hardcode them — they are set via `STORES` in the `.env` config.
 
@@ -133,7 +133,7 @@ Run migrations: `hd init-db`
 ## CLI Commands Quick Reference
 
 ```
-hd init-db                            # create/migrate tables + seed stores 2619, 8425
+hd init-db                            # create/migrate tables + seed stores 2619, 8452
 hd add-store <id> [--name] [--state]  # add a store
 hd browse [--stores] [--tier]         # facet-driven brand browse: discover+snapshot by category (default strategy)
 hd discover [--brand] [--pages]       # populate products table (legacy keyword mode)
@@ -170,7 +170,7 @@ Do not skip ahead. Each milestone has an acceptance gate that must pass before t
 - No web dashboard (`hd serve` is a future milestone)
 - No job queue (Celery/Redis is future)
 - No multi-user support
-- No stores beyond 2619 and 8425
+- No stores beyond your configured stores
 
 ---
 

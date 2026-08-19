@@ -146,7 +146,12 @@ class TestFormatDealLine:
 class TestFormatCanvasMarkdown:
     def test_empty_deals(self):
         md = format_canvas_markdown({}, {"2619": "Local Store"})
-        assert "# Milwaukee Deal Rundown" in md
+        assert "# Deal Rundown" in md
+
+    def test_title_is_configurable(self):
+        """The heading was hardcoded to one brand; it is a setting now."""
+        md = format_canvas_markdown({}, {"2619": "Local Store"}, title="Ryobi Watch")
+        assert md.startswith("# Ryobi Watch")
         assert "Store 2619" in md
         assert "No in-store clearance deals" in md
         assert "No online deals" in md
@@ -342,6 +347,8 @@ class TestDryRun:
 
         settings = AsyncMock()
         settings.store_list = ["2619"]
+        settings.canvas_enabled = True
+        settings.canvas_title = "Deal Rundown"
 
         with (
             patch("hd.notifiers.canvas.get_active_deals", new_callable=AsyncMock, return_value={}),
@@ -353,4 +360,4 @@ class TestDryRun:
 
         mock_create.assert_not_called()
         mock_update.assert_not_called()
-        assert "# Milwaukee Deal Rundown" in markdown
+        assert "# Deal Rundown" in markdown

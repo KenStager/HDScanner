@@ -14,7 +14,7 @@ log = get_logger("notifiers.webhook")
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
 
-async def post_to_openclaw(
+async def post_to_slack(
     settings: Settings,
     message: str,
     blocks: list[dict] | None = None,

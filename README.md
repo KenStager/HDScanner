@@ -1,45 +1,66 @@
 # HD Clearance Monitor
 
-A backend CLI tool that monitors Milwaukee and DeWalt tool products at Home Depot stores for clearance events, price drops, and inventory changes. It replicates the internal GraphQL API calls that homedepot.com makes in the browser, stores historical snapshots, and generates actionable alerts.
+Tracks clearance events, price drops and stock changes for the brands you care
+about at the Home Depot stores you can actually drive to. It replicates the
+GraphQL calls homedepot.com makes in the browser, keeps historical snapshots,
+and alerts when something genuinely gets cheaper.
+
+Clearance is a per-store event. A tool marked down at one store is often full
+price two towns over, and the markdown is gone before it shows up anywhere
+public — which is why this watches specific stores rather than a national feed.
 
 ## Quick Start
 
 ```bash
 # Install (Python 3.11+)
-pip install -e ".[dev]"
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev,dashboard]"
 
-# Initialize database and seed stores
-hd init-db
+# Answer two questions — a ZIP code and a brand — and it finds the rest
+hd setup
 
-# Run the full pipeline (discover products, snapshot prices, diff, generate alerts)
+# First full scan
 hd run-once
 
-# View recent alerts
+# What turned up
 hd alerts --since 24
 ```
 
+`hd setup` exists because the settings that matter are not guessable. Store ids
+are not published anywhere obvious, and each brand needs an opaque catalog
+facet token (Milwaukee is `zv`) that has no public lookup. Setup finds your
+stores from a ZIP code, resolves each brand name to its token and walks it to
+confirm it returns products, then offers Slack delivery and a schedule. It is
+re-runnable, and it verifies before it writes: a brand that would have scanned
+nothing is caught during setup rather than after a week of empty runs.
+
 ## Configuration
 
-All settings are read from `.env` (or environment variables). Copy `.env` and fill in your values:
+Settings come from `.env`, which `hd setup` writes. Edit it directly if you
+prefer; the defaults are deliberately empty so nothing scans a stranger's
+neighbourhood out of the box.
 
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `sqlite+aiosqlite:///./dev.db` | Database connection string |
-| `STORES` | `2619,8425` | Comma-separated store IDs to monitor |
-| `BRANDS` | `Milwaukee` | Comma-separated brand names |
-| `PRODUCT_LINE_FILTERS` | `M12,M18` | Product line prefixes to match in titles |
-| `MAX_PAGES` | `10` | Max API pages per discovery run |
-| `RATE_LIMIT_RPS` | `1.0` | Max requests per second |
-| `OPENCLAW_WEBHOOK_URL` | *(empty)* | OpenClaw webhook endpoint for Slack delivery |
-| `OPENCLAW_TOKEN` | *(empty)* | `x-openclaw-token` header value |
-| `SLACK_CHANNEL_ID` | *(empty)* | Target Slack channel (e.g. `channel:C1234567890`) |
-| `NOTIFY_CURSOR_PATH` | `.hd_notify_cursor` | File path for notification dedup cursor |
+| `STORES` | *(empty)* | Comma-separated store ids. `hd setup` fills this from a ZIP |
+| `BRANDS` | *(empty)* | Comma-separated brand names |
+| `BRAND_TOKENS` | *(empty)* | `Brand:token` pairs. Browse walks **only** these — a brand without one scans nothing |
+| `PRODUCT_LINE_FILTERS` | *(empty)* | Optional title/model filters, e.g. `M12,M18` |
+| `RATE_LIMIT_RPS` | `0.5` | Requests per second. See Being a good citizen |
+| `SLACK_BOT_TOKEN` | *(empty)* | Bot token (`xoxb-…`) for alerts |
+| `SLACK_CHANNEL_ID` | *(empty)* | Channel to post to, e.g. `C0123456789` |
+| `CANVAS_ENABLED` | `true` | Live deal rundown canvas. Free Slack workspaces cannot create one |
+| `CANVAS_TITLE` | `Deal Rundown` | Heading on that canvas |
 
-See `src/hd/config.py` for the full list of settings.
+`BRANDS` and `BRAND_TOKENS` belong together. Setup always writes both; if you
+edit by hand and add a brand without its token, browse mode will skip it
+silently. See `src/hd/config.py` for every setting.
 
 ## CLI Commands
 
 ```
+hd setup                               Interactive first-run setup (start here)
 hd init-db                             Create/migrate tables, seed configured stores
 hd add-store <id> [--name] [--state]   Add a store to the database
 hd browse [--stores] [--tier]          Facet-driven brand browse: discover + snapshot by category
@@ -48,7 +69,7 @@ hd discover [--brand] [--pages]        Populate products table from HD API (lega
 hd snapshot [--stores] [--limit]       Fetch pricing/inventory snapshots (legacy keyword mode)
 hd run-once                            Full pipeline: browse (or discover+snapshot) + diff + alerts
 hd alerts [--limit] [--type] [--since] Print recent alerts
-hd notify [--dry-run] [--reset]        Send alerts to Slack via OpenClaw webhook
+hd notify [--dry-run] [--reset]        Send new alerts to Slack
 hd health                              Print last run health status
 hd prune [--days] [--dry-run]          Delete old snapshots beyond retention period
 hd serve [--host] [--port]             Start NiceGUI web dashboard (requires dashboard extra)
@@ -79,68 +100,39 @@ anything still unreachable is logged as truncated — never silently skipped.
 Config: `BRAND_TOKENS` (e.g. `Milwaukee:zv`, DEWALT is `4j2`), `ROOT_NAV_PARAM`,
 `BROWSE_NETWORK_CATEGORIES_PER_RUN`, `BROWSE_REQUEST_BUDGET`.
 
-## Slack Notifications via OpenClaw
+## Slack Notifications
 
-The `hd notify` command sends recent alerts to Slack through an OpenClaw webhook endpoint. It's designed to run as a cron step after `hd run-once`.
+`hd setup` configures this, or set `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` by hand.
 
-### Setup
-
-1. Set the OpenClaw webhook URL and (optionally) auth token in `.env`:
-
-   ```
-   OPENCLAW_WEBHOOK_URL=http://127.0.0.1:18789/hooks/agent
-   OPENCLAW_TOKEN=your-token-here
-   SLACK_CHANNEL_ID=channel:C1234567890
-   ```
-
-2. Test with a dry run:
-
-   ```bash
-   hd notify --dry-run
-   ```
-
-3. Add to cron:
-
-   ```bash
-   # Every 4 hours
-   0 */4 * * * cd /path/to/HD_crawler && hd run-once && hd notify
-   ```
-
-### How It Works
-
-- **Cursor-based dedup**: A cursor file (`.hd_notify_cursor`) stores the timestamp of the last successfully notified alert. Each run only sends alerts newer than the cursor. This is self-correcting regardless of cron timing drift.
-- **Grouping**: Alerts for the same item and type within a 10-minute window are grouped together. A price drop detected at both stores 2619 and 8425 shows as one alert with both stores listed.
-- **Filtering**: `HEALTH_DEGRADED` alerts are excluded from Slack (they're internal monitoring signals).
-- **Webhook payload**: POSTs JSON to the OpenClaw endpoint:
-
-  ```json
-  {
-    "message": "<Slack mrkdwn formatted text>",
-    "deliver": true,
-    "channel": "slack",
-    "to": "<SLACK_CHANNEL_ID>"
-  }
-  ```
-
-- **Non-fatal delivery**: Webhook failures are logged but never crash the pipeline. The cursor is only updated on successful delivery, so alerts will be retried on the next run.
-
-### Options
-
-| Flag | Description |
-|---|---|
-| `--since N` | Fallback: look back N hours if no cursor exists (default: 4) |
-| `--dry-run` | Print the formatted Slack message to console without sending |
-| `--reset` | Delete the cursor file and re-send from `--since` window |
-
-### Example Output
+Create an app at [api.slack.com/apps](https://api.slack.com/apps), add the
+`chat:write` bot scope, install it to your workspace, and copy the **Bot User
+OAuth Token** (`xoxb-…`). Then invite the bot to the target channel:
 
 ```
-🏷️ *PRICE_DROP* (high) — Milwaukee M18 FUEL 1/2 in. Drill Driver Kit
-Stores: 2619, 8425
-$299.00 → $249.00 (-17%)
-Stock: In Stock / 3 units (2619), In Stock / 1 unit (8425)
-<https://www.homedepot.com/p/315442497|View on HomeDepot.com>
+/invite @your-app
 ```
+
+That invite is the step everyone misses. Without it Slack rejects posts with
+`not_in_channel`, which reads like a broken token.
+
+```bash
+hd notify              # send new alerts since the last run
+hd notify --dry-run    # print what would be sent
+hd notify --reset      # clear the dedup cursor and resend
+```
+
+Alerts are grouped so a single markdown post covers related items, and a cursor
+file (`.hd_notify_cursor`) prevents re-sending. `hd run-once && hd notify` is
+the pair the scheduled job runs.
+
+### Deal rundown canvas (optional)
+
+With the `canvases:write` scope, the monitor also maintains a Slack canvas
+holding the current deals, rewritten in place on each run rather than posted
+repeatedly. **Free Slack workspaces cannot create standalone canvases** — the
+API refuses, alerts are unaffected, and you can turn it off with
+`CANVAS_ENABLED=false`.
+
 
 ## Dashboard
 
@@ -178,7 +170,7 @@ CLI (cli.py / typer)
         grouping.py           → alert grouping logic (shared by dashboard + notifiers)
         notifiers/
           ├── formatter.py    → Slack mrkdwn message formatting
-          └── webhook.py      → curl-based OpenClaw webhook delivery
+          └── webhook.py      → curl-based Slack chat.postMessage delivery
 ```
 
 ## Database
@@ -197,10 +189,25 @@ pytest
 
 197 tests covering parsers, diff engine, health checks, alert grouping, dashboard queries, formatters, and Slack notification formatting.
 
+## Being a good citizen
+
+This reads Home Depot's own endpoints at a deliberately unhurried pace.
+`RATE_LIMIT_RPS` defaults to 0.5 — that is a courtesy floor, not a tuning knob.
+Turning it up does not get you more deals; the scan is bounded by a request
+budget and page rotation, not by how fast it asks.
+
+Home Depot signals throttling with **HTTP 206 and a null body**, not 429. The
+client latches that, abandons the run and reports it rather than treating a
+truncated result as the end of the catalog — which is why a throttled run says
+"coverage incomplete" instead of quietly claiming success.
+
+Run one instance against your own stores. There is no proxy rotation, CAPTCHA
+solving or bot evasion here, and adding some would change what this is.
+
 ## Safety
 
 - Rate limiting, jitter, and backoff are always active
-- Circuit breaker pauses crawling if error rate exceeds threshold
+- Circuit breaker pauses crawling if the error rate exceeds a threshold
 - Schema drift detection emits `HEALTH_DEGRADED` alerts on API changes
-- No proxy rotation, CAPTCHA solving, or bot evasion
-- `store_snapshots` table is append-only — historical data is never modified
+- `store_snapshots` is append-only — historical data is never modified
+- `item_price_stats` is the durable record; snapshots are pruned at retention age

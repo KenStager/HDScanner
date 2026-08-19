@@ -1,5 +1,10 @@
 # TASKS — Home Depot Clearance Monitor (coding agents Build Plan)
 
+> **Historical.** This is the original v1 planning document, kept as a record of
+> the initial design. It refers to the two stores and single brand this started
+> with; the tool is now configured per install via `hd setup`. See README.md for
+> how it actually works today.
+
 **Build order is strict. Do not start a milestone until the prior milestone's acceptance gate passes.**  
 Each task is a discrete, testable unit of work. Check off tasks as they are completed.
 

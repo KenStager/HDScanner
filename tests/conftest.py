@@ -25,7 +25,7 @@ def settings() -> Settings:
     """Create a test settings instance using in-memory SQLite."""
     return Settings(
         database_url="sqlite+aiosqlite:///:memory:",
-        stores="2619,8425",
+        stores="2619,8452",
         brands="Milwaukee",
         product_line_filters="M12,M18",
         store_raw_json=False,
