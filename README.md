@@ -11,6 +11,10 @@ within days. This watches the stores you can actually drive to.
 > Unofficial and unaffiliated with Home Depot. It reads the same public
 > endpoints the website's own pages use, slowly, for personal use.
 
+There is an illustrated walkthrough of all of this, with screenshots of the
+dashboard, at **<https://www.kenstager.com/hdscanner/>**. This file is the
+reference; that page is the guide.
+
 **Contents** — [What you get](#what-you-get) · [Requirements](#requirements) ·
 [Install](#install) · [Keep it running](#keep-it-running) ·
 [Seeing your deals](#seeing-your-deals) · [Configuration](#configuration) ·
@@ -159,8 +163,9 @@ hd alerts --type CLEARANCE    # one kind
 hd health                     # is the scanner healthy?
 ```
 
-**Web dashboard** — overview, product browser with price charts, alert feed and
-per-store summaries:
+**Web dashboard** — a deal board per store, today's daily deals checked against
+the prices this install actually recorded, a product browser with price charts,
+and the alert feed:
 
 ```bash
 hd serve                      # → http://127.0.0.1:8080
@@ -325,7 +330,7 @@ pipeline/
 hd_api/
   stores.py                   ZIP → store lookup
   graphql.py, parsers.py      requests and response normalisation
-http/client.py                curl wrapper: retry, rate limit, circuit breaker
+http/client.py                retry, rate limit, circuit breaker, throttle cooldown
 db/                           SQLAlchemy models, engine, price-stat folding
 notifiers/                    Slack message and canvas delivery
 dashboard/                    NiceGUI web UI
@@ -342,3 +347,9 @@ historical record.
 - Schema drift raises `HEALTH_DEGRADED` rather than failing quietly
 - `store_snapshots` is append-only — history is never rewritten
 - Destructive operations refuse to run when price history is uncaptured
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, change it, redistribute it; no warranty.

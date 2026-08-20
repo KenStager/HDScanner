@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "hd-clearance-monitor"
 version = "0.1.0"
 description = "Track Home Depot clearance, price drops and stock for any brand at your local stores"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "sqlalchemy[asyncio]>=2.0",
@@ -20,7 +22,11 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.29"]
 dashboard = ["nicegui>=2.0"]
+# The Facebook poster drives a real browser session; rendering alone does not
+# need this (it shells out to a local chrome-headless-shell).
+social = ["playwright>=1.45"]
 dev = [
+    "httpx",  # test doubles only; the scanner itself sends through curl
     "pytest",
     "pytest-asyncio",
     "pytest-mock",
