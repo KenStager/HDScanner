@@ -29,16 +29,18 @@ newly discovered item is monitored the same run it is first seen.
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from hd import rotation
 from hd.config import Settings
 from hd.hd_api.graphql import failure_reason, is_valid_search_response, search
 from hd.hd_api.parsers import parse_dimensions, parse_products, parse_snapshots
-from hd.http.client import HDClient
+from hd.http.client import CircuitOpenError, HDClient
 from hd.logging import get_logger
 
 log = get_logger("pipeline.browse")
@@ -55,6 +57,10 @@ class Walk:
     label: str
     total: int
     truncated: bool = False  # True when splitting could not get under the cap
+    # The facet read for this node, reusable as page 0 when the walk covers the
+    # same navParam. Excluded from equality so a primed walk still compares
+    # equal to the plan that produced it.
+    primed: dict | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -64,6 +70,9 @@ class BrowseSummary:
     walks: int = 0
     truncated_walks: list[str] = field(default_factory=list)
     aborted: bool = False
+    # Categories deliberately deferred to a later run by shelf rotation. Not a
+    # failure, but it does mean this run did not see the whole shelf.
+    skipped_walks: int = 0
 
 
 def build_nav(root: str, *tokens: str) -> str:
@@ -153,15 +162,24 @@ async def fetch_facets(
     nav_param: str,
     store_id: str,
     storefilter: str,
-) -> tuple[int | None, dict[str, list[dict]]]:
-    """One facet read: (totalProducts, dimensions). (None, {}) on failure."""
+    page_size: int | None = None,
+) -> tuple[int | None, dict[str, list[dict]], dict | None]:
+    """One facet read: (totalProducts, dimensions, raw response).
+
+    Fetches a full page rather than a single row by default. The counts and
+    dimensions are the same either way, but a full page can then serve as page
+    0 of the walk this read is planning — and most walks are one page, so
+    asking for one row here meant paying for two requests to read one page of
+    results. Callers that know the node will be split into differently-navved
+    children pass page_size=1, since no page they fetch here is reusable.
+    """
     raw = await search(
         client,
         keyword=None,
         nav_param=nav_param,
         store_id=store_id,
         start_index=0,
-        page_size=1,
+        page_size=page_size or settings.page_size,
         storefilter=storefilter,
     )
     if not is_valid_search_response(raw):
@@ -170,10 +188,10 @@ async def fetch_facets(
             nav_param=nav_param, store_id=store_id, storefilter=storefilter,
             reason=failure_reason(raw) or "api_error",
         )
-        return None, {}
+        return None, {}, None
     search_model = raw.get("data", {}).get("searchModel") or {}
     total = (search_model.get("searchReport") or {}).get("totalProducts")
-    return total, parse_dimensions(raw)
+    return total, parse_dimensions(raw), raw
 
 
 async def resolve_walks(
@@ -187,20 +205,27 @@ async def resolve_walks(
     dimensions: dict[str, list[dict]] | None = None,
 ) -> list[Walk]:
     """Plan walks for a node, fetching facets for any piece still over the cap."""
+    raw = None
     if total is None or dimensions is None:
-        total, dimensions = await fetch_facets(client, settings, nav_param, store_id, storefilter)
+        total, dimensions, raw = await fetch_facets(
+            client, settings, nav_param, store_id, storefilter
+        )
     walks, need = plan_walks(nav_param, label, total, dimensions, settings)
+    _prime(walks, nav_param, raw)
     depth = 1
     while need and depth <= settings.browse_max_split_depth:
         next_need: list[tuple[str, str]] = []
         for child_nav, child_label in need:
             if client.is_throttled:
                 return walks
-            c_total, c_dims = await fetch_facets(client, settings, child_nav, store_id, storefilter)
+            c_total, c_dims, c_raw = await fetch_facets(
+                client, settings, child_nav, store_id, storefilter
+            )
             c_walks, c_need = plan_walks(
                 child_nav, child_label, c_total, c_dims, settings,
                 depth=depth, price_split_used=False,
             )
+            _prime(c_walks, child_nav, c_raw)
             walks.extend(c_walks)
             next_need.extend(c_need)
         need = next_need
@@ -209,6 +234,78 @@ async def resolve_walks(
         log.warning("Unsplit oversized node — walking reachable head only", label=child_label)
         walks.append(Walk(child_nav, child_label, reachable_cap(settings) + 1, truncated=True))
     return walks
+
+
+# Home Depot's own clock. Matches setup_schedule, which builds the cron slots
+# from Eastern wall time for the same reason.
+SCHEDULE_TZ = ZoneInfo("America/New_York")
+
+
+def full_shelf_hours(settings: Settings) -> set[int]:
+    hours = set()
+    for part in str(getattr(settings, "browse_full_shelf_hours_et", "")).split(","):
+        part = part.strip()
+        if part.isdigit() and 0 <= int(part) <= 23:
+            hours.add(int(part))
+    return hours
+
+
+def effective_shelf_fraction(settings: Settings, now: datetime | None = None) -> float:
+    """1.0 on a designated full-walk hour, the configured slice otherwise.
+
+    Read once per run rather than per store, so a run that starts at 03:59 and
+    crosses into 04:00 keeps the fraction it began with instead of changing
+    behaviour halfway through.
+    """
+    hours = full_shelf_hours(settings)
+    if not hours:
+        return settings.browse_shelf_fraction
+    now = (now or datetime.now(timezone.utc)).astimezone(SCHEDULE_TZ)
+    return 1.0 if now.hour in hours else settings.browse_shelf_fraction
+
+
+def rotate_shelf_walks(
+    walks: list[Walk],
+    cursors: dict[str, int],
+    store_id: str,
+    token: str,
+    settings: Settings,
+    fraction: float | None = None,
+) -> tuple[list[Walk], int]:
+    """This run's slice of the shelf categories. Returns (picked, skipped).
+
+    The shelf tier re-paginates every category on every run — measured at 51
+    walks and 154 page requests, six times a day — while most categories change
+    far more slowly than that. Walking a slice per run trades coverage latency
+    for request volume: with a fraction of 0.5 a category is revisited every
+    other run instead of every run.
+
+    Ordering is by label so the cursor means the same thing between runs even
+    as the catalog shifts underneath it.
+    """
+    fraction = settings.browse_shelf_fraction if fraction is None else fraction
+    if fraction >= 1.0 or len(walks) <= 1:
+        return walks, 0
+    ordered = sorted(walks, key=lambda w: w.label)
+    per_run = max(1, math.ceil(len(ordered) * fraction))
+    key = f"shelf|{store_id}|{token}"
+    start = cursors.get(key, 0) % len(ordered)
+    picked = [ordered[(start + i) % len(ordered)] for i in range(per_run)]
+    cursors[key] = (start + per_run) % len(ordered)
+    return picked, len(ordered) - len(picked)
+
+
+def _prime(walks: list[Walk], nav_param: str, raw: dict | None) -> None:
+    """Hand a facet response to the walk that covers the same navParam.
+
+    A split node's children have their own navParams and get their own facet
+    reads, so only an exact match is reusable.
+    """
+    if raw is None:
+        return
+    for walk in walks:
+        if walk.nav_param == nav_param:
+            walk.primed = raw
 
 
 def _safe_label(label: str) -> str:
@@ -249,19 +346,29 @@ async def walk_and_capture(
                 )
             break
 
-        try:
-            raw = await search(
-                client,
-                keyword=None,
-                nav_param=walk.nav_param,
-                store_id=store_id,
-                start_index=start_index,
-                page_size=settings.page_size,
-                storefilter=storefilter,
-            )
-        except Exception as e:
-            log.error("Browse page fetch failed", label=walk.label, page=page, error=str(e))
-            break
+        if page == 0 and walk.primed is not None:
+            # Already fetched while planning this walk; consumed once so a
+            # later pass cannot serve a stale page.
+            raw = walk.primed
+            walk.primed = None
+        else:
+            try:
+                raw = await search(
+                    client,
+                    keyword=None,
+                    nav_param=walk.nav_param,
+                    store_id=store_id,
+                    start_index=start_index,
+                    page_size=settings.page_size,
+                    storefilter=storefilter,
+                )
+            except CircuitOpenError:
+                # Too many failures too fast. This ends the run, not just this
+                # walk, so it has to travel past the per-walk handler.
+                raise
+            except Exception as e:
+                log.error("Browse page fetch failed", label=walk.label, page=page, error=str(e))
+                break
 
         if client.is_throttled:
             break
@@ -339,10 +446,18 @@ async def run_browse(
     seen_by_store: dict[str, set[str]] = {s: set() for s in store_ids}
 
     cursors: dict[str, int] = rotation.load_cursors(settings.browse_cursor_path)
+    shelf_fraction = effective_shelf_fraction(settings)
 
     if not brand_tokens:
         log.error("No brand tokens configured — browse cannot run")
         return summary
+
+    log.info(
+        "Browse starting",
+        shelf_fraction=shelf_fraction,
+        full_walk=shelf_fraction >= 1.0,
+        stores=len(store_ids),
+    )
 
     try:
         if "shelf" in tiers:
@@ -355,6 +470,10 @@ async def run_browse(
                     walks = await resolve_walks(
                         client, settings, nav, brand, store_id, "IN_STORE",
                     )
+                    walks, skipped = rotate_shelf_walks(
+                        walks, cursors, store_id, token, settings, shelf_fraction
+                    )
+                    summary.skipped_walks += skipped
                     for walk in walks:
                         if client.is_throttled:
                             summary.aborted = True
@@ -374,6 +493,7 @@ async def run_browse(
                     store_id=store_id,
                     snapshots=summary.snapshots,
                     requests_used=client.request_count,
+                    deferred_categories=summary.skipped_walks or None,
                 )
 
         if "network" in tiers and not client.is_throttled:
@@ -384,7 +504,12 @@ async def run_browse(
                         summary.aborted = True
                         break
                     nav = build_nav(settings.root_nav_param, token)
-                    total, dims = await fetch_facets(client, settings, nav, store_id, "ALL")
+                    # The root read only supplies the category list; each
+                    # category walks under its own navParam, so there is no
+                    # page here to carry forward.
+                    total, dims, _ = await fetch_facets(
+                        client, settings, nav, store_id, "ALL", page_size=1
+                    )
                     categories = sorted(
                         (r for r in dims.get(CATEGORY_DIMENSION, [])
                          if r.get("count") and r["count"] > 0),
@@ -436,6 +561,12 @@ async def run_browse(
                             if walk.truncated:
                                 summary.truncated_walks.append(walk.label)
                             await _pause(settings)
+    except CircuitOpenError as e:
+        # Reached run_browse uncaught before this, killing the process mid-run:
+        # no cursor save, no cooldown written, no summary. Now it stops the run
+        # the same way a throttle does.
+        log.error("Circuit breaker opened — aborting run", error=str(e))
+        summary.aborted = True
     finally:
         rotation.save_cursors(settings.browse_cursor_path, cursors)
         summary.aborted = summary.aborted or client.is_throttled
@@ -444,6 +575,7 @@ async def run_browse(
             products=summary.products,
             snapshots=summary.snapshots,
             walks=summary.walks,
+            deferred_categories=summary.skipped_walks or None,
             truncated=summary.truncated_walks or None,
             requests_used=client.request_count,
             throttled=client.is_throttled,

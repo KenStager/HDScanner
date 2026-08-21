@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     extra_nav_params: str = ""  # Additional category navParams (CSV), no product_line_filter applied
     clearance_token: str = "1z11adf"
     max_concurrency: int = 3
+    # Tokens available at the start of a run. At the previous value (which
+    # borrowed max_concurrency) every run opened with a 3-request burst before
+    # any pacing applied — the least restrained moment of the whole run.
+    rate_limit_burst: int = 1
     rate_limit_rps: float = 0.5
     jitter_min_ms: int = 500
     jitter_max_ms: int = 2500
@@ -75,6 +79,17 @@ class Settings(BaseSettings):
     browse_cursor_path: str = ".hd_browse_cursor"
     browse_request_budget: int = 280          # replaces request_budget for browse runs
     browse_max_split_depth: int = 3           # facet-split recursion guard
+    # Fraction of shelf categories walked per run. The shelf tier costs a fixed
+    # ~154 page requests every run, six runs a day, to re-read categories that
+    # mostly have not changed. At 0.5 each category is seen every other run for
+    # half the traffic; 1.0 restores walking all of them every run.
+    browse_shelf_fraction: float = 0.5
+    # Hours (US Eastern) that walk the whole shelf instead of a slice. Measured
+    # over ~2,300 observed changes: regular repricing clusters in the 20:00-04:00
+    # window and is finished by 08:00, while new clearance tags appear in the
+    # 08:00-12:00 window. A full walk at the close of each window sees the whole
+    # store while the change is fresh. Empty disables full walks entirely.
+    browse_full_shelf_hours_et: str = "4,12"
 
     # A deal is only current if its item was seen by a recent scan. Items that
     # drop out of the catalog stop being deals — without this, their last
@@ -89,6 +104,12 @@ class Settings(BaseSettings):
     daily_deals_url: str = "https://www.homedepot.com/daily-deals"
     daily_deals_cursor_path: str = ".hd_dailydeals_cursor"
     daily_deals_max_items: int = 250
+    # Items in the day's set that we have never seen are skipped by default:
+    # identifying one costs an API request, and across every completed sweep on
+    # record none of the ~110 daily deals were a tracked brand. Raise this to
+    # spend that many requests probing unknown ids anyway.
+    daily_deals_probe_unknown: int = 0
+
 
     # True-savings verdicts need real history: an item first seen minutes ago
     # has a "30-day high" equal to today's price, which would wrongly label a
@@ -114,6 +135,47 @@ class Settings(BaseSettings):
     # Pipeline
     stage_delay_seconds: int = 15
 
+    # Client identity. The scanner names itself rather than borrowing a
+    # browser's User-Agent: that is what lets the operator on the other end
+    # allow-list it, throttle it deliberately, or ask it to stop. Set
+    # contact_email so a human there can reach a human here.
+    user_agent: str = "HDClearanceMonitor/0.1"
+    contact_email: str = ""
+
+    # Request limits. There is no connection pooling: the API refuses Python
+    # HTTP clients outright, so every request is its own curl process.
+    read_timeout_seconds: float = 30.0
+    max_response_bytes: int = 10 * 1024 * 1024
+
+    # Retry policy. A Retry-After longer than the ceiling ends the run instead
+    # of being waited out — at that point the API is asking for a later visit,
+    # not a slower one.
+    max_attempts: int = 5
+
+    # How long to stay away after an outright refusal — a 403, or an HTML
+    # block page served where JSON was expected. Both stop the run.
+    forbidden_cooldown_seconds: float = 3600.0
+
+    # A 206 quota signal applies to the caller, not the process. Without a
+    # cooldown that survives exit, the next scheduled run reopens a client and
+    # walks straight back into the wall — which is what happened at 20:00 on
+    # 2026-08-19, throttled on its second request.
+    throttle_cooldown_path: str = ".hd_throttle_cooldown"
+    throttle_cooldown_seconds: float = 3600.0
+    max_retry_after_seconds: float = 300.0
+
+    # Baseline instrumentation. Each run appends one summary line (success
+    # rate, latency percentiles, status/outcome counts) so the API's behaviour
+    # can be characterised across runs — a single run is far too small a
+    # sample to draw anything from.
+    metrics_path: str = "diagnostics/http_metrics.jsonl"
+
+    # Scan liveness. Notifications fire on transitions — stopped, resumed —
+    # not on state, so a long outage is two messages instead of one suppressed
+    # database row nobody reads.
+    health_state_path: str = ".hd_health_state"
+    health_notify: bool = True
+
     # Safety
     circuit_breaker_failure_threshold: int = 10
     circuit_breaker_window_seconds: int = 60
@@ -128,10 +190,26 @@ class Settings(BaseSettings):
 
     # Maintenance
     snapshot_retention_days: int = 90
+    # SQLite keeps the pages a delete frees and reuses them later, so pruning
+    # alone never shrinks the file: after deleting 491,902 rows the database
+    # still measured 1.43 GB with 1.26 GB reclaimable. VACUUM returns the space
+    # but rewrites the whole file, so it runs only once the waste is worth the
+    # rewrite. 0 disables it.
+    vacuum_threshold_pct: int = 25
 
     # Storage
     store_raw_json: bool = True
     raw_json_dir: str = "./raw_responses"
+    # Raw responses are the receipts behind each parse. Nothing reads them
+    # programmatically, but they are what makes after-the-fact forensics
+    # possible — the per-category cost and clearance-yield analysis of
+    # 2026-08-20 came entirely from this directory.
+    #
+    # They accumulated at ~59 MB/day and nothing ever deleted them, reaching
+    # 3,559 files and 353 MB in six days. A week keeps enough to investigate a
+    # bad parse while bounding the directory; raise it for deeper forensics,
+    # set 0 to keep everything.
+    raw_retention_days: int = 7
 
     # Dashboard
     dashboard_host: str = "127.0.0.1"

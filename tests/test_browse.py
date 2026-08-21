@@ -11,6 +11,9 @@ from hd.config import Settings
 from hd.hd_api.parsers import parse_dimensions
 from hd.pipeline.browse import (
     Walk,
+    effective_shelf_fraction,
+    full_shelf_hours,
+    rotate_shelf_walks,
     build_nav,
     plan_walks,
     reachable_cap,
@@ -132,13 +135,19 @@ def browse_settings(tmp_path) -> Settings:
 
 
 @pytest.fixture
-def fresh_db(tmp_path):
+async def fresh_db(tmp_path):
     """Patch the module-level Database singleton so tests get an isolated DB."""
     from hd.db import base
 
     db = base.Database()
     with patch.object(base, "_default", db):
         yield db
+    # conftest's autouse teardown closes whatever `base._default` is by then,
+    # which patch.object has already restored to the original — not this one.
+    # An undisposed engine leaves an aiosqlite worker thread running past the
+    # loop that owns it, and it surfaces as "Event loop is closed" against
+    # whichever unrelated test happens to be running when it dies.
+    await db.close_db()
 
 
 # ---------------------------------------------------------------- parse_dimensions
@@ -327,6 +336,278 @@ class TestWalkAndCapture:
         assert (upserts, inserts) == (0, 0)
 
 
+# ---------------------------------------------------------------- full-walk hours
+
+class TestFullShelfHours:
+    """04:00 and 12:00 ET walk the whole shelf; other runs take a slice."""
+
+    def _at(self, hour_et):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime(2026, 8, 20, hour_et, 30, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_designated_hours_walk_everything(self, browse_settings):
+        browse_settings.browse_full_shelf_hours_et = "4,12"
+        browse_settings.browse_shelf_fraction = 0.5
+        assert effective_shelf_fraction(browse_settings, self._at(4)) == 1.0
+        assert effective_shelf_fraction(browse_settings, self._at(12)) == 1.0
+
+    def test_other_hours_take_the_configured_slice(self, browse_settings):
+        browse_settings.browse_full_shelf_hours_et = "4,12"
+        browse_settings.browse_shelf_fraction = 0.5
+        for h in (0, 3, 8, 16, 20):
+            assert effective_shelf_fraction(browse_settings, self._at(h)) == 0.5
+
+    def test_hour_is_eastern_not_the_machine_clock(self, browse_settings):
+        """A UTC 08:00 instant is 04:00 Eastern — the run that must walk fully."""
+        from datetime import datetime, timezone
+        browse_settings.browse_full_shelf_hours_et = "4"
+        browse_settings.browse_shelf_fraction = 0.5
+        utc_0800 = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+        assert effective_shelf_fraction(browse_settings, utc_0800) == 1.0
+
+    def test_empty_setting_disables_full_walks(self, browse_settings):
+        browse_settings.browse_full_shelf_hours_et = ""
+        browse_settings.browse_shelf_fraction = 0.5
+        assert effective_shelf_fraction(browse_settings, self._at(4)) == 0.5
+
+    def test_malformed_hours_are_ignored_not_fatal(self, browse_settings):
+        browse_settings.browse_full_shelf_hours_et = "4, ,x,99,12"
+        assert full_shelf_hours(browse_settings) == {4, 12}
+
+    def test_explicit_fraction_overrides_the_setting(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.5
+        walks = [Walk(f"n{i}", f"C{i:02d}", 5) for i in range(10)]
+        picked, skipped = rotate_shelf_walks(walks, {}, "2619", "zv", browse_settings, 1.0)
+        assert len(picked) == 10 and skipped == 0
+
+
+# ---------------------------------------------------------------- shelf rotation
+
+class TestShelfRotation:
+    """The shelf tier walks a slice per run instead of every category every run."""
+
+    def _walks(self, n):
+        return [Walk(f"nav{i}", f"Cat{i:02d}", 5) for i in range(n)]
+
+    def test_half_the_categories_are_walked(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.5
+        picked, skipped = rotate_shelf_walks(self._walks(10), {}, "2619", "zv", browse_settings)
+        assert len(picked) == 5
+        assert skipped == 5
+
+    def test_consecutive_runs_cover_the_other_half(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.5
+        cursors = {}
+        walks = self._walks(10)
+        first, _ = rotate_shelf_walks(walks, cursors, "2619", "zv", browse_settings)
+        second, _ = rotate_shelf_walks(walks, cursors, "2619", "zv", browse_settings)
+        # Two runs see every category exactly once between them.
+        assert {w.label for w in first} | {w.label for w in second} == {w.label for w in walks}
+        assert not ({w.label for w in first} & {w.label for w in second})
+
+    def test_cursor_wraps_around(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.5
+        cursors = {}
+        walks = self._walks(10)
+        seen = []
+        for _ in range(4):
+            picked, _ = rotate_shelf_walks(walks, cursors, "2619", "zv", browse_settings)
+            seen.append({w.label for w in picked})
+        assert seen[0] == seen[2] and seen[1] == seen[3]  # cycle length 2
+
+    def test_fraction_of_one_walks_everything(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 1.0
+        walks = self._walks(10)
+        picked, skipped = rotate_shelf_walks(walks, {}, "2619", "zv", browse_settings)
+        assert picked == walks
+        assert skipped == 0
+
+    def test_a_single_walk_is_never_skipped(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.1
+        walks = self._walks(1)
+        picked, skipped = rotate_shelf_walks(walks, {}, "2619", "zv", browse_settings)
+        assert picked == walks and skipped == 0
+
+    def test_at_least_one_walk_runs_however_small_the_fraction(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.01
+        picked, _ = rotate_shelf_walks(self._walks(10), {}, "2619", "zv", browse_settings)
+        assert len(picked) == 1
+
+    def test_stores_rotate_independently(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.5
+        cursors = {}
+        walks = self._walks(10)
+        rotate_shelf_walks(walks, cursors, "2619", "zv", browse_settings)
+        assert "shelf|2619|zv" in cursors
+        assert "shelf|8452|zv" not in cursors
+
+    def test_order_is_stable_so_the_cursor_keeps_its_meaning(self, browse_settings):
+        browse_settings.browse_shelf_fraction = 0.5
+        walks = self._walks(10)
+        a, _ = rotate_shelf_walks(list(reversed(walks)), {}, "2619", "zv", browse_settings)
+        b, _ = rotate_shelf_walks(walks, {}, "2619", "zv", browse_settings)
+        assert [w.label for w in a] == [w.label for w in b]
+
+
+# ---------------------------------------------------------------- circuit breaker
+
+class TestCircuitBreakerAbort:
+    async def test_circuit_opening_mid_walk_ends_the_run(self, browse_settings, fresh_db):
+        """It used to escape run_browse uncaught, killing the process mid-run."""
+        from hd.db import base
+        from hd.http.client import CircuitOpenError
+
+        await base.init_db(browse_settings)
+
+        class ExplodingClient(FakeClient):
+            @property
+            def is_throttled(self):
+                return False
+
+            async def post_graphql(self, variables):
+                self._count += 1
+                if self._count > 1:
+                    raise CircuitOpenError("Circuit breaker open: 10 failures")
+                # A full page, so the walk tries to fetch the next one.
+                return make_page(
+                    [make_product("111"), make_product("222")], 100
+                )
+
+        summary = await run_browse(browse_settings, client=ExplodingClient(None))
+
+        # No traceback: the run reports itself as aborted and stops. The
+        # per-walk exception handler must not swallow this and walk on.
+        assert summary.aborted is True
+
+    async def test_circuit_opening_during_a_facet_read_ends_the_run(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.http.client import CircuitOpenError
+
+        await base.init_db(browse_settings)
+
+        class ExplodingClient(FakeClient):
+            @property
+            def is_throttled(self):
+                return False
+
+            async def post_graphql(self, variables):
+                self._count += 1
+                if self._count > 1:
+                    raise CircuitOpenError("open")
+                return make_page([make_product("111")], 1)
+
+        summary = await run_browse(browse_settings, client=ExplodingClient(None))
+        assert summary.aborted is True
+
+    async def test_cursors_survive_an_open_circuit(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.http.client import CircuitOpenError
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+
+        class ExplodingClient(FakeClient):
+            @property
+            def is_throttled(self):
+                return False
+
+            async def post_graphql(self, variables):
+                self._count += 1
+                if self._count > 1:
+                    raise CircuitOpenError("open")
+                return make_page([], 4, dims=[cat_dim(("Garage", "gar", 2))])
+
+        await run_browse(browse_settings, client=ExplodingClient(None))
+        # The finally block still ran, so progress is not lost.
+        assert rotation.load_cursors(browse_settings.browse_cursor_path) is not None
+
+
+# ---------------------------------------------------------------- facet-read reuse
+
+class TestFacetReadPriming:
+    """The facet read doubles as page 0, so planning a walk costs no extra request."""
+
+    async def test_facet_read_is_reused_as_page_zero(self, browse_settings, fresh_db):
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        seen = []
+
+        def router(v):
+            seen.append((v["navParam"], v["startIndex"]))
+            return make_page([make_product("111")], 1)
+
+        client = FakeClient(router)
+        walks = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzv", "Milwaukee", "2619", "IN_STORE",
+        )
+        assert len(walks) == 1
+        assert walks[0].primed is not None
+        planning_requests = client.request_count
+        assert planning_requests == 1
+
+        upserts, _ = await walk_and_capture(
+            client, browse_settings, walks[0], "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        # A single-page walk costs exactly one request in total, not two.
+        assert client.request_count == planning_requests
+        assert upserts == 1
+
+    async def test_primed_page_is_consumed_only_once(self, browse_settings, fresh_db):
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+
+        def router(v):
+            return make_page([make_product("111")], 1)
+
+        client = FakeClient(router)
+        walks = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzv", "Milwaukee", "2619", "IN_STORE",
+        )
+        walk = walks[0]
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert walk.primed is None  # a second pass must re-fetch, not serve a stale page
+
+        before = client.request_count
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert client.request_count > before
+
+    async def test_split_children_are_not_primed_with_the_parent_page(self, browse_settings):
+        """A child walks a different navParam, so the parent's page is not its page 0."""
+        def router(v):
+            if v["navParam"] == "N-5yc1vZzv":
+                return make_page([], 10, dims=[cat_dim(("Small", "sm", 3))])
+            return make_page([make_product("999")], 3)
+
+        client = FakeClient(router)
+        walks = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzv", "Milwaukee", "2619", "IN_STORE",
+        )
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZsm"]
+        # The child was derived from the parent's dimensions without a facet
+        # read of its own, so it has no page to carry forward — and must not
+        # inherit the parent's, which covers a different navParam.
+        assert walks[0].primed is None
+        assert client.request_count == 1
+
+    async def test_failed_facet_read_primes_nothing(self, browse_settings):
+        from hd.http.client import failure_response
+
+        client = FakeClient(lambda v: failure_response("http_429"))
+        walks = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzv", "Milwaukee", "2619", "IN_STORE",
+        )
+        assert walks == []
+
+
 # ---------------------------------------------------------------- run_browse integration
 
 def full_router(store="2619"):
@@ -343,14 +624,14 @@ def full_router(store="2619"):
 
     def router(v):
         nav, sf, idx = v["navParam"], v["storefilter"], v["startIndex"]
-        if v["pageSize"] == 1:  # facet read
-            if sf == "IN_STORE":
-                return make_page([], 3)
+        # A facet read is now an ordinary page-0 request — the response serves
+        # both purposes — so routing is by navParam and index, not page size.
+        if sf == "IN_STORE":
+            return shelf_pages[idx]
+        if nav == "N-5yc1vZzv":  # brand root: the category facet read
             return make_page([], 4, dims=[cat_dim(
                 ("Garage", "gar", 2), ("Plumbing", "bqew", 1), ("Tools", "c1xy", 1),
             )])
-        if sf == "IN_STORE":
-            return shelf_pages[idx]
         return net_pages[nav]
 
     return router

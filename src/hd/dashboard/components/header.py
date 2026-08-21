@@ -59,6 +59,35 @@ body, .hd-body { font-family: 'Inter', sans-serif; }
 .hd-dot.stale { background: var(--hd-yellow); }
 .hd-dot.degraded { background: var(--hd-red); }
 
+/* the scanner's own condition: absent when fine, unmissable when not */
+.hd-banner {
+  margin: 12px 24px 0 24px; padding: 10px 14px 12px 14px; border-radius: 6px;
+  background: var(--hd-surface); border-left: 4px solid var(--hd-yellow);
+}
+.hd-banner.fail { border-left-color: var(--hd-red); }
+.hd-banner-mark {
+  width: 9px; height: 9px; border-radius: 50%;
+  display: inline-block; background: var(--hd-yellow);
+}
+.hd-banner.fail .hd-banner-mark { background: var(--hd-red); }
+.hd-banner-head { font-weight: 600; font-size: 0.9rem; color: var(--hd-text); }
+.hd-banner-line {
+  color: var(--hd-muted); font-size: 0.82rem;
+  margin-left: 21px; line-height: 1.5;
+}
+.hd-banner-line.muted { opacity: 0.7; }
+
+/* warnings: findable without being an alarm. Several are permanent by choice,
+   and a bar that is always lit is one nobody reads on the day it matters. */
+.hd-advisory {
+  margin: 8px 24px 0 24px;
+  color: var(--hd-muted); font-size: 0.8rem;
+}
+.hd-advisory .q-expansion-item__container > .q-item {
+  min-height: 0; padding: 2px 0; color: var(--hd-muted);
+}
+.hd-advisory .q-item__label { font-size: 0.8rem; }
+
 /* deal grid + shelf-tag cards */
 .deal-grid {
   display: grid; gap: 14px;
@@ -153,6 +182,17 @@ a.deal-card:focus-visible { outline: 3px solid var(--hd-orange); outline-offset:
   font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 0.95rem;
   letter-spacing: 0.12em; text-transform: uppercase; color: var(--hd-muted);
 }
+
+/* Today's Daily Deals: a pinned panel on its own surface, visibly apart from
+   the ranked grid below it */
+.hd-daily-panel {
+  background: var(--hd-surface);
+  border: 1px solid #33363B;
+  border-top: 3px solid var(--hd-orange);
+  border-radius: 10px;
+  padding: 14px 16px 16px 16px;
+}
+.hd-daily-panel .hd-section-label { color: var(--hd-text); }
 
 /* ---- product detail: the item's dossier ---- */
 .pd-wrap { max-width: 1160px; margin: 0 auto; width: 100%; padding: 0 24px; }

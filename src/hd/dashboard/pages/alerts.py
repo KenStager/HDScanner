@@ -18,6 +18,7 @@ from hd.dashboard.components.formatters import (
     infer_in_stock,
 )
 from hd.dashboard.components.header import render_header
+from hd.dashboard.components.health import render_health_banner
 from hd.dashboard.queries import get_alerts
 from hd.db.models import AlertType, Severity
 from hd.grouping import group_alerts as _group_alerts
@@ -28,6 +29,7 @@ async def alerts_page() -> None:
     settings = _state.settings
     store_ids = settings.store_list
     render_header(settings.dashboard_title, current_path="/alerts")
+    await render_health_banner(settings)
 
     ui.add_css("""
         .q-table tbody tr.main-row:hover {

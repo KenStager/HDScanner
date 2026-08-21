@@ -31,7 +31,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from hd.http.client import CURL_HEADERS
+from hd.http.client import header_lines
 from hd.logging import get_logger
 
 log = get_logger("hd_api.stores")
@@ -149,6 +149,13 @@ def _to_result(raw: dict[str, Any]) -> StoreResult | None:
     )
 
 
+def _headers() -> list[str]:
+    """Request headers, read fresh so a configured contact address is picked up."""
+    from hd.config import Settings
+
+    return header_lines(Settings())
+
+
 async def _post(
     operation: str, query: str, variables: dict[str, Any], endpoint: str
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -170,7 +177,7 @@ async def _post(
         "--max-filesize", "5242880",
         "-d", json.dumps(payload),
     ]
-    for h in CURL_HEADERS:
+    for h in _headers():
         cmd.extend(["-H", h])
 
     try:

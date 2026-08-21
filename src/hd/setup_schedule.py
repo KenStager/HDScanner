@@ -31,10 +31,24 @@ log = get_logger("setup_schedule")
 HD_DEALS_TZ = ZoneInfo("America/New_York")
 HD_DEALS_REFRESH = dtime(3, 0)
 DEALS_GRACE_MINUTES = 10
+# A dedicated deals slot is only worth a whole extra run when no routine scan
+# already lands soon after the refresh. Every run checks the deals page anyway
+# (run-once calls it before the browse tiers), so if a scan starts within this
+# many hours of 3:00 ET the extra slot buys minutes of freshness at the cost of
+# a full pipeline run — and that run competes for the same server-side
+# allowance as the scan it precedes.
+DEALS_COVERED_WITHIN_HOURS = 2
 
 # The routine sweep. Deliberately not on the hour boundary of the deals run.
-SCAN_HOURS_ET = (0, 8, 12, 16, 20)
-PRUNE_HOUR_ET = 4
+# 04:00 exists because overnight repricing finishes by then: it and 12:00 are
+# the full-shelf walks (see browse_full_shelf_hours_et).
+SCAN_HOURS_ET = (0, 4, 8, 12, 16, 20)
+# Maintenance is placed in the middle of the quietest gap between scans rather
+# than at a fixed hour. It used to sit at 04:30 — thirty minutes into the 04:00
+# run, which is now the full-shelf walk and the longest of the day. Pruning
+# deletes rows and may VACUUM, which takes an exclusive lock, so overlapping a
+# scan means one of them loses.
+PRUNE_HOUR_ET = 4  # retained for callers that want the historical default
 
 DEFAULT_LABEL_BASE = "hdscanner"
 
@@ -78,16 +92,53 @@ def daily_deals_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
     return _to_local(HD_DEALS_REFRESH.hour + carry, minute, tz=tz, on=on)
 
 
+def deals_slot_needed(hours_et=SCAN_HOURS_ET) -> bool:
+    """Whether the deals refresh needs a slot of its own.
+
+    False when a routine scan already starts within DEALS_COVERED_WITHIN_HOURS
+    of the 3:00 ET refresh — that scan checks the deals page before it does
+    anything else, so a separate run would only duplicate it.
+    """
+    return not any(
+        0 <= (h - HD_DEALS_REFRESH.hour) <= DEALS_COVERED_WITHIN_HOURS
+        for h in hours_et
+    )
+
+
 def scan_slots(*, tz=None, on: datetime | None = None) -> list[ScheduleSlot]:
     """Every local time the scan should run, deals slot included, in order."""
     slots = [_to_local(h, 0, tz=tz, on=on) for h in SCAN_HOURS_ET]
-    slots.append(daily_deals_slot(tz=tz, on=on))
+    if deals_slot_needed():
+        slots.append(daily_deals_slot(tz=tz, on=on))
     unique = {(s.hour, s.minute) for s in slots}
     return [ScheduleSlot(h, m) for h, m in sorted(unique)]
 
 
+def quietest_hour_et(hours_et=SCAN_HOURS_ET) -> int:
+    """Eastern hour furthest from any scan, for maintenance to run in.
+
+    Picks the midpoint of the widest gap between consecutive scans, wrapping
+    around midnight. With scans every four hours every gap is equal, so this
+    settles on the first — two hours clear of the run before it and two hours
+    clear of the run after.
+    """
+    hours = sorted(set(hours_et))
+    if not hours:
+        return PRUNE_HOUR_ET
+    if len(hours) == 1:
+        return (hours[0] + 12) % 24
+
+    best_gap, best_hour = -1, hours[0]
+    for current, following in zip(hours, hours[1:] + [hours[0] + 24]):
+        gap = following - current
+        if gap > best_gap:
+            best_gap, best_hour = gap, (current + gap // 2) % 24
+    return best_hour
+
+
 def prune_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
-    return _to_local(PRUNE_HOUR_ET, 30, tz=tz, on=on)
+    """Local time for the maintenance job, in the quietest gap between scans."""
+    return _to_local(quietest_hour_et(), 30, tz=tz, on=on)
 
 
 def hd_executable() -> Path | None:
@@ -198,6 +249,56 @@ def render_prune_plist(label: str, workdir: Path, hd_path: Path, slot: ScheduleS
 
   <key>RunAtLoad</key>
   <false/>
+</dict>
+</plist>
+"""
+
+
+def render_dashboard_plist(label: str, workdir: Path, hd_path: Path) -> str:
+    """launchd job for the resident dashboard.
+
+    The only job here that stays running. `hd serve` blocks and owns its event
+    loop, so without this the dashboard exists only for as long as somebody
+    keeps a terminal window open — which is the whole reason a non-technical
+    install needs a terminal after day one.
+
+    KeepAlive restarts it after a crash, a logout or a reboot. ThrottleInterval
+    holds a broken install (a missing dashboard extra, an occupied port) to one
+    restart every 30s instead of a spin.
+
+    Host and port are deliberately not baked in: `hd serve` reads them from
+    settings, so changing the port in .env takes effect on the next restart
+    rather than needing the job rewritten.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{_xml(label)}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>export PYTHONUNBUFFERED=1; cd {_xml(_shell(workdir))} &amp;&amp; {_xml(_shell(hd_path))} serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{_xml(workdir)}</string>
+
+  <key>StandardOutPath</key>
+  <string>{_xml(str(workdir) + "/hd_dashboard.stdout.log")}</string>
+  <key>StandardErrorPath</key>
+  <string>{_xml(str(workdir) + "/hd_dashboard.stderr.log")}</string>
+
+  <!-- Resident: start at login and come back from any exit. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
 </dict>
 </plist>
 """

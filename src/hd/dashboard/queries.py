@@ -19,6 +19,7 @@ from hd.db.base import get_session
 from hd.db.models import (
     Alert,
     AlertType,
+    DailyDealPick,
     DismissedDeal,
     ItemPriceStat,
     Product,
@@ -741,6 +742,11 @@ ONLINE_UNVERIFIED_SLOTS = 15
 # price can still be the best available today, so they stay visible — but as
 # a small labeled strip, not competitors for grid slots.
 ONLINE_WARNING_SLOTS = 6
+# Deals no snapshot has ever shown to be buyable: no fulfillment data from any
+# recent observation, usually items HD lists in browse results it will not
+# actually sell. They stay on the board — missing data is not confirmed OOS —
+# but in a small block at the grid's tail, behind every purchasable deal.
+ONLINE_UNKNOWN_SLOTS = 6
 # A claim-only card whose price we have watched this many distinct days
 # without a single move is disproven — the "was" price never existed while we
 # were looking — and leaves the board entirely.
@@ -807,19 +813,26 @@ def _is_older_day(low_ts, snapshot_ts) -> bool:
     return low_ts.date() < snapshot_ts.date()
 
 
-async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
-    """Online deals (special buys, price drops) with honest savings.
+def _promo_predicate():
+    """A snapshot that advertises any kind of discount."""
+    return (
+        StoreSnapshot.special_buy.is_(True)
+        | (func.coalesce(StoreSnapshot.percentage_off, 0) > 0)
+        | (StoreSnapshot.price_original > StoreSnapshot.price_value)
+    )
 
-    Uses the latest snapshot per item at the reference store. claimed_pct is
-    what HD advertises; true_pct compares today's price to the highest price
-    we observed in the history window — the number that exposes inflated "was"
-    prices. history_days reports how much history actually backs that verdict,
-    so the UI can label its own confidence instead of implying a fixed span.
+
+def _online_rows_select(settings: Settings, ref_store: str, *,
+                        item_ids: list[str] | None = None,
+                        require_promo: bool = True):
+    """The online board's row query: latest snapshot per item at the reference
+    store, joined with everything an honest verdict needs — the window
+    baseline, when the promo first appeared, and the durable price stats.
+
+    item_ids narrows to a fixed set (the daily-deals strip). require_promo
+    drops the advertised-discount predicate: a pinned item earns a verdict
+    whether or not HD is claiming anything for it today.
     """
-    ref_store = settings.store_list[0] if settings.store_list else None
-    if ref_store is None:
-        return []
-
     latest_sub = _latest_snapshots_subquery()
     cutoff = datetime.now(timezone.utc) - timedelta(days=settings.deal_history_window_days)
     baseline_sub = (
@@ -846,79 +859,119 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
         )
         .where(
             StoreSnapshot.store_id == ref_store,
-            (
-                StoreSnapshot.special_buy.is_(True)
-                | (func.coalesce(StoreSnapshot.percentage_off, 0) > 0)
-                | (StoreSnapshot.price_original > StoreSnapshot.price_value)
-            ),
+            _promo_predicate(),
         )
         .group_by(StoreSnapshot.item_id)
         .subquery()
     )
 
-    async with get_session(settings) as session:
-        rows = (
+    stmt = (
+        select(
+            StoreSnapshot,
+            Product.title,
+            Product.canonical_url,
+            Product.image_url,
+            baseline_sub.c.high_window,
+            baseline_sub.c.first_ts,
+            promo_first_sub.c.promo_first_ts,
+            ItemPriceStat.low_price,
+            ItemPriceStat.low_ts,
+            ItemPriceStat.high_price,
+            ItemPriceStat.obs_days,
+        )
+        .join(
+            latest_sub,
+            and_(
+                StoreSnapshot.store_id == latest_sub.c.store_id,
+                StoreSnapshot.item_id == latest_sub.c.item_id,
+                StoreSnapshot.ts == latest_sub.c.max_ts,
+            ),
+        )
+        .outerjoin(Product, StoreSnapshot.item_id == Product.item_id)
+        .outerjoin(baseline_sub, StoreSnapshot.item_id == baseline_sub.c.item_id)
+        .outerjoin(promo_first_sub, StoreSnapshot.item_id == promo_first_sub.c.item_id)
+        .outerjoin(
+            ItemPriceStat,
+            and_(
+                ItemPriceStat.store_id == StoreSnapshot.store_id,
+                ItemPriceStat.item_id == StoreSnapshot.item_id,
+            ),
+        )
+        .where(
+            StoreSnapshot.store_id == ref_store,
+            StoreSnapshot.price_value.isnot(None),
+            # Freshness: unseen by recent scans = gone from the catalog
+            StoreSnapshot.ts
+            >= datetime.now(timezone.utc)
+            - timedelta(hours=settings.deal_freshness_hours),
+        )
+    )
+    if require_promo:
+        stmt = stmt.where(_promo_predicate())
+    if item_ids is not None:
+        stmt = stmt.where(StoreSnapshot.item_id.in_(item_ids))
+    return stmt
+
+
+async def _fulfillment_verdicts(session, settings: Settings, ref_store: str,
+                                rows) -> dict[str, bool | None]:
+    """Best fulfillment verdict per item: True / False / None (unknown).
+
+    HD's browse responses set fulfillment.fulfillmentOptions to null on some
+    rows — an unknown, never a confirmed out-of-stock — and several request
+    shapes feed the same snapshot stream, so a null row from one can land on
+    top of a fulfillment-bearing row another wrote hours earlier. Before
+    calling an item's availability unknown, consult its other snapshots
+    inside the same freshness window for the most recent real verdict.
+    """
+    from hd.hd_api.parsers import has_any_fulfillment
+
+    fulfillment_by_item: dict[str, bool | None] = {
+        row[0].item_id: has_any_fulfillment(row[0].raw_json) for row in rows
+    }
+    unknown_ids = [i for i, v in fulfillment_by_item.items() if v is None]
+    if unknown_ids:
+        lookback = (
             await session.execute(
-                select(
-                    StoreSnapshot,
-                    Product.title,
-                    Product.canonical_url,
-                    Product.image_url,
-                    baseline_sub.c.high_window,
-                    baseline_sub.c.first_ts,
-                    promo_first_sub.c.promo_first_ts,
-                    ItemPriceStat.low_price,
-                    ItemPriceStat.low_ts,
-                    ItemPriceStat.high_price,
-                    ItemPriceStat.obs_days,
-                )
-                .join(
-                    latest_sub,
-                    and_(
-                        StoreSnapshot.store_id == latest_sub.c.store_id,
-                        StoreSnapshot.item_id == latest_sub.c.item_id,
-                        StoreSnapshot.ts == latest_sub.c.max_ts,
-                    ),
-                )
-                .outerjoin(Product, StoreSnapshot.item_id == Product.item_id)
-                .outerjoin(baseline_sub, StoreSnapshot.item_id == baseline_sub.c.item_id)
-                .outerjoin(promo_first_sub, StoreSnapshot.item_id == promo_first_sub.c.item_id)
-                .outerjoin(
-                    ItemPriceStat,
-                    and_(
-                        ItemPriceStat.store_id == StoreSnapshot.store_id,
-                        ItemPriceStat.item_id == StoreSnapshot.item_id,
-                    ),
-                )
+                select(StoreSnapshot.item_id, StoreSnapshot.raw_json)
                 .where(
                     StoreSnapshot.store_id == ref_store,
-                    StoreSnapshot.price_value.isnot(None),
-                    # Freshness: unseen by recent scans = gone from the catalog
+                    StoreSnapshot.item_id.in_(unknown_ids),
                     StoreSnapshot.ts
                     >= datetime.now(timezone.utc)
                     - timedelta(hours=settings.deal_freshness_hours),
-                    (
-                        StoreSnapshot.special_buy.is_(True)
-                        | (func.coalesce(StoreSnapshot.percentage_off, 0) > 0)
-                        | (StoreSnapshot.price_original > StoreSnapshot.price_value)
-                    ),
                 )
+                .order_by(StoreSnapshot.ts.desc())
             )
         ).all()
+        for item_id, raw in lookback:
+            if fulfillment_by_item[item_id] is None:
+                fulfillment_by_item[item_id] = has_any_fulfillment(raw)
+    return fulfillment_by_item
 
-    dismissals = await get_dismissals(settings)
 
-    from hd.hd_api.parsers import has_any_fulfillment
+def _deals_from_rows(rows, fulfillment_by_item: dict[str, bool | None],
+                     dismissals: dict, settings: Settings) -> list[dict[str, Any]]:
+    """Turn row tuples from _online_rows_select into enriched deal dicts.
 
+    Applies the shared evidence math (claimed vs measured depth, history
+    gating, witnessed anchors) and the availability verdict, and attaches the
+    tier. The only rows dropped are confirmed out-of-stock; display policy —
+    depth cutoffs, hollow removal, slot caps — belongs to the callers.
+    """
     now = datetime.now(timezone.utc)
     min_history = timedelta(days=settings.price_history_min_days)
 
     deals: list[dict[str, Any]] = []
     for (snap, title, canonical_url, image_url, high_window, first_ts,
          promo_first_ts, low_price, low_ts, all_high, obs_days) in rows:
-        # A price is not a deal if nothing can actually be bought: skip items
-        # whose fulfillment data confirms every path is out of stock.
-        if has_any_fulfillment(snap.raw_json) is False:
+        # A price is not a deal if nothing can actually be bought: drop items
+        # whose fulfillment data confirms every path is out of stock. An item
+        # with no verdict at all stays — missing data is not evidence of
+        # unavailability — but is flagged so it can never outrank a deal we
+        # know is purchasable.
+        availability = fulfillment_by_item.get(snap.item_id)
+        if availability is False:
             continue
         value = float(snap.price_value)
         original = float(snap.price_original) if snap.price_original is not None else None
@@ -951,9 +1004,6 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
             witnessed_pct = round((float(all_high) - value) / float(all_high) * 100)
 
         evidence_pct = max(true_pct, witnessed_pct)
-
-        if max(claimed, evidence_pct) < 10:
-            continue
 
         if promo_first_ts is not None and promo_first_ts.tzinfo is None:
             promo_first_ts = promo_first_ts.replace(tzinfo=timezone.utc)
@@ -992,11 +1042,49 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
                 promo_first_ts and (now - promo_first_ts) <= timedelta(hours=24)
             ),
             "dismissed": _is_dismissed(dismissals, ONLINE_STORE_KEY, snap.item_id, value),
+            "availability_unknown": availability is None,
         }
         deal["tier"] = deal_tier(deal)
-        if deal["tier"] == "hollow":
-            continue  # the claimed "was" never existed while we watched
         deals.append(deal)
+    return deals
+
+
+async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
+    """Online deals (special buys, price drops) with honest savings.
+
+    Uses the latest snapshot per item at the reference store. claimed_pct is
+    what HD advertises; true_pct compares today's price to the highest price
+    we observed in the history window — the number that exposes inflated "was"
+    prices. history_days reports how much history actually backs that verdict,
+    so the UI can label its own confidence instead of implying a fixed span.
+
+    Availability follows the same evidence discipline: confirmed
+    out-of-stock drops off the board, items no fresh snapshot has shown to
+    be buyable rank behind every deal known to be purchasable, and only a
+    real fulfillment verdict counts either way.
+    """
+    ref_store = settings.store_list[0] if settings.store_list else None
+    if ref_store is None:
+        return []
+
+    async with get_session(settings) as session:
+        rows = (
+            await session.execute(_online_rows_select(settings, ref_store))
+        ).all()
+        fulfillment_by_item = await _fulfillment_verdicts(
+            session, settings, ref_store, rows
+        )
+
+    dismissals = await get_dismissals(settings)
+
+    deals = _deals_from_rows(rows, fulfillment_by_item, dismissals, settings)
+    # Board policy, applied only here: a cut nobody claims and nothing
+    # measured is not worth a card, and a claim-only card whose "was" our
+    # watching disproved (hollow) leaves the board entirely.
+    deals = [
+        d for d in deals
+        if max(d["claimed_pct"], d["evidence_pct"]) >= 10 and d["tier"] != "hollow"
+    ]
 
     # Evidence leads, HD's claim follows. Within each tier, newer deals break
     # ties first so the board rotates rather than ossifying.
@@ -1005,6 +1093,12 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
         if ts.tzinfo is None:  # ORM timestamps are naive UTC
             ts = ts.replace(tzinfo=timezone.utc)
         return ts
+
+    # Availability is its own evidence axis: however deep the cut, a deal
+    # nothing has shown to be buyable must not outrank one we know can be
+    # bought. Unknowns keep a small chipped block at the grid's tail.
+    unknown = [d for d in deals if d["availability_unknown"]]
+    deals = [d for d in deals if not d["availability_unknown"]]
 
     verified = [d for d in deals if d["tier"] == "verified"]
     unverified = [d for d in deals if d["tier"] == "unverified"]
@@ -1015,8 +1109,82 @@ async def get_online_deals(settings: Settings) -> list[dict[str, Any]]:
     unverified.sort(key=_recency, reverse=True)
     unverified.sort(key=lambda d: -d["claimed_pct"])
     warned.sort(key=lambda d: -d["claimed_pct"])
+    unknown.sort(key=_recency, reverse=True)
+    unknown.sort(key=lambda d: (-d["evidence_pct"], -d["claimed_pct"]))
 
     reserve = min(len(unverified), ONLINE_UNVERIFIED_SLOTS)
     keep_verified = verified[: max(0, ONLINE_DISPLAY_LIMIT - reserve)]
     keep_unverified = unverified[: max(0, ONLINE_DISPLAY_LIMIT - len(keep_verified))]
-    return keep_verified + keep_unverified + warned[:ONLINE_WARNING_SLOTS]
+    return (
+        keep_verified
+        + keep_unverified
+        + unknown[:ONLINE_UNKNOWN_SLOTS]
+        + warned[:ONLINE_WARNING_SLOTS]
+    )
+
+
+async def get_daily_deal_picks(settings: Settings) -> list[dict[str, Any]]:
+    """Today's Daily Deals set, every pick, with the board's honest verdicts.
+
+    A pinned editorial strip, not a ranking: whatever the sweep matched today
+    is shown in full — no depth cutoff, no slot caps, hollow included — because
+    the strip's promise is "here is what HD is pushing today and what our
+    record says about it". The verdict may well be unflattering ("we watched
+    it sell for less"); that is the point.
+
+    A set is current while HD's own end_date hasn't passed in Eastern time —
+    daily deals roll over at 3:00 ET, so yesterday's set (end_date == today)
+    stays legitimately live through the small hours. Confirmed out-of-stock
+    picks are still dropped: nothing honest can be said about a price nobody
+    can pay.
+    """
+    from zoneinfo import ZoneInfo
+
+    ref_store = settings.store_list[0] if settings.store_list else None
+    if ref_store is None:
+        return []
+
+    today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    async with get_session(settings) as session:
+        end_date = (
+            await session.execute(
+                select(func.max(DailyDealPick.end_date)).where(
+                    DailyDealPick.end_date >= today_et
+                )
+            )
+        ).scalar_one_or_none()
+        if not end_date:
+            return []
+        item_ids = [
+            r[0]
+            for r in await session.execute(
+                select(DailyDealPick.item_id).where(DailyDealPick.end_date == end_date)
+            )
+        ]
+        if not item_ids:
+            return []
+        rows = (
+            await session.execute(
+                _online_rows_select(
+                    settings, ref_store, item_ids=item_ids, require_promo=False
+                )
+            )
+        ).all()
+        fulfillment_by_item = await _fulfillment_verdicts(
+            session, settings, ref_store, rows
+        )
+
+    dismissals = await get_dismissals(settings)
+    deals = _deals_from_rows(rows, fulfillment_by_item, dismissals, settings)
+    for d in deals:
+        d["is_daily"] = True
+        d["daily_end_date"] = end_date
+
+    # Strongest facts first, warnings last where their chip reads as the
+    # closing word; hollow ranks with unverified — its flat-price chip is the
+    # honest rendering.
+    rank = {"verified": 0, "warned": 2}
+    deals.sort(
+        key=lambda d: (rank.get(d["tier"], 1), -d["evidence_pct"], -d["claimed_pct"])
+    )
+    return deals

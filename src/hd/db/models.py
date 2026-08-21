@@ -34,6 +34,7 @@ class AlertType(str, enum.Enum):
     OOS = "OOS"
     IN_STORE_CLEARANCE = "IN_STORE_CLEARANCE"
     HEALTH_DEGRADED = "HEALTH_DEGRADED"
+    HEALTH_RECOVERED = "HEALTH_RECOVERED"
 
 
 class Severity(str, enum.Enum):
@@ -101,6 +102,25 @@ class StoreSnapshot(Base):
     limited_qty: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     out_of_stock: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class DailyDealPick(Base):
+    """One brand-matched item from a day's Daily Deals set.
+
+    The sweep discovers the set from HD's daily-deals page; only the items
+    matching a tracked brand are recorded (unmatched items were never priced,
+    so there is nothing honest to show for them). end_date is HD's own label
+    for the set — the day the deals expire — and doubles as the currency
+    check: a set whose end_date has passed is dead.
+    """
+
+    __tablename__ = "daily_deal_picks"
+
+    end_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+    item_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
 
 
 class Alert(Base):

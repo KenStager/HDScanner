@@ -147,3 +147,74 @@ class TestPrune:
             remaining = result.scalar()
 
         assert remaining == 1  # only 10-day-old snapshot survives
+
+
+# --- raw response retention -------------------------------------------------
+#
+# Nothing had ever deleted this directory: it reached 3,559 files and 353 MB in
+# six days, accumulating at ~59 MB/day.
+
+import time
+from pathlib import Path
+
+from hd.cli import prune_raw_responses
+
+
+def _raw_settings(tmp_path, **kw):
+    from hd.config import Settings
+
+    base = dict(_env_file=None, raw_json_dir=str(tmp_path / "raw"), raw_retention_days=7)
+    base.update(kw)
+    return Settings(**base)
+
+
+def _write(directory: Path, name: str, age_days: float, size: int = 100) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("x" * size)
+    when = time.time() - age_days * 86400
+    import os
+
+    os.utime(path, (when, when))
+    return path
+
+
+def test_old_files_go_and_recent_ones_stay(tmp_path):
+    s = _raw_settings(tmp_path)
+    raw = Path(s.raw_json_dir)
+    old = _write(raw, "old.json", 30)
+    fresh = _write(raw, "fresh.json", 1)
+
+    files, freed = prune_raw_responses(s)
+    assert files == 1 and freed == 100
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_dry_run_deletes_nothing_but_reports_the_same_total(tmp_path):
+    s = _raw_settings(tmp_path)
+    raw = Path(s.raw_json_dir)
+    old = _write(raw, "old.json", 30)
+
+    files, freed = prune_raw_responses(s, dry_run=True)
+    assert files == 1 and freed == 100
+    assert old.exists()
+
+
+def test_zero_retention_keeps_everything(tmp_path):
+    s = _raw_settings(tmp_path, raw_retention_days=0)
+    _write(Path(s.raw_json_dir), "ancient.json", 900)
+    assert prune_raw_responses(s) == (0, 0)
+
+
+def test_missing_directory_is_not_an_error(tmp_path):
+    s = _raw_settings(tmp_path)
+    assert prune_raw_responses(s) == (0, 0)
+
+
+def test_non_json_files_are_left_alone(tmp_path):
+    s = _raw_settings(tmp_path)
+    raw = Path(s.raw_json_dir)
+    keep = _write(raw, "notes.txt", 90)
+    prune_raw_responses(s)
+    assert keep.exists()

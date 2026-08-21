@@ -33,6 +33,7 @@ from hd.dashboard.components.formatters import (
     store_price_verdict,
 )
 from hd.dashboard.components.header import render_header
+from hd.dashboard.components.health import render_health_banner
 from hd.dashboard.queries import get_product_detail, get_products_with_latest
 
 
@@ -41,6 +42,7 @@ async def products_page() -> None:
     settings = _state.settings
     store_ids = settings.store_list
     render_header(settings.dashboard_title, current_path="/products")
+    await render_health_banner(settings)
 
     ui.add_css("""
         .q-table tbody tr:hover { background: rgba(255,255,255,0.05) !important; cursor: pointer; }
@@ -461,6 +463,7 @@ async def product_detail_page(item_id: str) -> None:
     settings = _state.settings
     store_ids = settings.store_list
     render_header(settings.dashboard_title, current_path="/products")
+    await render_health_banner(settings)
 
     detail = await get_product_detail(settings, item_id)
     product = detail.get("product")

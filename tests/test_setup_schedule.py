@@ -20,8 +20,10 @@ from hd.setup_schedule import (
     hd_executable,
     label_for,
     prune_slot,
+    quietest_hour_et,
     render_crontab,
     render_prune_plist,
+    render_dashboard_plist,
     render_scan_plist,
     scan_slots,
 )
@@ -57,9 +59,19 @@ class TestDailyDealsSlot:
 
 
 class TestScanSlots:
-    def test_includes_the_deals_slot(self):
+    def test_no_separate_deals_slot_when_a_scan_already_covers_it(self):
+        """04:00 ET starts an hour after the refresh and checks deals first."""
         slots = scan_slots(tz=EASTERN, on=WINTER)
-        assert ScheduleSlot(3, 10) in slots
+        assert ScheduleSlot(3, 10) not in slots
+        assert ScheduleSlot(4, 0) in slots
+
+    def test_deals_slot_returns_when_no_scan_lands_near_the_refresh(self):
+        from hd.setup_schedule import deals_slot_needed
+
+        assert deals_slot_needed((0, 8, 12, 16, 20)) is True   # nothing near 03:00
+        assert deals_slot_needed((0, 4, 8, 12, 16, 20)) is False
+        assert deals_slot_needed((0, 3, 8)) is False           # exactly on the refresh
+        assert deals_slot_needed((0, 6, 8)) is True            # three hours later is too late
 
     def test_sorted_and_deduplicated(self):
         slots = scan_slots(tz=EASTERN, on=WINTER)
@@ -69,6 +81,49 @@ class TestScanSlots:
 
     def test_shifted_zone_still_has_every_slot(self):
         assert len(scan_slots(tz=PACIFIC, on=WINTER)) == len(scan_slots(tz=EASTERN, on=WINTER))
+
+
+class TestMaintenanceSlot:
+    """Maintenance must not overlap a scan: pruning deletes rows and may VACUUM,
+    which takes an exclusive lock. It used to sit at 04:30 — thirty minutes into
+    what is now the longest run of the day."""
+
+    def test_lands_in_the_middle_of_the_gap(self):
+        assert quietest_hour_et((0, 4, 8, 12, 16, 20)) == 2
+
+    def test_reproduces_the_old_hardcoded_hour_for_the_old_schedule(self):
+        """04:30 was not arbitrary — it was the quietest hour before 04:00 existed."""
+        assert quietest_hour_et((0, 8, 12, 16, 20)) == 4
+
+    def test_prefers_the_widest_gap(self):
+        # Gaps are 0->1, 1->2, 2->14 (twelve hours) and 14->0 (ten). The
+        # widest is 2->14, whose midpoint is 08:00.
+        assert quietest_hour_et((0, 1, 2, 14)) == 8
+
+    def test_wraps_around_midnight(self):
+        # 2->22 is twenty hours; 22->2 is four. Midpoint of the former is noon.
+        assert quietest_hour_et((22, 2)) == 12
+
+    def test_single_scan_goes_opposite(self):
+        assert quietest_hour_et((6,)) == 18
+
+    def test_empty_falls_back(self):
+        from hd.setup_schedule import PRUNE_HOUR_ET
+
+        assert quietest_hour_et(()) == PRUNE_HOUR_ET
+
+    def test_slot_is_half_past(self):
+        slot = prune_slot(tz=EASTERN, on=WINTER)
+        assert (slot.hour, slot.minute) == (2, 30)
+
+    def test_slot_never_collides_with_a_scan(self):
+        from hd.setup_schedule import scan_slots
+
+        maintenance = prune_slot(tz=EASTERN, on=WINTER)
+        scans = {(s.hour, s.minute) for s in scan_slots(tz=EASTERN, on=WINTER)}
+        assert (maintenance.hour, maintenance.minute) not in scans
+        # and at least an hour clear of the nearest scan start
+        assert min(abs(maintenance.hour - h) for h, _ in scans) >= 1
 
 
 class TestRenderPlists:
@@ -105,12 +160,37 @@ class TestRenderPlists:
         assert "prune" in out
         assert "run-once" not in out
 
+    def test_dashboard_job_is_resident(self):
+        """The scan and prune jobs fire and exit; this one has to stay up.
+
+        Without KeepAlive the dashboard lives only as long as the terminal that
+        started it, which is the whole reason an install needed a terminal
+        after day one.
+        """
+        out = render_dashboard_plist("l.dashboard", self.WORK, self.HD)
+        assert "<key>KeepAlive</key>\n  <true/>" in out
+        assert "<key>RunAtLoad</key>\n  <true/>" in out
+        assert "serve" in out
+        assert "run-once" not in out and "prune" not in out
+
+    def test_dashboard_job_throttles_a_crash_loop(self):
+        """A missing dashboard extra or an occupied port must not spin."""
+        out = render_dashboard_plist("l.dashboard", self.WORK, self.HD)
+        assert "<key>ThrottleInterval</key>" in out
+
+    def test_dashboard_job_does_not_bake_in_host_or_port(self):
+        """`hd serve` reads them from settings, so .env stays the one source."""
+        out = render_dashboard_plist("l.dashboard", self.WORK, self.HD)
+        assert "8080" not in out
+        assert "127.0.0.1" not in out
+
     def test_plists_are_well_formed_xml(self):
         import xml.etree.ElementTree as ET
 
         for text in (
             render_scan_plist("l", self.WORK, self.HD, [ScheduleSlot(3, 10), ScheduleSlot(8, 0)]),
             render_prune_plist("l.prune", self.WORK, self.HD, ScheduleSlot(4, 30)),
+            render_dashboard_plist("l.dashboard", self.WORK, self.HD),
         ):
             ET.fromstring(text)  # raises if malformed
 

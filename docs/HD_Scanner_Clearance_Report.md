@@ -1,7 +1,7 @@
 # HD Price Scanner: In-Store Clearance Detection
 
 **Date:** March 19, 2026
-**Trigger:** FORGE 12Ah Starter Kit (48-59-1813GB) found on clearance at $150 (50% off) at Greenfield #2619 — system missed it entirely.
+**Trigger:** FORGE 12Ah Starter Kit (48-59-1813GB) found on clearance at $150 (50% off) at the primary store — system missed it entirely.
 
 ---
 
@@ -23,7 +23,7 @@ A secondary bug compounded the miss: duplicate snapshots (items appearing on mul
 
 ## First Pipeline Results
 
-14 in-store clearance deals detected at Greenfield #2619 on first run (partial — API rate-limited to 1 page of snapshots):
+14 in-store clearance deals detected at the primary store on first run (partial — API rate-limited to 1 page of snapshots):
 
 | Item | Model | Online | Clearance | Off | Stock |
 |------|-------|--------|-----------|-----|-------|
@@ -46,8 +46,8 @@ A secondary bug compounded the miss: duplicate snapshots (items appearing on mul
 
 Cross-store probing of the Planer (2623-20) confirmed the `clearance` field is store-specific:
 
-- Greenfield (2619): clearance $81 (67% off)
-- Hadley (8452): no clearance
+- Primary store: clearance $81 (67% off)
+- Secondary store: no clearance
 - Chicopee (2610): no clearance
 
 However, the website didn't show a clearance badge for Greenfield on this item despite the API returning one. The clearance may reflect regional pricing that doesn't always correspond to a physical unit on the clearance shelf. Alerts should be treated as strong leads worth verifying in person, not guaranteed finds.

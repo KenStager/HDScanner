@@ -96,8 +96,8 @@ DATABASE_URL=postgresql+asyncpg://user:pass@localhost/hd_monitor
 # Use sqlite+aiosqlite:///./dev.db for local dev
 
 # Crawl settings
-STORES=2619,8425
-BRANDS=Milwaukee,DEWALT
+STORES=
+BRANDS=
 TOOLS_NAV_PARAM=N-5yc1vZc1xy
 CLEARANCE_TOKEN=1z11adf
 MAX_CONCURRENCY=3
@@ -247,19 +247,38 @@ POST https://apionline.homedepot.com/federation-gateway/graphql?opname=searchMod
 
 ```python
 HEADERS = {
-    "Host": "apionline.homedepot.com",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.homedepot.com/",
     "Content-Type": "application/json",
-    "Origin": "https://www.homedepot.com",
+    "Referer": "https://www.homedepot.com/",
+    # Gateway routing: schema, datacentre, debug flag. API parameters.
     "x-experience-name": "general-merchandise",
     "x-hd-dc": "origin",
     "x-debug": "false",
+    # Names the scanner, with a contact address when CONTACT_EMAIL is set.
+    "User-Agent": "HDClearanceMonitor/0.1 (+you@example.com)",
 }
 ```
+
+The scanner identifies itself rather than presenting a browser's User-Agent.
+That is what lets an operator at Home Depot allow-list it, rate-limit it
+deliberately, or ask it to stop — none of which is possible against a request
+wearing someone else's name. The honest agent works: it returns 200 as reliably
+as the browser string did.
+
+Two things were measured against the live API on 2026-08-20 and constrain this
+header set:
+
+- **`Referer` is required.** With an honest User-Agent and no `Referer` the
+  gateway answers 206; with it, 200 (3/3 each way). `Origin` does not
+  substitute — tested alone it still 206s, so it is not sent. `Referer` is not
+  accurate, since nothing here originates from a page load on homedepot.com. It
+  is kept because the User-Agent beside it states plainly what this client is,
+  so the request as a whole conceals nothing.
+- **Requests must go through curl.** The gateway refuses Python HTTP clients on
+  the transport alone: httpx returns 206 even carrying a full browser header
+  set. Connection pooling is therefore unavailable, and every request pays for
+  its own process. See `src/hd/http/transport.py`.
 
 ### 6.3 GraphQL Query File (`queries/searchModel.graphql`)
 
@@ -302,7 +321,7 @@ products {
 variables = {
     "keyword": keyword,           # "Milwaukee" | "DEWALT" | None
     "navParam": nav_param,        # e.g. "N-5yc1vZc1xyZ1z11adf"
-    "storeId": store_id,          # "2619" | "8425"
+    "storeId": store_id,          # from STORES
     "storefilter": "ALL",
     "channel": "DESKTOP",
     "isBrandPricingPolicyCompliant": False,
@@ -475,7 +494,7 @@ hd init-db
     Creates all tables via Alembic migration. Safe to re-run.
 
 hd add-store <store_id> [--name NAME] [--state STATE] [--zip ZIP]
-    Inserts a store record. Stores 2619 and 8425 pre-seeded.
+    Inserts a store record. The configured stores are pre-seeded.
 
 hd discover [--brand BRAND]... [--pages N] [--clearance-only]
     Runs discovery pipeline. Default brands: Milwaukee, DEWALT.

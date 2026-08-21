@@ -34,7 +34,7 @@ Each task is a discrete, testable unit of work. Check off tasks as they are comp
 - [ ] **M0.6** — Implement `src/hd/db/base.py` — async SQLAlchemy engine factory. Must support both Postgres and SQLite URLs. Provide `get_session()` async context manager.
 - [ ] **M0.7** — Create initial Alembic migration (`alembic init` + `env.py` wired to async engine + first migration generating all 4 tables).
 - [ ] **M0.8** — Implement `hd init-db` CLI command in `cli.py` — runs Alembic upgrade to head.
-- [ ] **M0.9** — Implement `hd add-store` CLI command. Pre-seed stores 2619 and 8425 as part of `init-db` automatically.
+- [ ] **M0.9** — Implement `hd add-store` CLI command. Pre-seed the configured stores as part of `init-db` automatically.
 - [ ] **M0.10** — Create `.env.example` matching SPEC.md §4 exactly.
 
 ### Acceptance Gate M0
@@ -44,7 +44,7 @@ Each task is a discrete, testable unit of work. Check off tasks as they are comp
 cp .env.example .env         # fill in DATABASE_URL
 hd init-db                   # exits 0, tables exist
 hd add-store 9999 --name "Test Store"   # exits 0, row in stores table
-python -c "from hd.config import Settings; s = Settings(); print(s.stores)"  # prints ['2619', '8425']
+python -c "from hd.config import Settings; s = Settings(); print(s.stores)"  # prints the configured store ids
 ```
 
 ---
@@ -98,7 +98,7 @@ hd discover --brand Milwaukee --brand DEWALT --pages 3
 ### Acceptance Gate M2
 
 ```bash
-hd snapshot --stores 2619,8425 --limit 20
+hd snapshot --stores <id>,<id> --limit 20
 # Check DB:
 # store_snapshots has >= 20 rows (10 per store if 10 products)
 # price_value is non-null for most rows

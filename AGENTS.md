@@ -25,12 +25,10 @@ Read these documents before starting any task:
 
 ## Monitored Stores
 
-| Store ID | Notes |
-|---|---|
-| `2619` | Primary store |
-| `8452` | Secondary store |
-
-These are the only stores for v1. Both must be pre-seeded during `hd init-db`. Do not hardcode them — they are set via `STORES` in the `.env` config.
+There are no default stores and none are hardcoded. They come from `STORES` in
+`.env`, which ships empty on purpose: a shipped default would point a stranger's
+install at somebody else's neighbourhood. `hd setup` finds them from a ZIP code
+and seeds the rows; `hd init-db` seeds whatever `STORES` already names.
 
 ---
 
@@ -133,7 +131,7 @@ Run migrations: `hd init-db`
 ## CLI Commands Quick Reference
 
 ```
-hd init-db                            # create/migrate tables + seed stores 2619, 8452
+hd init-db                            # create/migrate tables + seed the configured stores
 hd add-store <id> [--name] [--state]  # add a store
 hd browse [--stores] [--tier]         # facet-driven brand browse: discover+snapshot by category (default strategy)
 hd discover [--brand] [--pages]       # populate products table (legacy keyword mode)

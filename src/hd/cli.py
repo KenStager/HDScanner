@@ -17,6 +17,28 @@ app = typer.Typer(name="hd", help="Home Depot Clearance Monitor")
 console = Console()
 
 
+def _plugins():
+    """The optional local plugin module, or None on a stock install.
+
+    A convention rather than a registry: if an `hd.plugins` package is present
+    alongside this one it may expose `register(app)` to attach extra commands
+    and `post_run_hooks()` to do work after a scan completes. Nothing ships
+    with the scanner, and nothing here depends on one existing.
+    """
+    try:
+        from hd import plugins
+    except ImportError:
+        return None
+    return plugins
+
+
+def _post_run_hooks() -> list:
+    """(name, coroutine function) pairs to run after a completed scan."""
+    mod = _plugins()
+    getter = getattr(mod, "post_run_hooks", None) if mod is not None else None
+    return list(getter()) if getter is not None else []
+
+
 def _run(coro):
     """Run an async coroutine from sync CLI context."""
     return asyncio.run(coro)
@@ -277,6 +299,64 @@ def daily_deals(
         )
 
 
+async def _report_scan_health(settings: Settings, *, ok: bool) -> str | None:
+    """Fold this run into the liveness state and announce any transition.
+
+    Health goes out on its own Slack message rather than through the deal
+    notifier: deal alerts are grouped and formatted around a store and an item,
+    and they spike — 68 in one day on 2026-08-17. A "scanning stopped" notice
+    buried in that is a notice nobody sees.
+    """
+    from datetime import datetime, timezone
+
+    from hd.logging import get_logger
+    from hd.pipeline.health import (
+        emit_health_transition_alert,
+        load_scan_health,
+        next_scan_health,
+        outage_duration_hours,
+        save_scan_health,
+    )
+
+    log = get_logger("pipeline.health")
+    now = datetime.now(timezone.utc)
+    before = load_scan_health(settings.health_state_path)
+    after, transition = next_scan_health(before, ok, now)
+    save_scan_health(settings.health_state_path, after)
+
+    if transition is None:
+        if after.status.value == "DEGRADED":
+            log.warning(
+                "Still degraded — already reported",
+                consecutive_failures=after.consecutive_failures,
+            )
+        return None
+
+    down_for = outage_duration_hours(before, now)
+    await emit_health_transition_alert(settings, transition, after, down_for)
+
+    if not settings.health_notify or not settings.slack_bot_token:
+        return transition
+
+    if transition == "degraded":
+        text = (
+            ":warning: *HD Scanner stopped collecting.* "
+            "The last run captured no snapshots — usually Home Depot throttling. "
+            "You will get one more message when it resumes."
+        )
+    else:
+        span = f" after {down_for:.0f}h" if down_for else ""
+        text = f":white_check_mark: *HD Scanner is collecting again*{span}."
+
+    from hd.notifiers.webhook import post_to_slack
+
+    if await post_to_slack(settings, text):
+        log.info("Health transition sent to Slack", transition=transition)
+    else:
+        log.warning("Health transition could not be sent", transition=transition)
+    return transition
+
+
 @app.command()
 def run_once(
     mode: str = typer.Option("auto", help="Run mode: auto, full, snapshot-only"),
@@ -312,6 +392,22 @@ def run_once(
             hour = datetime.now(timezone.utc).hour
             effective_mode = "full" if hour == 0 else "snapshot-only"
 
+        # A 206 from an earlier run holds across process restarts. Starting a
+        # scan inside that window just burns requests into a wall — the 20:00
+        # run on 2026-08-19 was throttled on its second request doing exactly
+        # this — so the run defers instead.
+        from hd.http.cooldown import ThrottleCooldown
+
+        cooldown = ThrottleCooldown(
+            settings.throttle_cooldown_path, settings.throttle_cooldown_seconds
+        )
+        if cooldown.is_active():
+            log.warning(
+                "Deferring run — Home Depot throttled an earlier run",
+                resumes_in_seconds=round(cooldown.remaining_seconds()),
+            )
+            return 0, 0, 0, 0, 0, "cooldown"
+
         log.info("Pipeline starting", mode=effective_mode, browse=settings.browse_enabled)
         await _init_tables(settings)
 
@@ -324,22 +420,11 @@ def run_once(
 
         try:
             if settings.browse_enabled:
-                # Facet-driven browse replaces keyword discovery + snapshots:
-                # both tiers upsert products and append snapshots per page.
-                from hd.pipeline.browse import run_browse
-
-                summary = await run_browse(
-                    settings=settings,
-                    store_ids=settings.store_list,
-                    client=shared_client,
-                )
-                product_count = summary.products
-                snapshot_count = summary.snapshots
-                effective_mode = "browse"
-
-                # Daily Deals sweep: fires only when the day's set is new, so
-                # the 3:10 ET run prices it minutes after launch. Own client —
-                # its request budget must not compete with the browse tiers.
+                # Daily Deals goes first, ahead of the browse tiers. A daily
+                # deal is valid for one day; shelf clearance persists for days.
+                # When a run is throttled part-way, a late shelf sweep costs a
+                # delay but a missed daily deal is gone — and the brand gate
+                # means this usually spends no API requests at all.
                 if settings.daily_deals_enabled:
                     from hd.pipeline.daily_deals import run_daily_deals
 
@@ -353,6 +438,20 @@ def run_once(
                             brand_matches=dd.brand_matches,
                             snapshots=dd.snapshots,
                         )
+
+                # Facet-driven browse replaces keyword discovery + snapshots:
+                # both tiers upsert products and append snapshots per page.
+                from hd.pipeline.browse import run_browse
+
+                summary = await run_browse(
+                    settings=settings,
+                    store_ids=settings.store_list,
+                    client=shared_client,
+                )
+                product_count += summary.products
+                snapshot_count += summary.snapshots
+                effective_mode = "browse"
+
             else:
                 if effective_mode == "full":
                     product_count = await run_discovery(
@@ -373,16 +472,25 @@ def run_once(
                 )
             log.info("Scan complete", products=product_count, rows=snapshot_count, requests=shared_client.request_count)
         finally:
+            metrics = shared_client.metrics
+            log.info("Request metrics", **metrics.summary())
+            metrics.append_jsonl(
+                settings.metrics_path,
+                ts=datetime.now(timezone.utc).isoformat(),
+                mode=effective_mode,
+                stores=len(settings.store_list),
+            )
+            # Escaped: the outcome breakdown is bracketed, which Rich would
+            # otherwise parse as a style tag and silently drop — the 04:00 run
+            # printed its summary with the failure reasons missing.
+            from rich.markup import escape
+
+            console.print(f"[dim]HTTP: {escape(metrics.render())}[/dim]")
             await shared_client.close()
 
-        # Sanity check: zero snapshots on a snapshot run → likely API error
-        if snapshot_count == 0:
-            from hd.pipeline.health import emit_health_degraded_alert
-            await emit_health_degraded_alert(
-                settings,
-                ["Zero snapshots"],
-                message="Zero snapshots — likely API throttling or error responses",
-            )
+        # Liveness: a run that captured nothing is a blind run. Report the
+        # transition, not the state — see hd.pipeline.health.
+        await _report_scan_health(settings, ok=snapshot_count > 0)
 
         alerts_list = await run_diff(settings=settings)
         alert_count = 0
@@ -410,7 +518,10 @@ def run_once(
             recent = await get_alerts(settings, since_hours=hours_back, limit=500)
             if cursor_ts is not None:
                 recent = [a for a in recent if parse_ts(a.get("ts")) > cursor_ts]
-            recent = [a for a in recent if a.get("alert_type") != "HEALTH_DEGRADED"]
+            recent = [
+                a for a in recent
+                if a.get("alert_type") not in ("HEALTH_DEGRADED", "HEALTH_RECOVERED")
+            ]
 
             if recent:
                 groups = group_alerts(recent)
@@ -437,10 +548,32 @@ def run_once(
             except Exception as e:
                 log.warning("Canvas update failed", error=str(e))
 
+        # Optional post-run plugins. A failure is logged and deliberately
+        # never touches scan results: the scan is the product, a plugin is not.
+        for _name, _hook in _post_run_hooks():
+            try:
+                _result = await _hook(settings)
+                log.info("Post-run plugin", plugin=_name, **(_result or {}))
+            except Exception as exc:
+                log.warning("Post-run plugin failed", plugin=_name, error=str(exc))
+
         await close_db()
         return product_count, snapshot_count, alert_count, sent_count, canvas_deals, effective_mode
 
     products, snapshots, alerts_count, sent, canvas_deals, effective_mode = _run(_run_once())
+    if effective_mode == "cooldown":
+        # Not a completed run; saying so plainly beats reporting zero of
+        # everything as though the catalog were empty.
+        from hd.http.cooldown import ThrottleCooldown
+
+        remaining = ThrottleCooldown(
+            settings.throttle_cooldown_path, settings.throttle_cooldown_seconds
+        ).remaining_seconds()
+        console.print(
+            f"[yellow]Run deferred: Home Depot throttled an earlier run. "
+            f"Resuming in {round(remaining / 60)} min.[/yellow]"
+        )
+        return
     msg = f"[green]Pipeline complete ({effective_mode}): "
     if products:
         msg += f"{products} products, "
@@ -601,6 +734,65 @@ def alerts(
 
 
 @app.command()
+def doctor(
+    fix: bool = typer.Option(
+        False, "--fix", help="Apply the repairs that are safe to automate"
+    ),
+) -> None:
+    """Check that this installation is wired up correctly."""
+    setup_logging()
+    settings = Settings()
+
+    async def _doctor():
+        from hd.db.base import close_db
+        from hd.doctor import run_checks
+
+        checks = await run_checks(settings)
+        await close_db()
+        return checks
+
+    checks = _run(_doctor())
+
+    from hd.doctor import FAIL, OK, WARN
+
+    marks = {OK: "[green]OK  [/green]", WARN: "[yellow]WARN[/yellow]", FAIL: "[red]FAIL[/red]"}
+    table = Table(title="HD Scanner — installation check")
+    table.add_column("", width=4)
+    table.add_column("check", style="cyan")
+    table.add_column("detail")
+    for c in checks:
+        table.add_row(marks.get(c.status, c.status), c.name, c.detail)
+    console.print(table)
+
+    if fix:
+        from hd.doctor import apply_fixes
+
+        applied = _run(apply_fixes(settings, checks))
+        if applied:
+            console.print("\n[bold]Repairs[/bold]")
+            for line in applied:
+                console.print(f"  {line}")
+            console.print("\n[dim]Re-run `hd doctor` to confirm.[/dim]")
+        else:
+            console.print("\n[dim]Nothing to repair automatically.[/dim]")
+        return
+
+    fixes = [c for c in checks if c.fix]
+    if fixes:
+        console.print("\n[bold]Suggested fixes[/bold]")
+        for c in fixes:
+            console.print(f"  [dim]{c.name}:[/dim] {c.fix}")
+        console.print("\n[dim]`hd doctor --fix` applies the automatable ones.[/dim]")
+
+    failed = sum(1 for c in checks if c.status == FAIL)
+    warned = sum(1 for c in checks if c.status == WARN)
+    if failed:
+        console.print(f"\n[red]{failed} failing, {warned} warning[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"\n[green]All clear[/green]" if not warned else f"\n[yellow]{warned} warning(s)[/yellow]")
+
+
+@app.command()
 def health() -> None:
     """Print last run health status."""
     setup_logging()
@@ -652,6 +844,41 @@ def health() -> None:
         payload = degraded.payload or {}
         if "message" in payload:
             console.print(f"[red]  {payload['message']}[/red]")
+
+
+def prune_raw_responses(settings: Settings, *, dry_run: bool = False) -> tuple[int, int]:
+    """Delete raw response files past their retention. Returns (files, bytes).
+
+    Separate retention from snapshots because these serve a different purpose:
+    a snapshot is the record, a raw response is the receipt you keep briefly in
+    case the parse looks wrong.
+    """
+    from pathlib import Path as _Path
+
+    days = settings.raw_retention_days
+    if days <= 0:
+        return 0, 0
+    directory = _Path(settings.raw_json_dir)
+    if not directory.is_dir():
+        return 0, 0
+
+    import time
+
+    cutoff = time.time() - days * 86400
+    files = 0
+    freed = 0
+    for path in directory.glob("*.json"):
+        try:
+            stat = path.stat()
+            if stat.st_mtime >= cutoff:
+                continue
+            files += 1
+            freed += stat.st_size
+            if not dry_run:
+                path.unlink()
+        except OSError:
+            continue
+    return files, freed
 
 
 @app.command()
@@ -726,6 +953,23 @@ def prune(
             await close_db()
 
     eligible, deleted, uncaptured = _run(_prune())
+    raw_files, raw_bytes = prune_raw_responses(settings, dry_run=dry_run)
+
+    # Deleting rows does not shrink a SQLite file; reclaim the space once
+    # enough of it is waste to justify rewriting the database.
+    from hd.db.base import maybe_vacuum
+
+    vacuumed, vacuum_note = maybe_vacuum(
+        settings.database_url, settings.vacuum_threshold_pct, dry_run=dry_run
+    )
+    style = "green" if vacuumed else "dim"
+    console.print(f"[{style}]Database: {vacuum_note}[/{style}]")
+    if raw_files:
+        verb = "would free" if dry_run else "freed"
+        console.print(
+            f"[dim]Raw responses: {verb} {raw_files:,} file(s), "
+            f"{raw_bytes/1e6:,.0f} MB (older than {settings.raw_retention_days}d)[/dim]"
+        )
     if dry_run:
         console.print(f"[yellow]Dry run: {eligible} snapshots eligible for deletion.[/yellow]")
         if uncaptured:
@@ -827,10 +1071,13 @@ def notify(
                 if parse_ts(a.get("ts")) > cursor_ts
             ]
 
-        # Filter out HEALTH_DEGRADED (internal, not useful in Slack)
+        # Liveness alerts are delivered as their own Slack message the moment
+        # the transition happens (see _report_scan_health); routing them through
+        # the deal grouper as well would both duplicate them and format a
+        # SYSTEM row as if it were a product.
         alerts_list = [
             a for a in alerts_list
-            if a.get("alert_type") != "HEALTH_DEGRADED"
+            if a.get("alert_type") not in ("HEALTH_DEGRADED", "HEALTH_RECOVERED")
         ]
 
         if not alerts_list:
@@ -950,6 +1197,12 @@ def serve(
         f"[green]Starting dashboard at http://{settings.dashboard_host}:{settings.dashboard_port}[/green]"
     )
     run_dashboard(settings)  # Blocking — owns the event loop
+
+
+# Attach any plugin commands. Absent on a stock install.
+_plugin_mod = _plugins()
+if _plugin_mod is not None and hasattr(_plugin_mod, "register"):
+    _plugin_mod.register(app)
 
 
 if __name__ == "__main__":

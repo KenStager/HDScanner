@@ -122,12 +122,34 @@ def dd_settings(tmp_path) -> Settings:
 
 
 @pytest.fixture
-def fresh_db():
+async def fresh_db():
     from hd.db import base
 
     db = base.Database()
     with patch.object(base, "_default", db):
         yield db
+    # conftest's autouse teardown closes whatever `base._default` is by then,
+    # which patch.object has already restored to the original — not this one.
+    # An undisposed engine leaves an aiosqlite worker thread running past the
+    # loop that owns it, and it surfaces as "Event loop is closed" against
+    # whichever unrelated test happens to be running when it dies.
+    await db.close_db()
+
+
+async def seed_catalog(settings, **brands_by_item):
+    """Put items in the products table so the brand gate can recognise them."""
+    from datetime import datetime, timezone
+    from hd.db import base
+    from hd.db.models import Product
+
+    async with base.get_session(settings) as session:
+        now = datetime.now(timezone.utc)
+        for item_id, brand in brands_by_item.items():
+            session.add(Product(
+                item_id=item_id, brand=brand, title=f"item {item_id}",
+                first_seen_ts=now, last_seen_ts=now,
+            ))
+        await session.commit()
 
 
 class TestRunDailyDeals:
@@ -136,6 +158,8 @@ class TestRunDailyDeals:
         from hd.db.models import Product, StoreSnapshot
 
         await base.init_db(dd_settings)
+        # 111 and 222 are already tracked as ours; 333 is a brand we do not want.
+        await seed_catalog(dd_settings, **{"111": "Milwaukee", "222": "Milwaukee", "333": "RYOBI"})
         deal_set = DailyDealSet(end_date="2026-08-18", item_ids=["111", "222", "333"])
         client = FakeClient()
 
@@ -143,16 +167,29 @@ class TestRunDailyDeals:
             summary = await run_daily_deals(dd_settings, client=client)
 
         assert summary.skipped is False
-        assert summary.items_checked == 3
-        assert summary.brand_matches == 2   # 333 is RYOBI — filtered
+        # 333 costs nothing now: the catalog already says it is not ours, so it
+        # is never requested rather than requested and then discarded.
+        assert client.requested == ["111", "222"]
+        assert summary.items_checked == 2
+        assert summary.brand_matches == 2
         assert summary.snapshots == 2
+        assert summary.skipped_unknown == 1
 
         async with base.get_session(dd_settings) as session:
             prods = {p.item_id for p in (await session.execute(select(Product))).scalars().all()}
             snaps = [(s.item_id, s.store_id) for s in
                      (await session.execute(select(StoreSnapshot))).scalars().all()]
-        assert prods == {"111", "222"}
+        # 333 is present only because the test seeded it; the sweep neither
+        # requested it nor snapshotted it.
+        assert prods == {"111", "222", "333"}
         assert set(snaps) == {("111", "2619"), ("222", "2619")}
+
+        # The matches are recorded as picks so the dashboard can pin the set.
+        from hd.db.models import DailyDealPick
+        async with base.get_session(dd_settings) as session:
+            picks = {(p.end_date, p.item_id) for p in
+                     (await session.execute(select(DailyDealPick))).scalars().all()}
+        assert picks == {("2026-08-18", "111"), ("2026-08-18", "222")}
 
         # Second run same day: cursor short-circuits before any API traffic
         client2 = FakeClient()
@@ -165,6 +202,7 @@ class TestRunDailyDeals:
         from hd.db import base
 
         await base.init_db(dd_settings)
+        await seed_catalog(dd_settings, **{"111": "Milwaukee", "222": "Milwaukee"})
         day1 = DailyDealSet(end_date="2026-08-18", item_ids=["111"])
         day2 = DailyDealSet(end_date="2026-08-19", item_ids=["222"])
 
@@ -175,6 +213,40 @@ class TestRunDailyDeals:
             summary = await run_daily_deals(dd_settings, client=client)
         assert summary.skipped is False
         assert client.requested == ["222"]
+
+    async def test_set_with_no_tracked_brands_costs_nothing(self, dd_settings, fresh_db):
+        """The measured case: ~110 patio and garden items, none of them ours."""
+        from hd.db import base
+
+        await base.init_db(dd_settings)
+        await seed_catalog(dd_settings, **{"999": "Milwaukee"})  # tracked, but not on offer
+        deal_set = DailyDealSet(end_date="2026-08-18", item_ids=[str(i) for i in range(100, 210)])
+        client = FakeClient()
+
+        with patch("hd.pipeline.daily_deals.fetch_daily_deal_set", return_value=deal_set):
+            summary = await run_daily_deals(dd_settings, client=client)
+
+        assert client.requested == []          # 110 requests saved
+        assert summary.items_checked == 0
+        assert summary.skipped_unknown == 110
+        # The day is still recorded, so the next run does not re-check it.
+        from hd.pipeline.daily_deals import _read_cursor
+        assert _read_cursor(dd_settings.daily_deals_cursor_path) == "2026-08-18"
+
+    async def test_probe_budget_allows_checking_unknown_items(self, dd_settings, fresh_db):
+        """Opt-in escape hatch: a brand item we have never seen is invisible to the gate."""
+        from hd.db import base
+
+        await base.init_db(dd_settings)
+        dd_settings.daily_deals_probe_unknown = 2
+        deal_set = DailyDealSet(end_date="2026-08-18", item_ids=["111", "222", "333"])
+        client = FakeClient()
+
+        with patch("hd.pipeline.daily_deals.fetch_daily_deal_set", return_value=deal_set):
+            summary = await run_daily_deals(dd_settings, client=client)
+
+        assert client.requested == ["111", "222"]   # bounded by the probe budget
+        assert summary.skipped_unknown == 1
 
     async def test_unfetchable_page_skips_quietly(self, dd_settings, fresh_db):
         from hd.db import base

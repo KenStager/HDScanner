@@ -4,11 +4,15 @@ Read-only probe. Uses the app's own rate-limited client and query.
 """
 
 import asyncio
+import os
 import sys
 
 from hd.config import Settings
 from hd.hd_api import graphql
 from hd.http.client import HDClient
+
+# No default: a probe must not silently query somebody else's store.
+STORE_ID = os.environ.get("PROBE_STORE_ID", "")
 
 TARGET = "337128401"
 
@@ -53,16 +57,16 @@ async def main():
 
     client = HDClient(settings)
     try:
-        # Test 1: direct model-number search, both storefilters, store 2619
+        # Test 1: direct model-number search, both storefilters, the configured store
         for sf in ("IN_STORE", "ALL"):
             raw = await graphql.search(
-                client, keyword="0970-20", store_id="2619",
+                client, keyword="0970-20", store_id=STORE_ID,
                 start_index=0, page_size=24, storefilter=sf,
             )
             idx, p = find_target(raw)
-            print(f"[model '0970-20' @2619 storefilter={sf}] total={total(raw)} found={'YES idx=%d' % idx if p else 'NO'}")
+            print(f"[model '0970-20' @{STORE_ID} storefilter={sf}] total={total(raw)} found={'YES idx=%d' % idx if p else 'NO'}")
             if p:
-                describe(p, "2619")
+                describe(p, STORE_ID)
         print()
 
         # Test 2: how deep does 'Milwaukee PACKOUT' go, and is the item in range?

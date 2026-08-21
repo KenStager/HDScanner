@@ -254,7 +254,10 @@ def preflight(root: Path, *, want_dashboard: bool = True) -> PreflightResult:
             )
 
     if not _have_curl():
-        problems.append("curl not found on PATH — the scanner uses it for every request")
+        problems.append(
+            "curl not found on PATH — store lookup, the daily-deals page and "
+            "Slack delivery use it (scans do not)"
+        )
 
     if want_dashboard:
         try:
@@ -745,6 +748,7 @@ async def _prompt_schedule(console, root: Path) -> bool:
         load_agent,
         prune_slot,
         render_crontab,
+        render_dashboard_plist,
         render_prune_plist,
         render_scan_plist,
         scan_slots,
@@ -777,6 +781,7 @@ async def _prompt_schedule(console, root: Path) -> bool:
 
     scan_label = label_for()
     prune_label = f"{scan_label}.prune"
+    dash_label = f"{scan_label}.dashboard"
 
     if not is_macos():
         console.print(
@@ -784,6 +789,11 @@ async def _prompt_schedule(console, root: Path) -> bool:
         )
         console.print(render_crontab(root, hd_path, slots, pruning), markup=False, highlight=False)
         return True
+
+    from hd.config import Settings as _S
+
+    _cfg = _S()
+    settings_host, settings_port = _cfg.dashboard_host, _cfg.dashboard_port
 
     agents = launch_agents_dir()
     scan_path = write_agent(agents / f"{scan_label}.plist",
@@ -793,11 +803,38 @@ async def _prompt_schedule(console, root: Path) -> bool:
     console.print(f"  [green]Wrote[/green] {_e(str(scan_path))}")
     console.print(f"  [green]Wrote[/green] {_e(str(prune_path))}")
 
+    paths = [scan_path, prune_path]
+
+    # The dashboard is the only surface a non-technical install can use every
+    # day without a terminal, and it only exists while `hd serve` is running.
+    # Left to a terminal window it dies at the first logout.
+    try:
+        import nicegui  # noqa: F401
+    except ImportError:
+        console.print(
+            '  [dim]Dashboard not installed — `pip install -e ".[dashboard]"` then '
+            "rerun setup to keep it running in the background.[/dim]"
+        )
+    else:
+        url = f"http://{settings_host}:{settings_port}"
+        console.print(
+            f"\n[bold]Keep the dashboard running? (recommended)[/bold]\n"
+            f"[dim]Starts at login and stays up, so {url} always works and you "
+            "never need a terminal to see your deals.[/dim]"
+        )
+        if typer.confirm("  Run the dashboard in the background?", default=True):
+            dash_path = write_agent(
+                agents / f"{dash_label}.plist",
+                render_dashboard_plist(dash_label, root, hd_path),
+            )
+            console.print(f"  [green]Wrote[/green] {_e(str(dash_path))}")
+            paths.append(dash_path)
+
     if not typer.confirm("  Activate them now?", default=True):
         console.print(f"  [dim]Activate later with: launchctl load {_e(str(scan_path))}[/dim]")
         return True
 
-    for path in (scan_path, prune_path):
+    for path in paths:
         ok, output = await load_agent(path)
         if ok:
             console.print(f"  [green]Loaded[/green] {_e(path.name)}")

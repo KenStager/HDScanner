@@ -22,7 +22,7 @@ Milwaukee and DeWalt tools go on deep clearance and sale at Home Depot stores fr
 
 Build a backend monitoring system that:
 
-- Continuously tracks Milwaukee and DeWalt tool products at **stores 2619 and 8425**
+- Continuously tracks Milwaukee and DeWalt tool products at **the stores you configure**
 - Detects clearance events, price drops, special buys, and back-in-stock transitions
 - Stores historical snapshots for trend analysis
 - Produces actionable alerts when thresholds are crossed
@@ -58,7 +58,7 @@ Build a backend monitoring system that:
 - Store discovered products in `products` table with brand, title, model number, URL
 
 ### F2 — Store Snapshot Fetching
-- For each discovered product × each monitored store (2619, 8425), fetch:
+- For each discovered product × each monitored store, fetch:
   - Current price and original price
   - Promotion type, tag, savings center flag
   - Dollar off and percentage off values
@@ -105,7 +105,7 @@ Build a backend monitoring system that:
 - No high-frequency polling (not a real-time system)
 - No user authentication or multi-user support
 - No front-end UI (CLI only for v1)
-- No coverage of stores beyond 2619 and 8425 in v1
+- No coverage beyond the configured stores in v1
 - No "all SKUs ever listed" exhaustive coverage — best-effort discovery
 - No pricing history charts or analytics UI
 
@@ -134,6 +134,6 @@ Build a backend monitoring system that:
 ## 9. Assumptions
 
 - Home Depot's internal GraphQL endpoint (`apionline.homedepot.com/federation-gateway/graphql`) remains accessible with browser-mimicking headers
-- Store IDs 2619 and 8425 are valid and active
+- The configured store IDs are valid and active
 - The clearance navParam token `1z11adf` and Tools category navParam `N-5yc1vZc1xy` are stable enough for v1 discovery (drift detector will catch breakage)
 - Brand name values `"Milwaukee"` and `"DEWALT"` (capitalized) are stable identifiers in the API response

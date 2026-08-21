@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 from sqlalchemy import inspect, text
@@ -37,11 +38,39 @@ _INDEX_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+# How long a blocked writer waits for the lock before giving up. The default
+# is 0: the first scan that overlapped the dashboard would fail instantly.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+
+
 def _get_engine_kwargs(url: str) -> dict:
     kwargs: dict = {}
     if url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False}
+        kwargs["connect_args"] = {
+            "check_same_thread": False,
+            # sqlite3's `timeout` is the busy timeout, in seconds.
+            "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
+        }
     return kwargs
+
+
+async def _enable_wal(conn) -> None:
+    """Switch SQLite to WAL. Recorded in the file header, so it sticks.
+
+    The scanner writes on a schedule and the dashboard is resident, so readers
+    and writers now overlap by design. Under the default rollback journal a
+    reader blocks a writer outright; under WAL they do not block each other,
+    and the nightly VACUUM stops losing races with a running scan.
+
+    Set here rather than per-connection: journal mode is a property of the
+    database, and a synchronous PRAGMA in a connect hook leaves work pending on
+    aiosqlite's worker thread after the loop it belongs to has gone.
+    """
+    mode = (await conn.execute(text("PRAGMA journal_mode=WAL"))).scalar()
+    if mode and str(mode).lower() != "wal":
+        # Network filesystems refuse WAL. Not fatal — it just means the old
+        # reader-blocks-writer behaviour, which is what we had before.
+        log.warning("Could not enable WAL; concurrent access may contend", journal_mode=mode)
 
 
 class Database:
@@ -94,6 +123,10 @@ class Database:
         engine = self.get_engine(settings)
 
         async with engine.begin() as conn:
+            if engine.url.get_backend_name() == "sqlite":
+                # First statement in the block: the SQLite driver defers BEGIN
+                # until DML, and journal mode cannot change inside a transaction.
+                await _enable_wal(conn)
             await conn.run_sync(Base.metadata.create_all)
 
         def _reflect(sync_conn) -> dict[str, set[str]]:
@@ -189,3 +222,97 @@ async def init_db(settings: Settings | None = None) -> None:
 
 async def close_db() -> None:
     return await _default.close_db()
+
+
+# --- reclaiming space --------------------------------------------------------
+
+def sqlite_path(database_url: str) -> Path | None:
+    """Filesystem path behind a SQLite URL, or None for any other backend.
+
+    PostgreSQL is deliberately excluded: it autovacuums, and its VACUUM does
+    not mean the same thing.
+    """
+    from sqlalchemy.engine.url import make_url
+
+    try:
+        url = make_url(database_url)
+    except Exception:
+        return None
+    if not url.drivername.startswith("sqlite") or not url.database:
+        return None
+    if url.database == ":memory:":
+        return None
+    return Path(url.database)
+
+
+class NotMeasurable(Exception):
+    """The file exists but could not be measured — usually a lock."""
+
+
+def freed_space(database_url: str) -> tuple[int, int] | None:
+    """(reclaimable bytes, total bytes) for a SQLite file, or None if not applicable.
+
+    None means "this is not a SQLite database we can act on". A file that
+    exists but cannot be read raises NotMeasurable instead, because a locked
+    database and a Postgres URL warrant very different messages — reporting a
+    busy database as "not SQLite" sends the reader looking in the wrong place.
+    """
+    import sqlite3
+
+    path = sqlite_path(database_url)
+    if path is None or not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            pages = conn.execute("pragma freelist_count").fetchone()[0]
+            page_size = conn.execute("pragma page_size").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        raise NotMeasurable(str(e)) from e
+    return pages * page_size, path.stat().st_size
+
+
+def maybe_vacuum(
+    database_url: str, threshold_pct: int, *, dry_run: bool = False, timeout: float = 30.0
+) -> tuple[bool, str]:
+    """VACUUM when reclaimable space exceeds the threshold. Returns (ran, message).
+
+    A scan may still be running when the nightly maintenance fires — the 04:00
+    scan and the 04:30 prune can overlap — so this takes a busy timeout and
+    reports a locked database instead of blocking the job or raising.
+    """
+    import sqlite3
+
+    if threshold_pct <= 0:
+        return False, "vacuum disabled"
+    try:
+        measured = freed_space(database_url)
+    except NotMeasurable as e:
+        return False, f"could not vacuum ({e}); a scan may be running"
+    if measured is None:
+        return False, "not a SQLite database — nothing to reclaim"
+
+    reclaimable, total = measured
+    pct = (reclaimable / total * 100) if total else 0.0
+    summary = f"{reclaimable / 1e6:,.0f} MB reclaimable of {total / 1e6:,.0f} MB ({pct:.0f}%)"
+    if pct < threshold_pct:
+        return False, f"{summary} — below the {threshold_pct}% threshold"
+    if dry_run:
+        return False, f"{summary} — would vacuum"
+
+    path = sqlite_path(database_url)
+    try:
+        conn = sqlite3.connect(path, timeout=timeout)
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        return False, f"{summary} — could not vacuum ({e}); a scan may be running"
+    except sqlite3.Error as e:
+        return False, f"{summary} — vacuum failed ({e})"
+
+    after = path.stat().st_size
+    return True, f"reclaimed {(total - after) / 1e6:,.0f} MB ({total / 1e6:,.0f} → {after / 1e6:,.0f} MB)"

@@ -7,6 +7,7 @@ from nicegui import ui
 from hd.dashboard import _state
 from hd.dashboard.components.charts import store_comparison_options
 from hd.dashboard.components.header import render_header
+from hd.dashboard.components.health import render_health_banner
 from hd.dashboard.queries import get_store_summary
 
 
@@ -14,6 +15,7 @@ from hd.dashboard.queries import get_store_summary
 async def stores_page() -> None:
     settings = _state.settings
     render_header(settings.dashboard_title, current_path="/stores")
+    await render_health_banner(settings)
 
     summaries = await get_store_summary(settings)
 

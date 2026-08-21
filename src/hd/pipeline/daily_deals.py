@@ -28,11 +28,19 @@ from hd.logging import get_logger
 
 log = get_logger("pipeline.daily_deals")
 
-_PAGE_HEADERS = [
-    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
-    "Accept: text/html,application/xhtml+xml",
-    "Accept-Language: en-US,en;q=0.5",
-]
+def _page_headers(settings: Settings) -> list[str]:
+    """Headers for the daily-deals HTML page.
+
+    Same identity as the API client: one scanner, one name. Accept-Language is
+    kept because it is real content negotiation, not disguise.
+    """
+    from hd.http.client import build_user_agent
+
+    return [
+        f"User-Agent: {build_user_agent(settings)}",
+        "Accept: text/html,application/xhtml+xml",
+        "Accept-Language: en-US,en;q=0.5",
+    ]
 
 _APOLLO_MARKER = "window.__APOLLO_STATE__="
 
@@ -50,6 +58,9 @@ class DailyDealsSummary:
     skipped: bool = False
     items_checked: int = 0
     brand_matches: int = 0
+    # Items in the day's set that we already know are not our brands, so were
+    # never requested. The sweep used to price all ~110 of them to find out.
+    skipped_unknown: int = 0
     products: int = 0
     snapshots: int = 0
     aborted: bool = False
@@ -99,7 +110,7 @@ def parse_daily_deal_page(html: str) -> DailyDealSet | None:
 async def fetch_daily_deal_set(settings: Settings) -> DailyDealSet | None:
     """Fetch and parse the daily-deals page. One polite HTTP request."""
     cmd = ["curl", "-s", "-m", "30", "--compressed", settings.daily_deals_url]
-    for h in _PAGE_HEADERS:
+    for h in _page_headers(settings):
         cmd.extend(["-H", h])
     try:
         result = await asyncio.to_thread(
@@ -130,6 +141,48 @@ def _write_cursor(path: str, value: str) -> None:
         Path(path).write_text(value)
     except OSError as e:
         log.warning("Could not persist daily-deals cursor", error=str(e))
+
+
+async def _record_pick(settings: Settings, end_date: str, item_id: str) -> None:
+    """Persist a brand match so the dashboard can pin today's set.
+
+    merge() keeps re-runs of the same set idempotent (aborted sweeps resume
+    and re-insert) and is portable across SQLite and PostgreSQL.
+    """
+    from hd.db import base
+    from hd.db.models import DailyDealPick
+
+    async with base.get_session(settings) as session:
+        await session.merge(DailyDealPick(end_date=end_date, item_id=item_id))
+
+
+async def _tracked_brand_items(settings: Settings, item_ids: list[str]) -> set[str]:
+    """Which of these item ids are already known to be one of our brands.
+
+    The daily-deals page carries item ids and category names but no brand, so
+    the sweep used to spend one API request per item to find out — 110 requests
+    a day, and across every completed sweep on record it produced zero brand
+    matches and zero snapshots. The catalog we already track answers the same
+    question for free.
+    """
+    if not item_ids:
+        return set()
+    from sqlalchemy import func, select
+
+    from hd.db import base
+    from hd.db.models import Product
+
+    uppers = [b.upper() for b in settings.brand_list]
+    if not uppers:
+        return set()
+    async with base.get_session(settings) as session:
+        rows = await session.execute(
+            select(Product.item_id).where(
+                Product.item_id.in_(item_ids),
+                func.upper(Product.brand).in_(uppers),
+            )
+        )
+        return {r[0] for r in rows}
 
 
 async def run_daily_deals(
@@ -176,8 +229,32 @@ async def run_daily_deals(
         categories=[c.get("name") for c in deal_set.categories],
     )
 
+    tracked = await _tracked_brand_items(settings, item_ids)
+    unknown = [i for i in item_ids if i not in tracked]
+    probe = max(0, settings.daily_deals_probe_unknown)
+    targets = [i for i in item_ids if i in tracked] + unknown[:probe]
+    summary.skipped_unknown = len(item_ids) - len(targets)
+
+    if not targets:
+        # Nothing in today's set is a brand we track. Record the set as seen so
+        # the next run does not re-check it, and spend no requests.
+        log.info(
+            "Daily-deals set contains none of our brands — no requests made",
+            end_date=deal_set.end_date,
+            listed=len(item_ids),
+            categories=[c.get("name") for c in deal_set.categories],
+        )
+        _write_cursor(settings.daily_deals_cursor_path, deal_set.end_date)
+        return summary
+
+    log.info(
+        "Daily-deals candidates after brand filter",
+        candidates=len(targets), listed=len(item_ids), probing_unknown=min(probe, len(unknown)),
+    )
+    item_ids = targets
+
     owns_client = client is None
-    client = client or HDClient(settings, request_budget=settings.daily_deals_max_items + 10)
+    client = client or HDClient(settings, request_budget=len(item_ids) + 10)
     upper_brands = [b.upper() for b in settings.brand_list]
     now = datetime.now(timezone.utc)
     completed = True
@@ -210,6 +287,7 @@ async def run_daily_deals(
             if not products:
                 continue
             summary.brand_matches += 1
+            await _record_pick(settings, deal_set.end_date, item_id)
             summary.products += await _upsert_products(settings, products)
             snapshots = [
                 s for s in parse_snapshots(raw, ref_store)
@@ -225,6 +303,7 @@ async def run_daily_deals(
             end_date=deal_set.end_date,
             checked=summary.items_checked,
             brand_matches=summary.brand_matches,
+            skipped_unknown=summary.skipped_unknown,
             snapshots=summary.snapshots,
             aborted=summary.aborted,
             cursor_saved=completed and not summary.aborted,

@@ -534,7 +534,7 @@ class TestOnlineDealsAvailability:
         deals = await get_online_deals(seeded_settings)
         assert "100002" not in [d["item_id"] for d in deals]
 
-    async def test_unknown_fulfillment_kept(self, seeded_settings: Settings):
+    async def test_unknown_fulfillment_kept_but_flagged(self, seeded_settings: Settings):
         """No raw fulfillment data — keep the deal rather than false-negative it."""
         from datetime import datetime, timezone
         from decimal import Decimal
@@ -552,7 +552,298 @@ class TestOnlineDealsAvailability:
                 raw_json=None,
             ))
         deals = await get_online_deals(seeded_settings)
-        assert "100002" in [d["item_id"] for d in deals]
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["availability_unknown"] is True
+
+    async def test_lookback_recovers_masked_fulfillment(self, seeded_settings: Settings):
+        """A null-fulfillment latest snapshot defers to a fresh earlier verdict.
+
+        Several request shapes feed the snapshot stream; HD returns
+        fulfillmentOptions=null on some browse rows, which can land on top of
+        a fulfillment-bearing row written hours earlier. The earlier verdict
+        wins over "unknown".
+        """
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        in_stock_raw = {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": True, "quantity": 4}},
+            ]}],
+        }]}}
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now - timedelta(hours=5),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                raw_json=in_stock_raw,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                raw_json={"fulfillment": {"fulfillmentOptions": None}},
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["availability_unknown"] is False
+
+    async def test_lookback_honours_confirmed_oos(self, seeded_settings: Settings):
+        """The recovered verdict can also be "every path out of stock" → drop."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        oos_raw = {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": False, "isOutOfStock": True}},
+            ]}],
+        }]}}
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now - timedelta(hours=5),
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                raw_json=oos_raw,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                raw_json={"fulfillment": {"fulfillmentOptions": None}},
+            ))
+        deals = await get_online_deals(seeded_settings)
+        assert "100002" not in [d["item_id"] for d in deals]
+
+    async def test_stale_verdict_stays_unknown(self, seeded_settings: Settings):
+        """A verdict older than the freshness window is no verdict at all."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        in_stock_raw = {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": True, "quantity": 4}},
+            ]}],
+        }]}}
+        now = datetime.now(timezone.utc)
+        stale = now - timedelta(hours=seeded_settings.deal_freshness_hours + 2)
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=stale,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                raw_json=in_stock_raw,
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now,
+                price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=50,
+                raw_json={"fulfillment": {"fulfillmentOptions": None}},
+            ))
+        deals = await get_online_deals(seeded_settings)
+        deal = next(d for d in deals if d["item_id"] == "100002")
+        assert deal["availability_unknown"] is True
+
+    async def test_unknown_ranks_behind_purchasable(self, seeded_settings: Settings):
+        """A 65%-claim unknown must not outrank a 20%-claim purchasable deal."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+
+        in_stock_raw = {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": True, "quantity": 4}},
+            ]}],
+        }]}}
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            # Purchasable, modest claim
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100001",
+                ts=now,
+                price_value=Decimal("159.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=20,
+                raw_json=in_stock_raw,
+            ))
+            # Unknown availability, spectacular claim
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now,
+                price_value=Decimal("69.00"),
+                price_original=Decimal("199.00"),
+                percentage_off=65,
+                raw_json={"fulfillment": {"fulfillmentOptions": None}},
+            ))
+        deals = await get_online_deals(seeded_settings)
+        order = [d["item_id"] for d in deals]
+        assert order.index("100001") < order.index("100002")
+
+
+class TestDailyDealPicks:
+    """The pinned strip: every pick shown, verdict attached, no board policy."""
+
+    @staticmethod
+    def _tomorrow_et() -> str:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        return (datetime.now(ZoneInfo("America/New_York")).date()
+                + timedelta(days=1)).isoformat()
+
+    @staticmethod
+    def _in_stock_raw():
+        return {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": True, "quantity": 4}},
+            ]}],
+        }]}}
+
+    async def test_shallow_and_flat_picks_still_returned(self, seeded_settings: Settings):
+        """No depth cutoff, no promo requirement — a pick earns a card as-is."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_daily_deal_picks, get_online_deals
+        from hd.db import base as db_base
+        from hd.db.models import DailyDealPick, StoreSnapshot
+
+        end = self._tomorrow_et()
+        async with db_base._default.get_session(seeded_settings) as session:
+            # 100001: 5% claim — below the online board's 10% cutoff.
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100001",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("189.00"), price_original=Decimal("199.00"),
+                percentage_off=5, raw_json=self._in_stock_raw(),
+            ))
+            # 100002: flat price, nothing claimed at all.
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"), price_original=Decimal("99.00"),
+                raw_json=self._in_stock_raw(),
+            ))
+            session.add(DailyDealPick(end_date=end, item_id="100001"))
+            session.add(DailyDealPick(end_date=end, item_id="100002"))
+
+        picks = await get_daily_deal_picks(seeded_settings)
+        assert {d["item_id"] for d in picks} == {"100001", "100002"}
+        assert all(d["is_daily"] and d["daily_end_date"] == end for d in picks)
+        assert all(d["tier"] in {"verified", "unverified", "warned", "hollow"}
+                   for d in picks)
+        # The flat-price pick would never survive the online board's policy.
+        online = await get_online_deals(seeded_settings)
+        assert "100002" not in [d["item_id"] for d in online]
+
+    async def test_expired_set_hidden(self, seeded_settings: Settings):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_daily_deal_picks
+        from hd.db import base as db_base
+        from hd.db.models import DailyDealPick, StoreSnapshot
+
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"), price_original=Decimal("199.00"),
+                percentage_off=50, raw_json=self._in_stock_raw(),
+            ))
+            session.add(DailyDealPick(end_date="2020-01-01", item_id="100002"))
+
+        assert await get_daily_deal_picks(seeded_settings) == []
+
+    async def test_warned_pick_sorts_last_with_its_verdict(self, seeded_settings: Settings):
+        """A pick we watched sell for less still shows — flagged, at the end."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_daily_deal_picks
+        from hd.db import base as db_base
+        from hd.db.models import DailyDealPick, ItemPriceStat, StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        end = self._tomorrow_et()
+        async with db_base._default.get_session(seeded_settings) as session:
+            # 100002: "deal" at $99 but our durable stats witnessed $79 selling.
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=now, price_value=Decimal("99.00"),
+                price_original=Decimal("199.00"), percentage_off=50,
+                raw_json=self._in_stock_raw(),
+            ))
+            session.add(ItemPriceStat(
+                store_id="2619", item_id="100002",
+                low_price=Decimal("79.00"), low_ts=now - timedelta(days=3),
+                high_price=Decimal("199.00"), high_ts=now - timedelta(days=10),
+                price_sum=Decimal("278.00"), obs_count=2, obs_days=2,
+                first_ts=now - timedelta(days=10), last_ts=now,
+            ))
+            # 100001: unremarkable claim, nothing against it.
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100001",
+                ts=now, price_value=Decimal("149.00"),
+                price_original=Decimal("199.00"), percentage_off=25,
+                raw_json=self._in_stock_raw(),
+            ))
+            session.add(DailyDealPick(end_date=end, item_id="100001"))
+            session.add(DailyDealPick(end_date=end, item_id="100002"))
+
+        picks = await get_daily_deal_picks(seeded_settings)
+        assert [d["item_id"] for d in picks][-1] == "100002"
+        assert picks[-1]["tier"] == "warned"
+        assert picks[-1]["low_price"] == 79.0
+
+    async def test_confirmed_oos_pick_dropped(self, seeded_settings: Settings):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from hd.dashboard.queries import get_daily_deal_picks
+        from hd.db import base as db_base
+        from hd.db.models import DailyDealPick, StoreSnapshot
+
+        oos_raw = {"fulfillment": {"fulfillmentOptions": [{
+            "type": "delivery",
+            "services": [{"type": "sth", "locations": [
+                {"locationId": "x", "inventory": {"isInStock": False, "isOutOfStock": True}},
+            ]}],
+        }]}}
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002",
+                ts=datetime.now(timezone.utc),
+                price_value=Decimal("99.00"), price_original=Decimal("199.00"),
+                percentage_off=50, raw_json=oos_raw,
+            ))
+            session.add(DailyDealPick(end_date=self._tomorrow_et(), item_id="100002"))
+
+        assert await get_daily_deal_picks(seeded_settings) == []
 
 
 class TestDealFreshness:

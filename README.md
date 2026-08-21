@@ -32,8 +32,8 @@ After a scan, `hd alerts` shows what changed at your stores:
 ┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┓
 ┃ Time             ┃ Store  ┃ Item      ┃ Type            ┃ Severity ┃ Details ┃
 ┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━┩
-│ 2026-08-19 16:18 │ 2619   │ 342938293 │ CLEARANCE       │ medium   │ 41% off │
-│ 2026-08-19 16:18 │ 2619   │ 342937828 │ CLEARANCE       │ medium   │ 45% off │
+│ 2026-08-19 16:18 │ 1234   │ 342938293 │ CLEARANCE       │ medium   │ 41% off │
+│ 2026-08-19 16:18 │ 1234   │ 342937828 │ CLEARANCE       │ medium   │ 45% off │
 └──────────────────┴────────┴───────────┴─────────────────┴──────────┴─────────┘
 ```
 
@@ -141,11 +141,17 @@ schedule. `hd setup` offers to install one; to do it later:
 hd setup      # answer no to the steps you already have
 ```
 
-You get two jobs:
+You get three jobs:
 
 - **Scan** — five times a day, plus one slot timed to Home Depot's daily-deals
   refresh (3:00 Eastern, converted to *your* timezone)
 - **Prune** — once a day, deleting snapshots past the retention window
+- **Dashboard** — always on, if you installed the dashboard extra. It starts at
+  login and comes back after a crash or a reboot, so your deal board is a URL
+  that just works rather than something you have to start
+
+Together they mean the terminal is an install tool, not a daily one: after
+setup, everything reaches you through the dashboard or Slack.
 
 Keep the prune job. Nothing else deletes old snapshots, and the database grows
 without it. Your price history survives pruning — it lives in a separate
@@ -166,6 +172,9 @@ hd health                     # is the scanner healthy?
 **Web dashboard** — a deal board per store, today's daily deals checked against
 the prices this install actually recorded, a product browser with price charts,
 and the alert feed:
+
+If setup installed the dashboard job it is already running — open
+<http://127.0.0.1:8080> and leave it bookmarked. To start one by hand:
 
 ```bash
 hd serve                      # → http://127.0.0.1:8080
@@ -221,6 +230,22 @@ set `CANVAS_ENABLED=false` to silence the attempt.
 
 ## Troubleshooting
 
+**Start here:**
+
+```bash
+hd doctor          # what is wrong
+hd doctor --fix    # repair what can be repaired safely
+```
+
+It checks the things that break silently — a schedule that stopped firing, a
+prune job that was never registered, an `hd` that resolves to the wrong Python,
+a degraded API, retention debt, curl — and says which. `--fix` reinstalls
+missing jobs and clears junk; it never deletes price history, and anything
+destructive stays a suggestion rather than an action.
+
+The same checks appear as a banner across the top of the dashboard, so an
+install nobody is watching still says when it stopped collecting.
+
 **"No stores configured. Run `hd setup` first."**
 Expected on a fresh clone — the defaults are empty on purpose. Run `hd setup`.
 
@@ -243,12 +268,15 @@ Invite the bot: `/invite @your-app` in the target channel.
 Install the dashboard extra: `pip install -e ".[dashboard]"`.
 
 **The database is getting large**
-Make sure the prune job is scheduled. To run it now: `hd prune --dry-run`, then
-`hd prune`. If it refuses, run `hd backfill-stats` first — it is protecting
-price history that exists nowhere else.
+`hd doctor` reports whether the prune job is registered and how much retention
+debt has built up; `hd doctor --fix` installs the job if it is missing. To
+clear the backlog now: `hd prune --dry-run`, then `hd prune`. If prune refuses,
+run `hd backfill-stats` first — it is protecting price history that exists
+nowhere else.
 
 **Alerts stopped appearing**
-`hd health` reports the last run's status and whether the API is misbehaving.
+`hd doctor` covers the usual causes — a stopped schedule, a degraded API, a
+cooldown after throttling. `hd health` reports the last run's status alone.
 
 ---
 

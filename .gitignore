@@ -21,6 +21,11 @@ env/
 # Project-specific
 .env
 dev.db
+# WAL leaves two sidecar files beside any SQLite database.
+*.db-wal
+*.db-shm
+# Runtime request metrics, not source.
+diagnostics/*.jsonl
 hd_launchd.*.log
 hd_dashboard.*.log
 .hd_notify_cursor
@@ -35,6 +40,11 @@ screenshots/
 *.png
 .playwright-mcp/
 
+# Claude Code local settings
+.claude/settings.local.json
+
 # OS
 .DS_Store
 Thumbs.db
+.hd_throttle_cooldown
+.hd_health_state

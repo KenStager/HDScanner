@@ -60,6 +60,18 @@ def test_non_dict_rejected():
     assert failure_reason(None) == "not_a_dict"
 
 
+@pytest.fixture(autouse=True)
+def isolated_cwd(tmp_path, monkeypatch):
+    """Keep these tests away from the repo's real runtime state.
+
+    HDClient resolves its throttle cooldown relative to the working directory.
+    Without this, a cooldown written by an actual scheduled run makes the
+    client short-circuit and these tests fail for reasons that have nothing to
+    do with what they assert.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 class _StubSettings:
     """Minimal stand-in so the client can be built without real config."""
     rate_limit_rps = 1.0

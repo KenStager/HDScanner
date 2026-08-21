@@ -9,7 +9,6 @@ stays hidden unless the deal later gets deeper than when it was dismissed.
 
 from __future__ import annotations
 
-import asyncio
 import html as _html
 
 from nicegui import ui
@@ -18,14 +17,15 @@ from hd.dashboard import _state
 from hd.dashboard.components.formatters import (
     fmt_history_span,
     fmt_low_date,
-    fmt_ts,
     fmt_ts_relative,
 )
+from hd.dashboard.components.cards import online_card_html as _online_card_html
 from hd.dashboard.components.header import render_header
-from hd.dashboard.pipeline_runner import run_pipeline_background
+from hd.dashboard.components.health import render_health_banner
 from hd.dashboard.queries import (
     ONLINE_STORE_KEY,
     dismiss_deal,
+    get_daily_deal_picks,
     get_deal_board,
     get_online_deals,
     get_overview_stats,
@@ -39,6 +39,7 @@ ONLINE_TAB = ONLINE_STORE_KEY
 async def overview_page() -> None:
     settings = _state.settings
     render_header(settings.dashboard_title, current_path="/")
+    await render_health_banner(settings)
 
     # Per-client view state
     view = {"store": None, "min_pct": 0, "new_only": False, "sort": "deepest",
@@ -57,6 +58,11 @@ async def overview_page() -> None:
         stats = await get_overview_stats(settings)
         board = await get_deal_board(settings)
         online = await get_online_deals(settings)
+        daily = await get_daily_deal_picks(settings)
+        # A pick pinned in the daily strip must not show a second card below.
+        daily_ids = {d["item_id"] for d in daily}
+        online = [d for d in online if d["item_id"] not in daily_ids]
+        daily_visible = [d for d in daily if not d["dismissed"]]
         deals_by_store: dict[str, list] = board["stores"]
         hidden_by_store: dict[str, list] = board.get("hidden", {})
         store_names: dict[str, str] = board["store_names"]
@@ -89,7 +95,7 @@ async def overview_page() -> None:
             active = "active" if view["store"] == ONLINE_TAB else ""
             ui.html(
                 f'<button class="hd-storetab {active}">'
-                f'Online <span class="count">{len(online_grid)}</span></button>'
+                f'Online <span class="count">{len(online_grid) + len(daily_visible)}</span></button>'
             ).on("click", lambda _: _set(view, "store", ONLINE_TAB, content))
 
         is_online = view["store"] == ONLINE_TAB
@@ -132,6 +138,21 @@ async def overview_page() -> None:
                 deals.sort(key=lambda d: d["first_seen_ts"] or d["snapshot_ts"], reverse=True)
 
         store_key = ONLINE_TAB if is_online else view["store"]
+
+        # Today's Daily Deals — pinned above the grid, exempt from the filter
+        # chips and slot caps. Every pick carries our verdict, favorable or
+        # not: the strip says what HD is pushing today, the chips say what our
+        # record makes of it.
+        if is_online and daily_visible:
+            with ui.element("div").classes("w-full px-6 mt-4 mb-2"):
+                with ui.element("div").classes("hd-daily-panel w-full"):
+                    ui.html('<div class="hd-section-label">'
+                            'Today\'s daily deals — HD\'s picks, our verdicts</div>') \
+                        .classes("w-full")
+                    with ui.element("div").classes("deal-grid w-full mt-3"):
+                        for d in daily_visible:
+                            _render_deal(d, True, _dismiss, ONLINE_TAB)
+
         if deals:
             with ui.element("div").classes("deal-grid w-full px-6 mt-3"):
                 for d in deals:
@@ -200,7 +221,6 @@ def _status_line(stats: dict) -> None:
         "DEGRADED": "Scanner degraded — check Alerts",
     }.get(health, "")
 
-    ps = _state.pipeline_state
     with ui.row().classes("w-full px-6 pt-3 items-center gap-3 hd-status"):
         ui.html(f'<span class="hd-dot {dot}"></span>')
         ui.label(label)
@@ -208,16 +228,33 @@ def _status_line(stats: dict) -> None:
         ui.label(f"{stats['clearance_count']} clearance deals")
         ui.label("·")
         ui.label(f"{stats['active_products']:,} items watched")
+        nxt = _next_scan_label()
+        if nxt:
+            ui.label("·")
+            ui.label(nxt)
         ui.element("div").classes("grow")
-        if ps.is_running:
-            ui.spinner(size="xs")
-            ui.label("Scanning…")
-        else:
-            ui.button("Scan now", icon="radar",
-                      on_click=lambda: _trigger_pipeline(_state.settings, None)) \
-                .props("flat dense size=sm no-caps").classes("text-orange")
-            if ps.last_run_error:
-                ui.label(f"Last run failed at {fmt_ts(ps.last_run_ts)}").classes("text-red")
+
+
+def _next_scan_label() -> str:
+    """When the schedule fires next.
+
+    Replaces a "Scan now" button that promised an instant result and delivered
+    a 10-30 minute one. People pressed it because nothing on the page said
+    whether the scanner was still working; saying so is the actual fix.
+    """
+    from datetime import datetime
+
+    try:
+        from hd.setup_schedule import scan_slots
+
+        slots = scan_slots()
+        now = datetime.now()
+        later = [s for s in slots if (s.hour, s.minute) > (now.hour, now.minute)]
+        nxt = later[0] if later else slots[0]
+    except Exception:
+        return ""
+    when = "next scan" if later else "next scan tomorrow"
+    return f"{when} {nxt.hour:02d}:{nxt.minute:02d}"
 
 
 def _deal_card_html(d: dict) -> str:
@@ -264,88 +301,6 @@ def _deal_card_html(d: dict) -> str:
     )
 
 
-def _online_card_html(d: dict, cap_days: int) -> str:
-    """Online deal shelf tag.
-
-    The flash carries OUR number: a verified card headlines the depth our
-    record measured, and HD's claim is demoted to the word "claims" (on
-    unverified cards) or a small disagreement chip (when their number and
-    ours part ways). The chips carry the evidence — dated, with the span
-    that backs it — so a 3-day verdict can never pose as a 30-day one.
-    """
-    title = _html.escape(d["title"])
-    url = f'/products/{_html.escape(str(d["item_id"]), quote=True)}'
-
-    if d.get("image_url"):
-        img = f'<img src="{_html.escape(d["image_url"], quote=True)}" alt="" loading="lazy">'
-    else:
-        img = '<div class="placeholder">🔧</div>'
-
-    price = f"${d['price']:,.2f}"
-    tier = d.get("tier", "unverified")
-    claimed = int(d["claimed_pct"] or 0)
-    true_pct = int(d["true_pct"] or 0)
-    witnessed = int(d.get("witnessed_pct") or 0)
-    evidence = int(d.get("evidence_pct") or 0)
-    label = "Special Buy" if d.get("special_buy") else "Online Deal"
-
-    if tier == "verified":
-        flash_pct = f"−{evidence}%"
-        # The struck price is one our own record saw it sell for, never HD's
-        # asserted original.
-        was_val = d.get("high_all") if witnessed >= true_pct else d.get("high_window")
-    else:
-        flash_pct = f"claims {claimed}%" if claimed else ""
-        was_val = d.get("original")
-
-    was = (
-        f'<span class="deal-was">${was_val:,.2f}</span>'
-        if was_val and was_val > d["price"]
-        else ""
-    )
-
-    chips = ""
-    if d.get("is_new"):
-        chips += '<span class="deal-chip new">NEW</span>'
-
-    span = fmt_history_span(d.get("history_days"), cap_days)
-    low = d.get("low_price")
-    if tier == "verified":
-        if true_pct >= witnessed:
-            chips += f'<span class="deal-chip true">true −{true_pct}% vs {span}</span>'
-        elif low is not None and d["price"] <= low:
-            watched = fmt_history_span(d.get("obs_days"), cap_days)
-            chips += f'<span class="deal-chip best">lowest recorded · {watched}</span>'
-        elif d.get("high_all") is not None:
-            watched = fmt_history_span(d.get("obs_days"), cap_days)
-            chips += (f'<span class="deal-chip">high ${d["high_all"]:,.0f}'
-                      f' · {watched}</span>')
-        # HD's number gets a chip only when it materially disagrees with ours
-        if claimed and abs(claimed - evidence) > 5:
-            chips += f'<span class="deal-chip">HD claims {claimed}%</span>'
-    elif tier == "warned":
-        when = fmt_low_date(d.get("low_ts"))
-        chips += (f'<span class="deal-chip above">seen ${low:,.2f}'
-                  f'{" · " + when if when else ""}</span>')
-    else:
-        # Unverified: the record is too young to speak. Say what little we
-        # know, or nothing — a chip on 3 of every 4 cards is noise.
-        if d.get("high_window") is not None and true_pct < 10:
-            chips += f'<span class="deal-chip flat">flat {span} price</span>'
-        if low is not None and d.get("price_varied") and d["price"] <= low:
-            chips += '<span class="deal-chip best">lowest recorded</span>'
-
-    return (
-        f'<a class="deal-card" href="{url}" target="_blank" rel="noopener">'
-        f'<div class="deal-img">{img}</div>'
-        f'<div class="deal-flash online"><span>{label}</span><span>{flash_pct}</span></div>'
-        f'<div class="deal-price-row"><span class="deal-price">{price}</span>{was}</div>'
-        f'<div class="deal-title">{title}</div>'
-        f'<div class="deal-foot">{chips}</div>'
-        f'</a>'
-    )
-
-
 def _chip(label: str, active: bool, on_click) -> None:
     cls = "hd-chip active" if active else "hd-chip"
     ui.html(f'<button class="{cls}">{_html.escape(label)}</button>').on(
@@ -364,26 +319,3 @@ def _reset_filters(view: dict, content) -> None:
     view["min_pct"] = 0
     view["new_only"] = False
     content.refresh()
-
-
-def _trigger_pipeline(settings, _content) -> None:
-    """Start the pipeline in the background and notify on completion."""
-    if _state.pipeline_state.is_running:
-        ui.notification("A scan is already running", type="warning")
-        return
-
-    async def _run_and_refresh():
-        await run_pipeline_background(settings)
-        ps = _state.pipeline_state
-        if ps.last_run_error:
-            ui.notification(f"Scan failed: {ps.last_run_error}", type="negative")
-        else:
-            r = ps.last_run_result or {}
-            ui.notification(
-                f"Scan complete: {r.get('snapshots', 0)} prices checked, "
-                f"{r.get('alerts', 0)} new alerts",
-                type="positive",
-            )
-
-    ui.notification("Scan started", type="info")
-    asyncio.create_task(_run_and_refresh())
