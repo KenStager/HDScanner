@@ -1,8 +1,8 @@
-"""Deal card HTML builders shared by the dashboard and the social renderer.
+"""Deal card HTML builders.
 
-Kept free of NiceGUI imports so the social pipeline can build the exact same
-cards the dashboard shows — one card language, one verdict vocabulary,
-wherever a deal is rendered.
+Deliberately free of NiceGUI imports so any renderer can produce the same cards
+the dashboard shows — one card language, one verdict vocabulary, wherever a deal
+is rendered.
 """
 
 from __future__ import annotations

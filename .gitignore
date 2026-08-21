@@ -48,3 +48,6 @@ screenshots/
 Thumbs.db
 .hd_throttle_cooldown
 .hd_health_state
+
+# Stray empty scratch database.
+x.db
