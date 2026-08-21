@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hd-clearance-monitor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Track Home Depot clearance, price drops and stock for any brand at your local stores"
 license = "MIT"
 license-files = ["LICENSE"]
