@@ -239,6 +239,14 @@ class Settings(BaseSettings):
     # would look identical to a problem.
     retired_stores: str = ""
 
+    # Scan cadence, as Eastern hours. Empty uses the shipped three-a-day
+    # schedule. Raising it costs allowance that is shared across every install
+    # of this tool, not just yours — see setup_schedule.SCAN_HOURS_ET.
+    scan_hours_et: str = ""
+    # Minute past the hour. None derives one from this install's path so that
+    # many installs do not all fire on the same minute.
+    scan_minute: int | None = None
+
     @property
     def store_list(self) -> list[str]:
         return _parse_csv(self.stores)
@@ -246,6 +254,16 @@ class Settings(BaseSettings):
     @property
     def retired_store_list(self) -> list[str]:
         return _parse_csv(self.retired_stores)
+
+    @property
+    def scan_hours_et_list(self) -> list[int]:
+        hours = []
+        for raw in _parse_csv(self.scan_hours_et):
+            try:
+                hours.append(int(raw) % 24)
+            except ValueError:
+                continue
+        return sorted(set(hours))
 
     @property
     def brand_list(self) -> list[str]:

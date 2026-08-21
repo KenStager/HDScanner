@@ -61,7 +61,7 @@ class TestDailyDealsSlot:
 class TestScanSlots:
     def test_no_separate_deals_slot_when_a_scan_already_covers_it(self):
         """04:00 ET starts an hour after the refresh and checks deals first."""
-        slots = scan_slots(tz=EASTERN, on=WINTER)
+        slots = scan_slots(tz=EASTERN, on=WINTER, hours_et=(4, 12, 20), minute=0)
         assert ScheduleSlot(3, 10) not in slots
         assert ScheduleSlot(4, 0) in slots
 
@@ -113,8 +113,13 @@ class TestMaintenanceSlot:
         assert quietest_hour_et(()) == PRUNE_HOUR_ET
 
     def test_slot_is_half_past(self):
-        slot = prune_slot(tz=EASTERN, on=WINTER)
+        slot = prune_slot(tz=EASTERN, on=WINTER, hours_et=(0, 4, 8, 12, 16, 20))
         assert (slot.hour, slot.minute) == (2, 30)
+
+    def test_slot_follows_the_cadence_actually_configured(self):
+        """Pruning takes an exclusive lock; it must not land inside a scan."""
+        slot = prune_slot(tz=EASTERN, on=WINTER, hours_et=(4, 12, 20))
+        assert (slot.hour, slot.minute) == (8, 30)
 
     def test_slot_never_collides_with_a_scan(self):
         from hd.setup_schedule import scan_slots
@@ -306,3 +311,63 @@ class TestExecutableDiscovery:
         monkeypatch.setattr(sched.sys, "executable", str(tmp_path / "bin" / "python"))
         monkeypatch.setattr(sched.shutil, "which", lambda name: "/usr/local/bin/hd")
         assert hd_executable() == Path("/usr/local/bin/hd")
+
+
+class TestCadence:
+    """Three a day, on a minute that is this install's own.
+
+    Nine of the last ten runs on the author's install ended on an HTTP 206
+    quota stop — the per-install limit already binding at one install watching
+    one store. The limit that actually matters is the one across every install,
+    and that one does not aggregate: the shipped default is the only lever.
+    """
+
+    def test_ships_three_scans_a_day(self):
+        from hd.setup_schedule import SCAN_HOURS_ET
+
+        assert len(SCAN_HOURS_ET) == 3
+
+    def test_keeps_both_full_shelf_walks(self):
+        """04:00 and 12:00 are the full-shelf hours; a thinner cadence must keep them."""
+        from hd.setup_schedule import SCAN_HOURS_ET
+
+        assert 4 in SCAN_HOURS_ET and 12 in SCAN_HOURS_ET
+
+    def test_scans_are_evenly_spaced(self):
+        from hd.setup_schedule import SCAN_HOURS_ET
+
+        hours = sorted(SCAN_HOURS_ET)
+        gaps = {b - a for a, b in zip(hours, hours[1:])}
+        assert gaps == {8}
+
+    def test_the_default_needs_no_extra_deals_slot(self):
+        """A fourth run for the deals page would undo a third of the saving."""
+        from hd.setup_schedule import SCAN_HOURS_ET, deals_slot_needed
+
+        assert not deals_slot_needed(SCAN_HOURS_ET)
+
+    def test_two_installs_do_not_share_a_minute(self):
+        """A fixed :15 offset moves the crowd; it does not disperse it."""
+        from pathlib import Path
+
+        from hd.setup_schedule import scan_minute
+
+        minutes = {scan_minute(Path(f"/Users/u{i}/HDScanner")) for i in range(12)}
+        assert len(minutes) > 6, f"only {len(minutes)} distinct minutes across 12 installs"
+
+    def test_an_install_keeps_its_minute(self):
+        """It goes into a plist; a minute that drifts would rewrite the schedule."""
+        from pathlib import Path
+
+        from hd.setup_schedule import scan_minute
+
+        here = Path("/Users/someone/HDScanner")
+        assert scan_minute(here) == scan_minute(here)
+
+    def test_minute_is_a_real_minute(self):
+        from pathlib import Path
+
+        from hd.setup_schedule import scan_minute
+
+        for i in range(50):
+            assert 0 <= scan_minute(Path(f"/x/{i}")) < 60

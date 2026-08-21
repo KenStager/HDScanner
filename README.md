@@ -196,8 +196,10 @@ hd setup      # answer no to the steps you already have
 
 You get three jobs:
 
-- **Scan** — five times a day, plus one slot timed to Home Depot's daily-deals
-  refresh (3:00 Eastern, converted to *your* timezone)
+- **Scan** — three times a day, eight hours apart, on a minute derived from
+  your install so that everyone running this does not arrive at once. The
+  04:00 Eastern slot lands just after the daily-deals refresh and checks it
+  first, so no separate run is needed
 - **Prune** — once a day, deleting snapshots past the retention window
 - **Dashboard** — always on, if you installed the dashboard extra. It starts at
   login and comes back after a crash or a reboot, so your deal board is a URL
@@ -205,6 +207,12 @@ You get three jobs:
 
 Together they mean the terminal is an install tool, not a daily one: after
 setup, everything reaches you through the dashboard or Slack.
+
+Three passes a day is deliberate. Clearance persists for days rather than
+hours, so a denser schedule finds substantially the same markdowns — and Home
+Depot's request allowance is shared across everyone running this rather than
+metered per install, so the shipped default is the only thing that scales. It
+is tunable via `SCAN_HOURS_ET` if you have a reason.
 
 Keep the prune job. Nothing else deletes old snapshots, and the database grows
 without it. Your price history survives pruning — it lives in a separate

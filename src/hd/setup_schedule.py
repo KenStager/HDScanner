@@ -14,10 +14,12 @@ after the deals went up. The local equivalent is computed instead.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 import shutil
 import sys
+from collections.abc import Sequence
 from xml.sax.saxutils import escape as xml_escape
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
@@ -39,10 +41,16 @@ DEALS_GRACE_MINUTES = 10
 # allowance as the scan it precedes.
 DEALS_COVERED_WITHIN_HOURS = 2
 
-# The routine sweep. Deliberately not on the hour boundary of the deals run.
-# 04:00 exists because overnight repricing finishes by then: it and 12:00 are
-# the full-shelf walks (see browse_full_shelf_hours_et).
-SCAN_HOURS_ET = (0, 4, 8, 12, 16, 20)
+# The routine sweep, three times a day, eight hours apart. 04:00 exists because
+# overnight repricing finishes by then: it and 12:00 are the full-shelf walks
+# (see browse_full_shelf_hours_et), so both survive at this cadence.
+#
+# It used to be six. Nine of the last ten runs on the author's install ended on
+# an HTTP 206 quota stop, which is the per-install rate limit already binding at
+# a single install watching a single store. Clearance persists for days, not
+# hours, so three passes find substantially the same markdowns — and the limit
+# that matters is the one across every install, which does not aggregate.
+SCAN_HOURS_ET = (4, 12, 20)
 # Maintenance is placed in the middle of the quietest gap between scans rather
 # than at a fixed hour. It used to sit at 04:30 — thirty minutes into the 04:00
 # run, which is now the full-shelf walk and the longest of the day. Pruning
@@ -105,13 +113,60 @@ def deals_slot_needed(hours_et=SCAN_HOURS_ET) -> bool:
     )
 
 
-def scan_slots(*, tz=None, on: datetime | None = None) -> list[ScheduleSlot]:
+def scan_minute(workdir: Path | None = None) -> int:
+    """Which minute past the hour this install scans on.
+
+    Derived from the install's own path rather than fixed at :00. A shared
+    constant would put every install of this tool on Home Depot's doorstep at
+    the same instant — a fixed offset like :15 only moves that crowd, it does
+    not disperse it. Hashing the install path spreads them across the hour
+    while staying stable for any one install, so the plist does not churn.
+    """
+    seed = str(workdir if workdir is not None else Path.cwd())
+    return int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 60
+
+
+def scan_slots(
+    *,
+    tz=None,
+    on: datetime | None = None,
+    hours_et: Sequence[int] | None = None,
+    minute: int | None = None,
+    workdir: Path | None = None,
+) -> list[ScheduleSlot]:
     """Every local time the scan should run, deals slot included, in order."""
-    slots = [_to_local(h, 0, tz=tz, on=on) for h in SCAN_HOURS_ET]
-    if deals_slot_needed():
+    if hours_et is None:
+        hours_et = _configured_hours()
+    if minute is None:
+        minute = _configured_minute(workdir)
+    minute %= 60
+    slots = [_to_local(h, minute, tz=tz, on=on) for h in hours_et]
+    if deals_slot_needed(hours_et):
         slots.append(daily_deals_slot(tz=tz, on=on))
     unique = {(s.hour, s.minute) for s in slots}
     return [ScheduleSlot(h, m) for h, m in sorted(unique)]
+
+
+def _configured_hours() -> Sequence[int]:
+    """Settings override, else the shipped three-a-day cadence."""
+    try:
+        from hd.config import Settings
+
+        hours = Settings().scan_hours_et_list
+    except Exception:
+        return SCAN_HOURS_ET
+    return hours or SCAN_HOURS_ET
+
+
+def _configured_minute(workdir: Path | None = None) -> int:
+    """Settings override, else a minute derived from this install."""
+    try:
+        from hd.config import Settings
+
+        configured = Settings().scan_minute
+    except Exception:
+        configured = None
+    return scan_minute(workdir) if configured is None else configured
 
 
 def quietest_hour_et(hours_et=SCAN_HOURS_ET) -> int:
@@ -136,9 +191,17 @@ def quietest_hour_et(hours_et=SCAN_HOURS_ET) -> int:
     return best_hour
 
 
-def prune_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
-    """Local time for the maintenance job, in the quietest gap between scans."""
-    return _to_local(quietest_hour_et(), 30, tz=tz, on=on)
+def prune_slot(*, tz=None, on: datetime | None = None,
+               hours_et: Sequence[int] | None = None) -> ScheduleSlot:
+    """Local time for the maintenance job, in the quietest gap between scans.
+
+    Computed from the cadence this install actually runs, not the shipped
+    default: pruning takes an exclusive lock, so landing it inside a scan
+    window means one of the two loses.
+    """
+    if hours_et is None:
+        hours_et = _configured_hours()
+    return _to_local(quietest_hour_et(hours_et), 30, tz=tz, on=on)
 
 
 def hd_executable() -> Path | None:
