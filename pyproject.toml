@@ -22,9 +22,6 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.29"]
 dashboard = ["nicegui>=2.0"]
-# The Facebook poster drives a real browser session; rendering alone does not
-# need this (it shells out to a local chrome-headless-shell).
-social = ["playwright>=1.45"]
 dev = [
     "httpx",  # test doubles only; the scanner itself sends through curl
     "pytest",
