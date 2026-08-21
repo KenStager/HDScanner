@@ -54,7 +54,8 @@ saving it cannot back up.
 
 | | |
 |---|---|
-| **Python** | 3.11 or newer |
+| **Python** | 3.11 or newer. Check with `python3 --version` |
+| **git** | To download the code. On a Mac that has never run developer tools you will be prompted to install them — that is normal, click **Install** and wait |
 | **curl** | Required — every request goes through it. Preinstalled on macOS and most Linux |
 | **A Home Depot near you** | Setup finds your stores from a ZIP code |
 | **Time** | About 5 minutes to set up; the first full scan takes 10–30 minutes |
@@ -67,14 +68,30 @@ setup prints crontab lines for you to paste.
 
 ## Install
 
+Run these one line at a time.
+
 ```bash
 git clone https://github.com/KenStager/HDScanner.git
 cd HDScanner
+ls
+```
 
+**Stop and check:** that `ls` must list **pyproject.toml**. If it does not, the
+download did not finish and everything after this will fail in a confusing way —
+see [Troubleshooting](#troubleshooting). Only continue once you see it.
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev,dashboard]"
+pip install -e ".[dashboard]"
 ```
+
+Keep the quotation marks on that last line — without them the shell reads the
+brackets as a filename pattern. It prints a lot of scrolling text; you want the
+last line to say `Successfully installed`.
+
+Your prompt should now start with `(.venv)`. **That lasts only as long as this
+terminal window** — see [Keep it running](#keep-it-running).
 
 Then run setup:
 
@@ -83,7 +100,9 @@ hd setup
 ```
 
 It asks two things you already know — a **ZIP code** and a **brand name** — and
-finds everything else itself:
+finds everything else itself. Setup is a conversation: it asks one question at a
+time and waits. **Nothing below is typed by you** — it is a recording of what the
+conversation looks like:
 
 ```
 Where should the data live?
@@ -107,6 +126,26 @@ Which brands should be tracked?
 Check it works?
   Working — 329 products, 329 snapshots recorded.
 ```
+
+That transcript is shortened. The full sequence, and what to answer:
+
+| It asks | You answer |
+|---|---|
+| Use PostgreSQL instead of SQLite? | **Enter** (no) |
+| ZIP code | Your ZIP |
+| Select store(s) | **Enter** for the closest, or `1,3` for two |
+| Brand name | `Milwaukee`, `DEWALT`, `Ryobi` — whatever you are hunting |
+| Add another brand? | **Enter** for no |
+| Filters | **Enter** to skip |
+| Set up Slack? | **Enter** to skip — you can add it later |
+| Run a test scan? | **Enter** for yes — this is what proves it works |
+| Install the schedule? | **Enter** for yes — this is what makes it run on its own |
+
+In a prompt like `[y/N]`, the **capital letter is what you get if you just press
+Enter**. Every answer above except the ZIP and the brand is the default.
+
+A few steps pause for several seconds while they talk to Home Depot — the store
+lookup, the brand check, and the test scan. That is work, not a freeze.
 
 Setup is **re-runnable** and safe: it verifies before it writes. A brand that
 would have scanned nothing is caught here rather than after a week of empty
@@ -133,6 +172,20 @@ run that succeeds and scans nothing, which is exactly the failure setup prevents
 ---
 
 ## Keep it running
+
+**Every new terminal window starts fresh.** Before running any `hd` command:
+
+```bash
+cd ~/HDScanner
+source .venv/bin/activate
+```
+
+You will see `(.venv)` appear at the start of your prompt. Without it, `hd` says
+`command not found`. The scheduled background jobs do **not** need this — they
+run `hd` by its full path — so this applies only to commands you type yourself.
+
+Once the schedule and the dashboard are installed, you should rarely need a
+terminal at all: the scans run themselves and the deals show up in your browser.
 
 Clearance appears and disappears within days, so this is worth running on a
 schedule. `hd setup` offers to install one; to do it later:
@@ -246,6 +299,33 @@ destructive stays a suggestion rather than an action.
 The same checks appear as a banner across the top of the dashboard, so an
 install nobody is watching still says when it stopped collecting.
 
+**"does not appear to be a Python project: neither 'setup.py' nor 'pyproject.toml' found"**
+You are not in the project folder. `pip install -e .` installs whatever is in the
+*current* directory, and the download step did not finish. Start over:
+
+```bash
+cd ~
+git clone https://github.com/KenStager/HDScanner.git
+cd HDScanner
+ls          # must list pyproject.toml
+```
+
+If `git clone` did nothing, or said `command not found: git`, run
+`xcode-select --install` first, let it finish, then clone again.
+
+**"requires a different Python: 3.9 … not in '>=3.11'"**
+Your `python3` is older than 3.11. Install a current Python from
+[python.org](https://www.python.org/downloads/), open a **new** terminal window,
+confirm `python3 --version`, then delete the `.venv` folder and redo the install
+steps.
+
+**`zsh: no matches found: .[dashboard]`**
+The quotation marks were dropped. It is `pip install -e ".[dashboard]"`.
+
+**`command not found: hd`**
+The virtual environment is not active in this window. See
+[Keep it running](#keep-it-running).
+
 **"No stores configured. Run `hd setup` first."**
 Expected on a fresh clone — the defaults are empty on purpose. Run `hd setup`.
 
@@ -341,15 +421,16 @@ solving or bot evasion here, and adding any would change what this is.
 
 ```bash
 pip install -e ".[dev]"
-pytest                        # 626 tests
+pytest                        # 807 tests
 ```
 
 ```
 cli.py                        typer commands
+doctor.py                     hd doctor — deployment checks and safe repairs
 setup_wizard.py               hd setup — the interactive first-run flow
   setup_database.py             provisioning: SQLite or PostgreSQL
   setup_slack.py                token, channel and scope verification
-  setup_schedule.py             launchd / crontab generation
+  setup_schedule.py             launchd / crontab generation (scan, prune, dashboard)
 pipeline/
   browse.py                   facet-driven scan (the default strategy)
   brands.py                   brand name → catalog facet token
