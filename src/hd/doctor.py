@@ -271,12 +271,14 @@ async def check_database(settings: Settings) -> list[Check]:
     ))
 
     configured = set(settings.store_list)
+    retired = set(settings.retired_store_list)
     for store_id, last in sorted(rows):
-        if store_id in configured:
+        if store_id in configured or store_id in retired:
             continue
         out.append(Check(
             "stray-store", WARN,
             f"store {store_id} holds data but is not scanned (last seen {str(last)[:10]})",
+            "if that is deliberate, add it to RETIRED_STORES",
         ))
     for store_id in sorted(configured - {r[0] for r in rows}):
         out.append(Check("store", WARN, f"store {store_id} is configured but has no data"))

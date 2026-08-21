@@ -159,3 +159,49 @@ async def test_database_check_reports_retention_debt_and_stray_stores(tmp_path):
     assert "80%" in by_name["retention"].detail
     assert by_name["stray-store"].status == WARN
     assert "8425" in by_name["stray-store"].detail
+
+
+@pytest.mark.asyncio
+async def test_a_retired_store_is_an_answer_not_a_warning(tmp_path):
+    """Dropping a store while keeping its price history is a normal thing to do.
+
+    Without a way to say so, `stray-store` warns forever: the dashboard shows a
+    standing advisory for a state chosen on purpose, and a signal that never
+    clears is the one nobody reads on the day something is genuinely wrong.
+    """
+    from hd.db import base
+    from hd.db.models import StoreSnapshot
+    from hd.doctor import check_database
+
+    s = settings_for(tmp_path, snapshot_retention_days=90,
+                     stores="2619", retired_stores="8425")
+    await base.init_db(s)
+    now = datetime.now(timezone.utc)
+    async with base.get_session(s) as session:
+        session.add(StoreSnapshot(ts=now, store_id="8425", item_id="o1", price_value=1))
+        session.add(StoreSnapshot(ts=now, store_id="2619", item_id="n1", price_value=1))
+        await session.commit()
+
+    checks = await check_database(s)
+    await base.close_db()
+    assert "stray-store" not in {c.name for c in checks}
+
+
+@pytest.mark.asyncio
+async def test_an_unretired_stray_store_says_how_to_settle_it(tmp_path):
+    """The warning has to be resolvable, or it is just noise."""
+    from hd.db import base
+    from hd.db.models import StoreSnapshot
+    from hd.doctor import check_database
+
+    s = settings_for(tmp_path, snapshot_retention_days=90, stores="2619")
+    await base.init_db(s)
+    now = datetime.now(timezone.utc)
+    async with base.get_session(s) as session:
+        session.add(StoreSnapshot(ts=now, store_id="8425", item_id="o1", price_value=1))
+        await session.commit()
+
+    checks = await check_database(s)
+    await base.close_db()
+    stray = next(c for c in checks if c.name == "stray-store")
+    assert "RETIRED_STORES" in (stray.fix or "")

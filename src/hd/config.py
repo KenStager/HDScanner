@@ -233,9 +233,19 @@ class Settings(BaseSettings):
     # unaffected when this is off.
     canvas_enabled: bool = True
 
+    # Stores you deliberately stopped scanning but whose price history you
+    # kept. Without this, `hd doctor` warns about their leftover data forever
+    # and the dashboard advisory never clears — so a permanent, chosen state
+    # would look identical to a problem.
+    retired_stores: str = ""
+
     @property
     def store_list(self) -> list[str]:
         return _parse_csv(self.stores)
+
+    @property
+    def retired_store_list(self) -> list[str]:
+        return _parse_csv(self.retired_stores)
 
     @property
     def brand_list(self) -> list[str]:
