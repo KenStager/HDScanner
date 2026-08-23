@@ -15,6 +15,7 @@ from hd.pipeline import brands as br
 from hd.pipeline.brands import (
     BrandResolutionError,
     BrandThrottled,
+    read_brand_facet,
     resolve_brand,
     list_brands,
     suggest_brands,
@@ -84,7 +85,7 @@ def _search(*totals):
 
 
 def _facets(*responses):
-    """Queue of (total, dimensions) responses returned in order; last repeats."""
+    """Expose (total, dimensions) fixtures through fetch_facets' real contract."""
     calls = {"n": 0}
 
     async def _inner(client, settings, nav_param, store_id, storefilter):
@@ -93,13 +94,41 @@ def _facets(*responses):
         note = getattr(client, "note_read", None)
         if note:
             note()
-        return responses[i]
+        total, dimensions = responses[i]
+        return total, dimensions, None
 
     _inner.calls = calls
     return _inner
 
 
 class TestListBrands:
+    async def test_real_fetch_facets_contract(self, settings):
+        """Brand reads consume the production helper's three-value result."""
+        raw = {
+            "data": {
+                "searchModel": {
+                    "searchReport": {"totalProducts": 34707},
+                    "dimensions": [{
+                        "label": "Brand",
+                        "refinements": [{
+                            "label": "MILWAUKEE",
+                            "refinementKey": "zv",
+                            "recordCount": 9306,
+                        }],
+                    }],
+                }
+            }
+        }
+
+        class FacetClient(FakeClient):
+            async def post_graphql(self, variables):
+                assert variables["navParam"] == settings.tools_nav_param
+                assert variables["storeId"] == "8452"
+                return raw
+
+        got = await read_brand_facet(FacetClient(), settings, "8452")
+        assert got == {"MILWAUKEE": ("zv", 9306)}
+
     async def test_parses_labels_and_tokens(self, monkeypatch, settings):
         monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
         got = await list_brands(FakeClient(), settings, "8452")

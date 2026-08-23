@@ -91,7 +91,7 @@ async def read_brand_facet(
     failed or returned no Brand dimension — callers must not treat that as
     "there are no brands".
     """
-    total, dimensions = await fetch_facets(
+    total, dimensions, _raw = await fetch_facets(
         client, settings, settings.tools_nav_param, store_id, storefilter
     )
     if client.is_throttled:
@@ -219,7 +219,7 @@ async def verify_token(
 
     The request is made directly rather than through fetch_facets because that
     helper collapses "the request failed" and "the response carried no total"
-    into the same (None, {}) return. Believing that conflation would report a
+    into the same (None, {}, None) return. Believing that conflation would report a
     perfectly good brand as nonexistent whenever a verify read happened to fail
     — and the facet read above is retried precisely because reads do fail.
     """
