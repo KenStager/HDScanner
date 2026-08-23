@@ -8,9 +8,11 @@ loses its store-page links, which is the defect setup exists to prevent.
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from hd.config import Settings
 from hd.hd_api.stores import StoreResult
@@ -205,6 +207,58 @@ class TestPreflight:
     def test_missing_directory_blocks(self, tmp_path):
         result = preflight(tmp_path / "absent", want_dashboard=False)
         assert result.ok is False and result.problems
+
+
+class TestSetupCooldown:
+    async def test_existing_cooldown_stops_before_any_prompt(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        from hd.http.cooldown import ThrottleCooldown
+
+        path = tmp_path / "cool"
+        ThrottleCooldown(path).start(2460)
+        monkeypatch.setenv("THROTTLE_COOLDOWN_PATH", str(path))
+
+        async def should_not_prompt(*args, **kwargs):
+            raise AssertionError("setup prompted despite an active cooldown")
+
+        monkeypatch.setattr(sw, "_prompt_database", should_not_prompt)
+
+        assert await sw.run_setup(tmp_path) == 1
+        output = " ".join(capsys.readouterr().out.split())
+        assert "No request was sent" in output
+        assert "about 41 minutes" in output
+
+    async def test_throttle_during_brand_lookup_stops_without_retrying(
+        self, monkeypatch, tmp_path
+    ):
+        from hd.http.cooldown import ThrottleCooldown
+        from hd.pipeline.brands import BrandThrottled
+
+        cooldown = ThrottleCooldown(tmp_path / "cool")
+        cooldown.start(600)
+        calls = {"resolve": 0}
+
+        async def throttled(*args, **kwargs):
+            calls["resolve"] += 1
+            raise BrandThrottled("throttled")
+
+        class Client:
+            @property
+            def cooldown(self):
+                return cooldown
+
+        monkeypatch.setattr("hd.pipeline.brands.resolve_brand", throttled)
+        monkeypatch.setattr("typer.prompt", lambda *args, **kwargs: "Milwaukee")
+
+        console = Console(file=io.StringIO(), no_color=True)
+        with pytest.raises(sw.SetupAborted) as exc:
+            await sw._resolve_brands(
+                console, Settings(), "3907", Client(), [], {}
+            )
+
+        assert calls["resolve"] == 1
+        assert "about 10 minutes" in str(exc.value)
 
 
 class TestSeedStores:

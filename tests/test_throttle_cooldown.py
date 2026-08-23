@@ -102,6 +102,7 @@ async def test_a_cooling_client_makes_no_requests(tmp_path):
     await c.close()
 
     assert failure_reason(raw) == "cooling_down"
+    assert c.is_throttled is True
     assert calls == []  # the point: nothing reached the network
 
 
