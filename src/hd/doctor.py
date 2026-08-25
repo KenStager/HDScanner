@@ -70,7 +70,10 @@ def _plists() -> list[Path]:
 
 def check_scheduler(settings: Settings) -> Iterable[Check]:
     """The scan job exists, is loaded, and runs the interpreter we think it does."""
-    plists = [p for p in _plists() if "dashboard" not in p.name and "prune" not in p.name]
+    plists = [
+        p for p in _plists()
+        if not any(job in p.name for job in ("dashboard", "prune", "backup"))
+    ]
     if not plists:
         yield Check("scheduler", FAIL, "no scan job installed",
                     "run `hd setup` to install the schedule")
@@ -89,9 +92,12 @@ def check_scheduler(settings: Settings) -> Iterable[Check]:
             yield Check("scheduler", FAIL, f"{label} is installed but not loaded",
                         f"launchctl load {path}")
         else:
+            # launchd accepts a single dict or an array of dicts here.
+            intervals = data.get("StartCalendarInterval") or []
+            if isinstance(intervals, dict):
+                intervals = [intervals]
             slots = [
-                (d.get("Hour", 0), d.get("Minute", 0))
-                for d in data.get("StartCalendarInterval") or []
+                (d.get("Hour", 0), d.get("Minute", 0)) for d in intervals
             ]
             times = ", ".join(f"{h:02d}:{m:02d}" for h, m in sorted(slots))
             yield Check("scheduler", OK, f"{label} loaded — {times or 'no slots'}")
