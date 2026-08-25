@@ -63,6 +63,15 @@ class Walk:
     # same navParam. Excluded from equality so a primed walk still compares
     # equal to the plan that produced it.
     primed: dict | None = field(default=None, compare=False, repr=False)
+    # Runtime outcome, filled by walk_and_capture and read by walk_status.
+    # Excluded from equality for the same reason as primed: a walked plan
+    # still compares equal to the plan that produced it.
+    observed_ids: int | None = field(default=None, compare=False)
+    live_total: int | None = field(default=None, compare=False)
+    # A mid-walk stop that was not the natural end of the results: a fetch
+    # error, an unusable page, or a throttle. Distinct from `truncated`,
+    # which is a planning-time judgment; walk_status folds both together.
+    cut: bool = field(default=False, compare=False)
 
 
 @dataclass
@@ -428,9 +437,11 @@ async def _page_direction(
                 raise
             except Exception as e:
                 log.error("Browse page fetch failed", label=walk.label, page=page, error=str(e))
+                walk.cut = True
                 break
 
         if client.is_throttled:
+            walk.cut = True
             break
 
         if not is_valid_search_response(raw):
@@ -440,6 +451,7 @@ async def _page_direction(
                 storefilter=storefilter,
                 reason=failure_reason(raw) or "api_error",
             )
+            walk.cut = True
             break
 
         search_model = raw.get("data", {}).get("searchModel") or {}
@@ -536,10 +548,12 @@ async def walk_and_capture(
     coverage: set[str] = set()
 
     if not walk.both_ends:
-        up, ins, _ = await _page_direction(
+        up, ins, live_total = await _page_direction(
             client, settings, walk, store_id, storefilter, seen_item_ids,
             upper_brands, now, order_by=None, coverage_ids=coverage,
         )
+        walk.live_total = live_total
+        walk.observed_ids = len(coverage)
         return up, ins
 
     # ASC runs full — it can only reach the cheap 744, never the whole node —
@@ -553,6 +567,8 @@ async def walk_and_capture(
     if client.is_throttled:
         # ASC-only is structurally half a node — say so, don't report it clean.
         walk.truncated = True
+        walk.live_total = live_total
+        walk.observed_ids = len(coverage)
         return up_a, ins_a
 
     up_d, ins_d, _ = await _page_direction(
@@ -582,6 +598,8 @@ async def walk_and_capture(
             "Both-ends coverage complete",
             label=walk.label, covered=covered, total=denom,
         )
+    walk.live_total = live_total
+    walk.observed_ids = covered
     return up_a + up_d, ins_a + ins_d
 
 
@@ -590,6 +608,106 @@ async def _pause(settings: Settings) -> None:
         settings.keyword_pause_min_seconds,
         settings.keyword_pause_max_seconds,
     ))
+
+
+def walk_status(walk: Walk) -> str:
+    """complete | truncated | failed — how far this walk's coverage can be trusted.
+
+    Judged on what was seen, not on how the walk ended: a walk that saw every
+    itemId its node claimed is complete even if its final request errored,
+    and a walk that ran to a clean stop but saw fewer than the node's own
+    total is truncated — catalog churn mid-walk can cause that, and erring
+    toward under-claiming is the safe direction. "failed" is reserved for a
+    walk that produced nothing usable at all, not even a page-0 total.
+    """
+    observed = walk.observed_ids or 0
+    if observed == 0 and walk.live_total is None:
+        return "failed"
+    denom = walk.live_total if walk.live_total is not None else walk.total
+    if denom and observed >= denom and not walk.truncated:
+        return "complete"
+    if walk.truncated or walk.cut or (denom and observed < denom):
+        return "truncated"
+    return "complete"
+
+
+async def _record_walk(
+    settings: Settings,
+    run_id: int | None,
+    walk: Walk,
+    store_id: str,
+    storefilter: str,
+    started: datetime,
+) -> None:
+    """Persist one walk's coverage row. Never allowed to break a scan."""
+    if run_id is None:
+        return
+    from hd.db.base import get_session
+    from hd.db.models import WalkCoverage
+
+    denom = walk.live_total if walk.live_total is not None else (walk.total or None)
+    try:
+        async with get_session(settings) as session:
+            session.add(WalkCoverage(
+                run_id=run_id,
+                store_id=store_id,
+                tier=storefilter,
+                label=walk.label,
+                started=started,
+                ended=datetime.now(timezone.utc),
+                status=walk_status(walk),
+                items_expected=denom,
+                items_observed=walk.observed_ids or 0,
+            ))
+    except Exception as e:
+        log.error("Coverage record failed", label=walk.label, error=str(e))
+
+
+async def _record_run_start(settings: Settings, tiers: tuple[str, ...]) -> int | None:
+    """Open this run's scan_runs row. Returns its id, or None if it could not
+    be written — walks then go unrecorded, which downstream reads as
+    unknown-not-complete: the safe failure mode."""
+    from hd.db.base import get_session
+    from hd.db.models import ScanRun
+
+    try:
+        async with get_session(settings) as session:
+            run = ScanRun(
+                started=datetime.now(timezone.utc),
+                tiers=",".join(tiers),
+                status="running",
+            )
+            session.add(run)
+            await session.flush()
+            return run.id
+    except Exception as e:
+        log.error("Could not open scan_runs row — walks will be unrecorded", error=str(e))
+        return None
+
+
+async def _record_run_end(
+    settings: Settings, run_id: int | None, summary: BrowseSummary, requests_used: int
+) -> None:
+    if run_id is None:
+        return
+    from sqlalchemy import update
+
+    from hd.db.base import get_session
+    from hd.db.models import ScanRun
+
+    try:
+        async with get_session(settings) as session:
+            await session.execute(
+                update(ScanRun).where(ScanRun.id == run_id).values(
+                    ended=datetime.now(timezone.utc),
+                    status="aborted" if summary.aborted else "complete",
+                    walks=summary.walks,
+                    snapshots=summary.snapshots,
+                    requests_used=requests_used,
+                )
+            )
+    except Exception as e:
+        log.error("Could not finalize scan_runs row", run_id=run_id, error=str(e))
 
 
 async def run_browse(
@@ -621,6 +739,8 @@ async def run_browse(
         stores=len(store_ids),
     )
 
+    run_id = await _record_run_start(settings, tiers)
+
     try:
         if "shelf" in tiers:
             for store_id in store_ids:
@@ -640,9 +760,13 @@ async def run_browse(
                         if client.is_throttled:
                             summary.aborted = True
                             break
+                        walk_started = datetime.now(timezone.utc)
                         upserts, inserts = await walk_and_capture(
                             client, settings, walk, store_id, "IN_STORE",
                             seen_by_store[store_id], brands,
+                        )
+                        await _record_walk(
+                            settings, run_id, walk, store_id, "IN_STORE", walk_started
                         )
                         summary.products += upserts
                         summary.snapshots += inserts
@@ -668,9 +792,13 @@ async def run_browse(
                         if client.is_throttled:
                             summary.aborted = True
                             break
+                        walk_started = datetime.now(timezone.utc)
                         upserts, inserts = await walk_and_capture(
                             client, settings, walk, store_id, "IN_STORE",
                             seen_by_store[store_id], brands,
+                        )
+                        await _record_walk(
+                            settings, run_id, walk, store_id, "IN_STORE", walk_started
                         )
                         summary.products += upserts
                         summary.snapshots += inserts
@@ -749,9 +877,13 @@ async def run_browse(
                                 summary.aborted = True
                                 category_finished = False
                                 break
+                            walk_started = datetime.now(timezone.utc)
                             upserts, inserts = await walk_and_capture(
                                 client, settings, walk, store_id, "ALL",
                                 seen_by_store[store_id], brands,
+                            )
+                            await _record_walk(
+                                settings, run_id, walk, store_id, "ALL", walk_started
                             )
                             summary.products += upserts
                             summary.snapshots += inserts
@@ -772,6 +904,7 @@ async def run_browse(
     finally:
         rotation.save_cursors(settings.browse_cursor_path, cursors)
         summary.aborted = summary.aborted or client.is_throttled
+        await _record_run_end(settings, run_id, summary, client.request_count)
         log.info(
             "Browse complete",
             products=summary.products,

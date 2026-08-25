@@ -967,3 +967,126 @@ class TestShelfCategoryWalks:
         async with base.get_session(browse_settings) as session:
             brands = {p.brand for p in (await session.execute(select(Product))).scalars()}
         assert brands == {"Milwaukee", "Weber", "Traeger"}
+
+
+# ---------------------------------------------------------------- coverage records
+
+from hd.pipeline.browse import walk_status
+
+
+class TestWalkStatus:
+    """Coverage is judged on what was seen, never on how the walk ended."""
+
+    def test_every_claimed_item_seen_is_complete(self):
+        w = Walk("n", "l", 3)
+        w.observed_ids, w.live_total = 3, 3
+        assert walk_status(w) == "complete"
+
+    def test_shortfall_against_live_total_is_truncated(self):
+        w = Walk("n", "l", 3)
+        w.observed_ids, w.live_total = 2, 3
+        assert walk_status(w) == "truncated"
+
+    def test_planner_truncation_survives_full_coverage_arithmetic(self):
+        w = Walk("n", "l", 3, truncated=True)
+        w.observed_ids, w.live_total = 3, 3
+        assert walk_status(w) == "truncated"
+
+    def test_cut_walk_with_unknown_denominator_is_truncated(self):
+        w = Walk("n", "l", 0)
+        w.observed_ids, w.live_total, w.cut = 5, None, True
+        assert walk_status(w) == "truncated"
+
+    def test_nothing_usable_at_all_is_failed(self):
+        w = Walk("n", "l", 3)
+        assert walk_status(w) == "failed"
+
+    def test_node_that_shrank_mid_walk_is_still_complete(self):
+        w = Walk("n", "l", 5)
+        w.observed_ids, w.live_total = 4, 3
+        assert walk_status(w) == "complete"
+
+    def test_empty_node_fully_seen_is_complete(self):
+        w = Walk("n", "l", 2)
+        w.observed_ids, w.live_total = 0, 0
+        assert walk_status(w) == "complete"
+
+
+class TestCoverageRecords:
+    async def test_run_writes_a_run_row_and_a_row_per_walk(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.db.models import ScanRun, WalkCoverage
+
+        await base.init_db(browse_settings)
+        # The fixture reads the ambient .env; a configured shelf-category walk
+        # would add extra IN_STORE rows and muddy the per-walk assertions.
+        browse_settings.shelf_category_walks = ""
+        summary = await run_browse(browse_settings, client=FakeClient(full_router()))
+        assert summary.aborted is False
+
+        async with base.get_session(browse_settings) as session:
+            runs = (await session.execute(select(ScanRun))).scalars().all()
+            walks = (await session.execute(select(WalkCoverage))).scalars().all()
+
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.status == "complete"
+        assert run.ended is not None and run.ended >= run.started
+        assert run.walks == summary.walks == len(walks)
+        assert run.snapshots == summary.snapshots
+
+        assert all(w.run_id == run.id for w in walks)
+        assert all(w.status == "complete" for w in walks)
+        by_tier = {}
+        for w in walks:
+            by_tier.setdefault(w.tier, []).append(w)
+        # shelf walk saw all 3; network walked Garage (2) + Plumbing (1)
+        assert [w.items_observed for w in by_tier["IN_STORE"]] == [3]
+        assert sorted(w.items_observed for w in by_tier["ALL"]) == [1, 2]
+        assert all(w.items_expected == w.items_observed for w in walks)
+
+    async def test_unusable_first_page_records_a_failed_walk(self, browse_settings, fresh_db):
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        client = FakeClient(lambda v: {"data": {}})
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 3)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert walk_status(walk) == "failed"
+
+    async def test_short_page_below_claimed_total_records_truncated(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        # Page 0 claims 5 products but delivers one short page of 1.
+        client = FakeClient(lambda v: make_page([make_product("111")], 5))
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 5)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert walk_status(walk) == "truncated"
+        assert walk.observed_ids == 1 and walk.live_total == 5
+
+    async def test_throttled_run_is_recorded_aborted(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.db.models import ScanRun, WalkCoverage
+
+        await base.init_db(browse_settings)
+
+        class ThrottledClient(FakeClient):
+            @property
+            def is_throttled(self):
+                return True
+
+        summary = await run_browse(browse_settings, client=ThrottledClient(full_router()))
+        assert summary.aborted is True
+
+        async with base.get_session(browse_settings) as session:
+            runs = (await session.execute(select(ScanRun))).scalars().all()
+            walks = (await session.execute(select(WalkCoverage))).scalars().all()
+        assert len(runs) == 1 and runs[0].status == "aborted"
+        assert walks == []  # nothing attempted, nothing claimed

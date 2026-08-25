@@ -205,3 +205,68 @@ class DismissedDeal(Base):
     __table_args__ = (
         Index("ix_dismissed_store_item", "store_id", "item_id", unique=True),
     )
+
+
+class ScanRun(Base):
+    """One browse run's outcome — the frame its walk coverage hangs from.
+
+    The most dangerous failure a scanner has is covering less than it meant
+    to and not saying so: downstream, an item missing from a short scan reads
+    as a dead deal, an ended clearance, a price that "disappeared". The facts
+    that guard against that — what a run attempted, how it ended — lived only
+    in log lines, and logs rotate. This table is the durable version: one row
+    per browse run, status "complete" or "aborted", finalized in the same
+    place the run summary is logged.
+    """
+
+    __tablename__ = "scan_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tiers: Mapped[str] = mapped_column(String(50), nullable=False)  # "shelf,network"
+    # running → complete | aborted. A row stuck at "running" is a crashed run.
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="running")
+    walks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    snapshots: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    requests_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_scan_runs_started", "started"),
+    )
+
+
+class WalkCoverage(Base):
+    """What one walk promised and what it delivered, per run.
+
+    status is judged conservatively: "complete" only when every itemId the
+    node claimed was actually seen ("failed" when not even page 0 was usable,
+    "truncated" for everything between — planner truncation, a mid-walk error
+    or throttle, or a shortfall against the node's own live total). Catalog
+    churn mid-walk can therefore mark an honest walk truncated; that errs
+    toward under-claiming coverage, which is the safe direction — nothing may
+    ever reason from an item's ABSENCE except against a walk recorded
+    complete. A walk deferred by shelf rotation writes no row at all: not
+    attempted is not evidence either.
+    """
+
+    __tablename__ = "walk_coverage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    store_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    tier: Mapped[str] = mapped_column(String(10), nullable=False)  # IN_STORE | ALL
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    started: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(10), nullable=False)
+    # The denominator the status was judged against: the node's live page-0
+    # total when the walk read one, its planned total otherwise.
+    items_expected: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Distinct itemIds the API returned across the walk's pages, before any
+    # brand filter — what the walk SAW, not what it chose to keep.
+    items_observed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_walk_coverage_run", "run_id"),
+    )
