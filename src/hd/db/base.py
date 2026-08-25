@@ -317,3 +317,76 @@ def maybe_vacuum(
 
     after = path.stat().st_size
     return True, f"reclaimed {(total - after) / 1e6:,.0f} MB ({total / 1e6:,.0f} → {after / 1e6:,.0f} MB)"
+
+
+def backup_database(
+    database_url: str,
+    dest_dir: str,
+    *,
+    keep: int = 14,
+    timeout: float = 30.0,
+) -> tuple[Path | None, str]:
+    """Write a consistent snapshot of the database into dest_dir, rotate old ones.
+
+    VACUUM INTO produces a compact, transactionally-consistent copy without
+    stopping the scanner — never copy the live file directly, because a copy
+    taken mid-write is a corrupt database that still opens. Returns
+    (path-or-None, message). An unavailable destination (an unplugged drive)
+    is a skip with a message, not an error: the nightly job must survive it.
+
+    The copy is verified with a quick_check before it counts; a snapshot that
+    fails verification is deleted and reported, because a backup that has
+    never been readable is a hope, not a backup. Rotation keeps the newest
+    `keep` snapshots for this database's stem and only ever touches files
+    matching that pattern.
+    """
+    import sqlite3
+    from datetime import datetime
+
+    src = sqlite_path(database_url)
+    if src is None or not src.exists():
+        return None, "not a file-backed SQLite database — nothing to back up"
+
+    dest = Path(dest_dir).expanduser()
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return None, f"skipped — destination unavailable ({e})"
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = dest / f"{src.stem}-{stamp}.db"
+    try:
+        conn = sqlite3.connect(src, timeout=timeout)
+        try:
+            conn.execute("VACUUM INTO ?", (str(target),))
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        target.unlink(missing_ok=True)
+        return None, f"backup failed ({e}); a scan may be running"
+
+    try:
+        check_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=timeout)
+        try:
+            verdict = check_conn.execute("pragma quick_check").fetchone()[0]
+        finally:
+            check_conn.close()
+    except sqlite3.Error as e:
+        verdict = str(e)
+    if verdict != "ok":
+        target.unlink(missing_ok=True)
+        return None, f"snapshot failed verification ({verdict}) and was deleted"
+
+    pruned = 0
+    if keep > 0:
+        snapshots = sorted(dest.glob(f"{src.stem}-*.db"))
+        for old in snapshots[:-keep]:
+            try:
+                old.unlink()
+                pruned += 1
+            except OSError:
+                continue
+
+    size = target.stat().st_size
+    note = f", pruned {pruned} old" if pruned else ""
+    return target, f"{target.name}: {size / 1e6:,.0f} MB, verified ok{note}"

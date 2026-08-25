@@ -250,6 +250,14 @@ class Settings(BaseSettings):
     # rewrite. 0 disables it.
     vacuum_threshold_pct: int = 25
 
+    # Backups. The database is the record; the machine it lives on is a
+    # single point of failure until a snapshot exists somewhere else. Each
+    # directory gets a verified VACUUM INTO snapshot per `hd backup` run,
+    # rotated to backup_keep files. CSV so one run can feed a second drive
+    # and a local directory; empty disables the command with a hint.
+    backup_dirs: str = ""
+    backup_keep: int = 14
+
     # Storage
     store_raw_json: bool = True
     raw_json_dir: str = "./raw_responses"

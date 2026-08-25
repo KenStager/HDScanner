@@ -1088,6 +1088,43 @@ def prune(
         console.print(f"[green]Pruned {deleted} old snapshots.[/green]")
 
 
+@app.command()
+def backup(
+    dest: list[str] = typer.Option(
+        None, "--dest", help="Destination directory (repeatable; default: BACKUP_DIRS)"
+    ),
+    keep: int = typer.Option(0, help="Snapshots to keep per destination (0 = use config)"),
+) -> None:
+    """Write a verified snapshot of the database to each backup destination."""
+    setup_logging()
+    settings = Settings()
+
+    from hd.db.base import backup_database
+
+    dirs = list(dest) if dest else [
+        d.strip() for d in settings.backup_dirs.split(",") if d.strip()
+    ]
+    if not dirs:
+        console.print(
+            "[red]No destination.[/red] Set BACKUP_DIRS in .env or pass --dest."
+        )
+        raise typer.Exit(code=1)
+
+    keep_n = keep if keep > 0 else settings.backup_keep
+    failures = 0
+    for directory in dirs:
+        path, message = backup_database(
+            settings.database_url, directory, keep=keep_n
+        )
+        if path is None:
+            failures += 1
+            console.print(f"[yellow]{directory}: {message}[/yellow]")
+        else:
+            console.print(f"[green]{directory}: {message}[/green]")
+    if failures == len(dirs):
+        raise typer.Exit(code=1)
+
+
 @app.command("backfill-stats")
 def backfill_stats(
     chunk: int = typer.Option(50_000, help="Rows to read per batch"),
