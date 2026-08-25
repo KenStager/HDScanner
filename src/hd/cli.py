@@ -901,6 +901,59 @@ def prune_raw_responses(settings: Settings, *, dry_run: bool = False) -> tuple[i
     return files, freed
 
 
+async def slim_snapshots(
+    session,
+    slim_days: int,
+    retention_days: int,
+    *,
+    now,
+    dry_run: bool = False,
+) -> tuple[int, int]:
+    """Drop the raw receipts from snapshot rows past the slim age.
+
+    A snapshot row carries the record (every parsed price, promo, clearance,
+    and inventory field) and the receipt it was parsed from (raw_json, ~1.9 KB
+    against the record's few hundred bytes). Slimming nulls the receipt and
+    keeps the record, so point-by-point history can outlive the receipts that
+    produced it instead of being deleted with them.
+
+    Owns the band between the delete cutoff and the slim cutoff: rows older
+    than retention_days belong to the delete stage, so a slim age at or past
+    the delete age does nothing (the caller warns). Returns (rows, bytes) —
+    counted the same whether or not dry_run, and deliberately not gated by
+    the uncaptured-items guard, because no price fact is lost here.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func, null, select, update
+
+    from hd.db.models import StoreSnapshot
+
+    if slim_days <= 0 or slim_days >= retention_days:
+        return 0, 0
+
+    slim_cutoff = now - timedelta(days=slim_days)
+    delete_cutoff = now - timedelta(days=retention_days)
+    in_band = (
+        StoreSnapshot.ts < slim_cutoff,
+        StoreSnapshot.ts >= delete_cutoff,
+        StoreSnapshot.raw_json.isnot(None),
+    )
+    rows, size = (await session.execute(
+        select(
+            func.count(),
+            func.coalesce(func.sum(func.length(StoreSnapshot.raw_json)), 0),
+        ).where(*in_band)
+    )).one()
+    if rows and not dry_run:
+        # null(), not None: the JSON column type stores Python None as the
+        # JSON text 'null', which IS NOT NULL and would be slimmed forever.
+        await session.execute(
+            update(StoreSnapshot).where(*in_band).values(raw_json=null())
+        )
+    return rows, size
+
+
 @app.command()
 def prune(
     days: int = typer.Option(0, help="Retention days (0 = use config)"),
@@ -923,6 +976,7 @@ def prune(
 
         retention_days = days if days > 0 else settings.snapshot_retention_days
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        slim_days = settings.snapshot_slim_days
 
         try:
             async with get_session(settings) as session:
@@ -960,19 +1014,32 @@ def prune(
                 )).scalar() or 0
 
                 if dry_run:
-                    return count, 0, uncaptured
+                    slimmed, slim_bytes = await slim_snapshots(
+                        session, slim_days, retention_days,
+                        now=datetime.now(timezone.utc), dry_run=True,
+                    )
+                    return count, 0, uncaptured, slimmed, slim_bytes
                 if uncaptured and not force:
-                    return count, -1, uncaptured
+                    # Slimming still runs: it loses no price fact, so the
+                    # guard that blocks deletion has no claim over it.
+                    slimmed, slim_bytes = await slim_snapshots(
+                        session, slim_days, retention_days,
+                        now=datetime.now(timezone.utc),
+                    )
+                    return count, -1, uncaptured, slimmed, slim_bytes
 
                 if count > 0:
                     await session.execute(
                         delete(StoreSnapshot).where(StoreSnapshot.ts < cutoff)
                     )
-                return count, count, uncaptured
+                slimmed, slim_bytes = await slim_snapshots(
+                    session, slim_days, retention_days, now=datetime.now(timezone.utc)
+                )
+                return count, count, uncaptured, slimmed, slim_bytes
         finally:
             await close_db()
 
-    eligible, deleted, uncaptured = _run(_prune())
+    eligible, deleted, uncaptured, slimmed, slim_bytes = _run(_prune())
     raw_files, raw_bytes = prune_raw_responses(settings, dry_run=dry_run)
 
     # Deleting rows does not shrink a SQLite file; reclaim the space once
@@ -989,6 +1056,19 @@ def prune(
         console.print(
             f"[dim]Raw responses: {verb} {raw_files:,} file(s), "
             f"{raw_bytes/1e6:,.0f} MB (older than {settings.raw_retention_days}d)[/dim]"
+        )
+    retention_days = days if days > 0 else settings.snapshot_retention_days
+    if 0 < retention_days <= settings.snapshot_slim_days:
+        console.print(
+            f"[yellow]SNAPSHOT_SLIM_DAYS ({settings.snapshot_slim_days}) is not "
+            f"below the {retention_days}-day retention — slimming never fires.[/yellow]"
+        )
+    if slimmed:
+        verb = "would drop" if dry_run else "dropped"
+        console.print(
+            f"[dim]Slimmed: {verb} receipts from {slimmed:,} snapshot(s), "
+            f"{slim_bytes/1e6:,.0f} MB (older than {settings.snapshot_slim_days}d; "
+            f"records kept)[/dim]"
         )
     if dry_run:
         console.print(f"[yellow]Dry run: {eligible} snapshots eligible for deletion.[/yellow]")

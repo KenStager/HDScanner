@@ -218,3 +218,93 @@ def test_non_json_files_are_left_alone(tmp_path):
     keep = _write(raw, "notes.txt", 90)
     prune_raw_responses(s)
     assert keep.exists()
+
+
+# --- slimming ----------------------------------------------------------------
+#
+# A snapshot row is the record plus the receipt it was parsed from, and the
+# receipt is ~71% of the database. Slimming drops receipts at age and keeps
+# records, so retention can hold history for years without holding the blobs.
+
+from hd.cli import slim_snapshots
+
+
+@pytest_asyncio.fixture
+async def slim_seeded(prune_settings: Settings):
+    """Rows with receipts at 10, 100, and 200 days old."""
+    from hd.db import base as db_base
+
+    db_base._default = Database()
+    await db_base._default.init_db(prune_settings)
+
+    now = datetime.now(timezone.utc)
+    async with db_base._default.get_session(prune_settings) as session:
+        for item, age in (("100001", 10), ("100001", 100), ("100002", 200)):
+            session.add(StoreSnapshot(
+                store_id="2619", item_id=item,
+                ts=now - timedelta(days=age),
+                price_value=Decimal("199.00"),
+                in_stock=True,
+                raw_json={"itemId": item, "padding": "x" * 50},
+            ))
+
+    yield prune_settings, now
+    await db_base._default.close_db()
+
+
+async def _rows_by_age(settings):
+    from hd.db import base as db_base
+
+    async with db_base._default.get_session(settings) as session:
+        rows = (await session.execute(
+            select(StoreSnapshot).order_by(StoreSnapshot.ts.desc())
+        )).scalars().all()
+        return [(r.price_value, r.raw_json) for r in rows]
+
+
+class TestSlim:
+    async def test_band_rows_lose_receipts_and_keep_records(self, slim_seeded):
+        settings, now = slim_seeded
+        from hd.db import base as db_base
+
+        async with db_base._default.get_session(settings) as session:
+            rows, size = await slim_snapshots(session, 30, 180, now=now)
+
+        assert rows == 1 and size > 0
+        ten, hundred, two_hundred = await _rows_by_age(settings)
+        assert ten[1] is not None                      # too young to slim
+        assert hundred[1] is None                      # slimmed
+        assert hundred[0] == Decimal("199.00")         # the record survives
+        assert two_hundred[1] is not None              # the delete stage's row
+
+    async def test_dry_run_counts_without_touching(self, slim_seeded):
+        settings, now = slim_seeded
+        from hd.db import base as db_base
+
+        async with db_base._default.get_session(settings) as session:
+            rows, size = await slim_snapshots(session, 30, 180, now=now, dry_run=True)
+
+        assert rows == 1 and size > 0
+        assert all(raw is not None for _, raw in await _rows_by_age(settings))
+
+    async def test_slimming_is_idempotent(self, slim_seeded):
+        settings, now = slim_seeded
+        from hd.db import base as db_base
+
+        async with db_base._default.get_session(settings) as session:
+            first = await slim_snapshots(session, 30, 180, now=now)
+        async with db_base._default.get_session(settings) as session:
+            second = await slim_snapshots(session, 30, 180, now=now)
+
+        assert first[0] == 1
+        assert second == (0, 0)
+
+    async def test_disabled_and_inverted_configs_do_nothing(self, slim_seeded):
+        settings, now = slim_seeded
+        from hd.db import base as db_base
+
+        async with db_base._default.get_session(settings) as session:
+            assert await slim_snapshots(session, 0, 90, now=now) == (0, 0)
+            assert await slim_snapshots(session, 90, 90, now=now) == (0, 0)
+            assert await slim_snapshots(session, 120, 90, now=now) == (0, 0)
+        assert all(raw is not None for _, raw in await _rows_by_age(settings))

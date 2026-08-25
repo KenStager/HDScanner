@@ -232,6 +232,17 @@ class Settings(BaseSettings):
 
     # Maintenance
     snapshot_retention_days: int = 90
+    # A snapshot row is two things at once: the record (price, promo,
+    # clearance, inventory — a few hundred bytes) and the receipt (the raw
+    # API response it was parsed from, ~1.9 KB and 71% of the database).
+    # Deleting whole rows at retention age throws away the record to get rid
+    # of the receipt. Slimming splits the fates: rows older than this keep
+    # every parsed field but drop raw_json, so point-by-point price history
+    # survives at ~15% of the weight and snapshot_retention_days can be set
+    # years out instead of months. 0 disables slimming (rows stay whole
+    # until deleted). Meaningful only below snapshot_retention_days — a
+    # slim age past the delete age never fires, and `hd prune` says so.
+    snapshot_slim_days: int = 0
     # SQLite keeps the pages a delete frees and reuses them later, so pruning
     # alone never shrinks the file: after deleting 491,902 rows the database
     # still measured 1.43 GB with 1.26 GB reclaimable. VACUUM returns the space
