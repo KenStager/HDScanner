@@ -420,12 +420,32 @@ def run_once(
 
         try:
             if settings.browse_enabled:
+                from hd.pipeline.browse import (
+                    current_et_hour,
+                    parse_et_hours,
+                    run_browse,
+                )
+
+                # Per-hour tier assignment. With browse_shelf_hours_et set, each
+                # run is dedicated to one tier: the IN_STORE shelf at its hours
+                # (spread across them via the rotation fraction), the ALL/online
+                # catalogue at every other scan hour. Empty keeps the original
+                # both-tiers-every-run behaviour.
+                et_hour = current_et_hour()
+                shelf_hours = parse_et_hours(settings.browse_shelf_hours_et)
+                dd_hours = parse_et_hours(settings.daily_deals_hours_et)
+                if shelf_hours:
+                    tiers = ("shelf",) if et_hour in shelf_hours else ("network",)
+                else:
+                    tiers = ("shelf", "network")
+
                 # Daily Deals goes first, ahead of the browse tiers. A daily
                 # deal is valid for one day; shelf clearance persists for days.
-                # When a run is throttled part-way, a late shelf sweep costs a
-                # delay but a missed daily deal is gone — and the brand gate
-                # means this usually spends no API requests at all.
-                if settings.daily_deals_enabled:
+                # The brand gate means this usually spends no API requests at all.
+                run_dd = settings.daily_deals_enabled and (
+                    not dd_hours or et_hour in dd_hours
+                )
+                if run_dd:
                     from hd.pipeline.daily_deals import run_daily_deals
 
                     dd = await run_daily_deals(settings)
@@ -441,16 +461,16 @@ def run_once(
 
                 # Facet-driven browse replaces keyword discovery + snapshots:
                 # both tiers upsert products and append snapshots per page.
-                from hd.pipeline.browse import run_browse
-
                 summary = await run_browse(
                     settings=settings,
                     store_ids=settings.store_list,
                     client=shared_client,
+                    tiers=tiers,
                 )
                 product_count += summary.products
                 snapshot_count += summary.snapshots
                 effective_mode = "browse"
+                log.info("Tiers this run", hour_et=et_hour, tiers=list(tiers), daily_deals=run_dd)
 
             else:
                 if effective_mode == "full":

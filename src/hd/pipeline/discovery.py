@@ -294,6 +294,8 @@ async def _upsert_products(settings: Settings, products: list) -> int:
                     existing.canonical_url = p.canonical_url
                 if p.model_number:
                     existing.model_number = p.model_number
+                if p.upc:
+                    existing.upc = p.upc
                 if p.image_url:
                     existing.image_url = p.image_url
             else:
@@ -303,6 +305,7 @@ async def _upsert_products(settings: Settings, products: list) -> int:
                     title=p.title or "Unknown",
                     canonical_url=p.canonical_url,
                     model_number=p.model_number,
+                    upc=p.upc,
                     image_url=p.image_url,
                     first_seen_ts=now,
                     last_seen_ts=now,

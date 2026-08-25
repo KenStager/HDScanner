@@ -1067,11 +1067,74 @@ class TestDealTier:
                        price_varied=True, evidence_pct=15)
         assert deal_tier(d) == "warned"
 
-    def test_warning_outranks_a_verified_discount(self):
-        """"We watched it sell for less" is decisive, even beside a real drop."""
+    def test_recent_warning_outranks_a_verified_discount(self):
+        """"We watched it sell for less" is decisive beside a real drop — as
+        long as the low is recent (or undated, which counts as recent)."""
         from hd.dashboard.queries import deal_tier
         d = self._deal(price=120.0, true_pct=30, evidence_pct=30,
                        low_price=100.0, low_is_older=True, price_varied=True)
+        assert deal_tier(d) == "warned"
+        assert deal_tier(dict(d, low_is_recent=True)) == "warned"
+
+    def test_stale_low_does_not_overrule_a_measured_drop(self):
+        """The durable low never expires; without this, every recurring promo
+        eventually sits above some ancient dip and the warning channel numbs.
+        An old low beside a real, FRESHER measured drop is context, not
+        caution."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, true_pct=30, evidence_pct=30,
+                       low_price=100.0, low_is_older=True, price_varied=True,
+                       low_is_recent=False, evidence_outdates_low=True)
+        assert deal_tier(d) == "verified"
+
+    def test_stale_evidence_cannot_dismiss_a_fresher_low(self):
+        """The recency rule cuts both ways: evidence anchored to a high even
+        OLDER than the low may not overrule it. Expiring the fact that hurts
+        while keeping an older fact that flatters would be a thumb on the
+        scale, not a recency rule."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, true_pct=30, evidence_pct=30,
+                       low_price=100.0, low_is_older=True, price_varied=True,
+                       low_is_recent=False, evidence_outdates_low=False)
+        assert deal_tier(d) == "warned"
+        # absent key defaults the same, conservative way
+        d.pop("evidence_outdates_low")
+        assert deal_tier(d) == "warned"
+
+    def test_explicit_none_recency_counts_as_recent(self):
+        """Present-but-None must behave like absent: a record that cannot
+        date its low keeps the warning."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, true_pct=30, evidence_pct=30,
+                       low_price=100.0, low_is_older=True, price_varied=True,
+                       low_is_recent=None, evidence_outdates_low=True)
+        assert deal_tier(d) == "warned"
+
+    def test_none_evidence_never_crashes(self):
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(evidence_pct=None)
+        assert deal_tier(d) == "unverified"
+        d = self._deal(price=120.0, evidence_pct=None, low_price=100.0,
+                       low_is_older=True, price_varied=True,
+                       low_is_recent=False)
+        assert deal_tier(d) == "warned"
+
+    def test_stale_low_still_warns_an_unmeasured_claim(self):
+        """A claim-contradiction does not age: a May low disproves an August
+        "was" just as well as a fresh one. Only measured evidence outranks."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, claimed_pct=30, low_price=100.0,
+                       low_is_older=True, price_varied=True,
+                       low_is_recent=False)
+        assert deal_tier(d) == "warned"
+
+    def test_stale_low_with_sub_threshold_evidence_still_warns(self):
+        """The recency exception never rescues a deal the verified bar would
+        reject anyway — one threshold in the system, not two."""
+        from hd.dashboard.queries import deal_tier
+        d = self._deal(price=120.0, true_pct=9, evidence_pct=9,
+                       low_price=100.0, low_is_older=True, price_varied=True,
+                       low_is_recent=False)
         assert deal_tier(d) == "warned"
 
     def test_long_watched_flat_claim_is_hollow(self):
@@ -1085,6 +1148,108 @@ class TestDealTier:
         from hd.dashboard.queries import deal_tier
         d = self._deal(price_varied=False, obs_days=3)
         assert deal_tier(d) == "unverified"
+
+
+class TestRecentLow:
+    """_is_recent dates the warning's teeth."""
+
+    def test_inside_the_bound_is_recent(self):
+        from hd.dashboard.queries import _is_recent
+        assert _is_recent(datetime(2026, 8, 1), datetime(2026, 8, 20), 45)
+
+    def test_past_the_bound_is_not(self):
+        from hd.dashboard.queries import _is_recent
+        assert not _is_recent(
+            datetime(2026, 5, 1), datetime(2026, 8, 20), 45)
+
+    def test_exactly_at_the_bound_is_recent(self):
+        """The boundary day still warns — the teeth dull, they don't snap."""
+        from hd.dashboard.queries import _is_recent
+        assert _is_recent(datetime(2026, 7, 6), datetime(2026, 8, 20), 45)
+
+    def test_unknown_age_counts_as_recent(self):
+        """A record that cannot date its low keeps the warning."""
+        from hd.dashboard.queries import _is_recent
+        assert _is_recent(None, datetime(2026, 8, 20), 45)
+        assert _is_recent(datetime(2026, 5, 1), None, 45)
+
+    def test_mixed_timezone_awareness_does_not_crash(self):
+        from hd.dashboard.queries import _is_recent
+        aware = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        assert not _is_recent(aware, datetime(2026, 8, 20), 45)
+        assert not _is_recent(datetime(2026, 5, 1),
+                                  datetime(2026, 8, 20, tzinfo=timezone.utc), 45)
+
+
+class TestRecencyReachesProduction:
+    """The recency rule exists only if the query layer actually emits it:
+    with deal_tier defaulting conservative, deleting the emission would
+    restore the old behavior with a green suite. These pin the wire-up."""
+
+    async def _seed(self, settings, *, low, low_days_ago, high, high_days_ago,
+                    price, first_days_ago=40):
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from hd.db import base as db_base
+        from hd.db.models import ItemPriceStat, StoreSnapshot
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(settings) as session:
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100002", ts=now,
+                price_value=Decimal(str(price)), price_original=Decimal("199.00"),
+                percentage_off=50, special_buy=True, in_stock=True,
+            ))
+            session.add(ItemPriceStat(
+                store_id="2619", item_id="100002",
+                low_price=Decimal(str(low)),
+                low_ts=now - timedelta(days=low_days_ago),
+                high_price=Decimal(str(high)),
+                high_ts=now - timedelta(days=high_days_ago),
+                price_sum=Decimal("500.00"), obs_count=5, obs_days=5,
+                first_ts=now - timedelta(days=first_days_ago), last_ts=now,
+            ))
+
+    async def _deal(self, settings):
+        from hd.dashboard.queries import get_online_deals
+        return next(d for d in await get_online_deals(settings)
+                    if d["item_id"] == "100002")
+
+    async def test_stale_low_with_fresher_evidence_verifies(self, seeded_settings):
+        await self._seed(seeded_settings, low=42.93, low_days_ago=100,
+                         high=99.00, high_days_ago=30, price=49.97)
+        deal = await self._deal(seeded_settings)
+        assert deal["low_is_recent"] is False
+        assert deal["evidence_outdates_low"] is True
+        assert deal["tier"] == "verified"
+        # and the calendar watching-span rides along for the wording
+        assert deal["watched_days"] == 40
+
+    async def test_recent_low_still_warns(self, seeded_settings):
+        await self._seed(seeded_settings, low=42.93, low_days_ago=10,
+                         high=99.00, high_days_ago=5, price=49.97)
+        deal = await self._deal(seeded_settings)
+        assert deal["low_is_recent"] is True
+        assert deal["tier"] == "warned"
+
+    async def test_stale_evidence_stays_warned(self, seeded_settings):
+        """A high even older than the stale low may not dismiss it."""
+        await self._seed(seeded_settings, low=42.93, low_days_ago=100,
+                         high=99.00, high_days_ago=150, price=49.97,
+                         first_days_ago=160)
+        deal = await self._deal(seeded_settings)
+        assert deal["low_is_recent"] is False
+        assert deal["evidence_outdates_low"] is False
+        assert deal["tier"] == "warned"
+
+    async def test_the_setting_is_honored_not_the_constant(self, seeded_settings):
+        await self._seed(seeded_settings, low=42.93, low_days_ago=10,
+                         high=99.00, high_days_ago=5, price=49.97)
+        tight = seeded_settings.model_copy(
+            update={"warn_low_recency_days": 5})
+        deal = await self._deal(tight)
+        assert deal["low_is_recent"] is False
+        assert deal["tier"] == "verified"
 
 
 class TestStorePageUrl:

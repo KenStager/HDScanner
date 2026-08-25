@@ -144,6 +144,11 @@ a.deal-card:focus-visible { outline: 3px solid var(--hd-orange); outline-offset:
 /* durable price anchors: witnessed best price vs paying above a witnessed one */
 .deal-chip.best { background: #0b6bcb; color: #fff; }
 .deal-chip.above { background: var(--hd-red); color: #fff; }
+/* the same witnessed-low fact, one salience tier down: a low too old to
+   warn (see warn_low_recency_days) rides as dated context in the base
+   dress — deliberately identical to the default pill, stated here so the
+   quietness reads as intent, not omission */
+.deal-chip.context { background: #EEF0F2; color: #3a3d40; }
 
 /* online deal flash */
 .deal-flash.online { background: var(--hd-orange); color: #fff; }

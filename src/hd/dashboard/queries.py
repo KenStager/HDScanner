@@ -760,20 +760,44 @@ def deal_tier(deal: dict[str, Any]) -> str:
 
     'verified'   — our record vouches for a real discount: a measured drop in
                    the recent window, or the price sits at our witnessed low
-                   with a witnessed high meaningfully above it.
-    'warned'     — we watched it sell for less than today's "deal".
+                   with a witnessed high meaningfully above it. May carry a
+                   dated note of an older, lower price we once recorded.
+    'warned'     — we watched it sell for less RECENTLY — or ever, when the
+                   claim has no measured support of its own.
     'hollow'     — claim-only, and we watched the price long enough to say the
                    claimed "was" never existed. Dropped from the board.
     'unverified' — HD's claim is all there is, and our record is too young to
                    corroborate or contradict it.
+
+    A warning must be actionable-fresh; a claim-contradiction does not age.
+    The witnessed low is durable and never expires, so without a recency
+    bound every recurring promo eventually sits above some ancient dip and
+    the warning channel numbs. A RECENT low warns whatever we measured (the
+    reader could plausibly have had, and may again get, the better price).
+    An OLD low still warns when the claim has no measured backing — a May
+    low disproves an August "was" just as well as a fresh one — but it does
+    not overrule a real measured drop: that deal is verified, and the card
+    keeps the old low visible as a dated context chip rather than dressing
+    a true discount as a caution.
     """
     low = deal.get("low_price")
     if (
         low is not None and deal.get("price_varied") and deal.get("low_is_older")
         and deal["price"] > low
     ):
-        return "warned"
-    if deal.get("evidence_pct", 0) >= VERIFIED_MIN_PCT:
+        # The exception must clear three gates, each defaulting to warned:
+        # the low is dated AND stale ("is not False": an absent or None
+        # recency verdict counts as recent — a record that cannot date its
+        # low keeps the warning); the drop is measured to the shared
+        # threshold; and the evidence that beats the low POSTDATES it —
+        # expiring the fact that hurts a deal while keeping an older fact
+        # that flatters it would be a thumb on the scale, not a recency
+        # rule.
+        if (deal.get("low_is_recent", True) is not False
+                or (deal.get("evidence_pct") or 0) < VERIFIED_MIN_PCT
+                or not deal.get("evidence_outdates_low", False)):
+            return "warned"
+    if (deal.get("evidence_pct") or 0) >= VERIFIED_MIN_PCT:
         return "verified"
     if (
         not deal.get("price_varied")
@@ -811,6 +835,31 @@ def _is_older_day(low_ts, snapshot_ts) -> bool:
     if low_ts is None or snapshot_ts is None:
         return False
     return low_ts.date() < snapshot_ts.date()
+
+
+def _as_utc(dt):
+    """Normalize a possibly-naive DB timestamp to aware UTC for comparison."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_recent(low_ts, snapshot_ts, recency_days: int) -> bool:
+    """Is the witnessed low fresh enough to still gate today's verdict?
+
+    Feeds deal_tier's warned/verified boundary: a recent lower price is
+    actionable and keeps its warning teeth; an old one is history, and a
+    real measured drop outranks it (the card then shows it as a dated
+    context chip instead of a warning). Unknown ages count as recent, so a
+    record that cannot date its low keeps the warning.
+    """
+    if low_ts is None or snapshot_ts is None:
+        return True
+    if low_ts.tzinfo is None:
+        low_ts = low_ts.replace(tzinfo=timezone.utc)
+    if snapshot_ts.tzinfo is None:
+        snapshot_ts = snapshot_ts.replace(tzinfo=timezone.utc)
+    return (snapshot_ts - low_ts) <= timedelta(days=recency_days)
 
 
 def _promo_predicate():
@@ -878,6 +927,8 @@ def _online_rows_select(settings: Settings, ref_store: str, *,
             ItemPriceStat.low_ts,
             ItemPriceStat.high_price,
             ItemPriceStat.obs_days,
+            ItemPriceStat.high_ts,
+            ItemPriceStat.first_ts,
         )
         .join(
             latest_sub,
@@ -964,7 +1015,8 @@ def _deals_from_rows(rows, fulfillment_by_item: dict[str, bool | None],
 
     deals: list[dict[str, Any]] = []
     for (snap, title, canonical_url, image_url, high_window, first_ts,
-         promo_first_ts, low_price, low_ts, all_high, obs_days) in rows:
+         promo_first_ts, low_price, low_ts, all_high, obs_days,
+         high_ts, stats_first_ts) in rows:
         # A price is not a deal if nothing can actually be bought: drop items
         # whose fulfillment data confirms every path is out of stock. An item
         # with no verdict at all stays — missing data is not evidence of
@@ -1005,6 +1057,35 @@ def _deals_from_rows(rows, fulfillment_by_item: dict[str, bool | None],
 
         evidence_pct = max(true_pct, witnessed_pct)
 
+        # Does bar-clearing evidence POSTDATE the witnessed low? A stale low
+        # may only stop warning when the evidence that beats it is at least
+        # as fresh: expiring the fact that hurts a deal while keeping an
+        # older fact that flatters it would be a thumb on the scale, not a
+        # recency rule. Two independent legs, each requiring its own leg to
+        # clear the threshold: the witnessed high's own date, or a window
+        # whose observations all began after the low was set (the window
+        # high then necessarily postdates it).
+        low_ts_u = _as_utc(low_ts)
+        high_ts_u = _as_utc(high_ts)
+        evidence_outdates_low = low_ts_u is not None and (
+            (witnessed_pct >= VERIFIED_MIN_PCT and high_ts_u is not None
+             and high_ts_u >= low_ts_u)
+            or (true_pct >= VERIFIED_MIN_PCT and first_ts is not None
+                and _as_utc(first_ts) >= low_ts_u)
+        )
+
+        # How long the durable record has watched this item, as a CALENDAR
+        # span — the honest referent for an all-time measurement. obs_days
+        # counts distinct observed days, which can be 12 days spread over 5
+        # months; printing it as "vs 12d" would let a 5-month verdict pose
+        # as a 12-day one.
+        stats_first_u = _as_utc(stats_first_ts)
+        snap_ts_u = _as_utc(snap.ts)
+        watched_days = (
+            (snap_ts_u - stats_first_u).days
+            if stats_first_u is not None and snap_ts_u is not None else None
+        )
+
         if promo_first_ts is not None and promo_first_ts.tzinfo is None:
             promo_first_ts = promo_first_ts.replace(tzinfo=timezone.utc)
 
@@ -1028,6 +1109,21 @@ def _deals_from_rows(rows, fulfillment_by_item: dict[str, bool | None],
             "low_price": float(low_price) if low_price is not None else None,
             "low_ts": low_ts,
             "low_is_older": _is_older_day(low_ts, snap.ts),
+            "low_is_recent": _is_recent(
+                low_ts, snap.ts, settings.warn_low_recency_days),
+            # Same recency dial, applied to the flattering anchor: a card
+            # whose big number rests on a months-old witnessed high owes the
+            # reader the recent context too (see verdict_facts).
+            "high_is_recent": _is_recent(
+                high_ts, snap.ts, settings.warn_low_recency_days),
+            # How long today's low has been the recorded low — the dated
+            # strength of "lowest recorded" (nothing lower recorded since).
+            "low_age_days": (
+                (snap_ts_u - low_ts_u).days
+                if low_ts_u is not None and snap_ts_u is not None else None
+            ),
+            "evidence_outdates_low": evidence_outdates_low,
+            "watched_days": watched_days,
             "price_varied": (
                 low_price is not None and all_high is not None and low_price != all_high
             ),

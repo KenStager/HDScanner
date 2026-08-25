@@ -219,6 +219,9 @@ def _build_deal_dict(
     if deal_type == "in_store_clearance":
         effective_price = float(snap.clearance_value)
         effective_discount_pct = snap.clearance_percentage_off
+        # A real in-store clearance tag, validated by the diff engine — not
+        # HD's asserted online list.
+        discount_observed = True
     else:
         effective_price = float(snap.price_value) if snap.price_value is not None else None
         # Compute observed discount from first price baseline
@@ -231,8 +234,13 @@ def _build_deal_dict(
             effective_discount_pct = round(
                 float((first_price - snap.price_value) / first_price * 100)
             )
+            discount_observed = True
         else:
+            # No drop in our own record to measure — the only number available
+            # is HD's own claim, so it must be labelled as a claim, not shown
+            # as a discount we verified.
             effective_discount_pct = snap.percentage_off
+            discount_observed = False
 
     # Stock status
     stock_data = {
@@ -265,6 +273,7 @@ def _build_deal_dict(
         "deal_type": deal_type,
         "effective_price": effective_price,
         "effective_discount_pct": effective_discount_pct,
+        "discount_observed": discount_observed,
         "in_stock": in_stock,
         "inventory_qty": snap.inventory_qty,
         "deal_age_ts": deal_age_ts,
@@ -299,7 +308,12 @@ def _format_deal_line(deal: dict) -> str:
     url = deal.get("product_url", "")
     price = fmt_price(deal.get("effective_price"))
     pct = deal.get("effective_discount_pct")
-    pct_str = f"{pct}% off" if pct else ""
+    # Our measured drop reads as "X% off"; HD's unverified claim is labelled as
+    # a claim so this rundown never presents HD's number as one we confirmed.
+    if pct:
+        pct_str = f"{pct}% off" if deal.get("discount_observed", True) else f"HD claims {pct}%"
+    else:
+        pct_str = ""
 
     # Line 1: title (as link) + price + discount
     if url:

@@ -577,7 +577,13 @@ def _diff_snapshots(
                 },
             ))
 
-    # CLEARANCE — require observed price drop to confirm it's real
+    # CLEARANCE (savingsCenter == "CLEARANCE") — VERIFIED DEAD 2026-08-22.
+    # savings_center has never once held "CLEARANCE" across 78k+ snapshots (only
+    # NULL / "Special Buys" / "New Lower Prices"), so this branch is unreachable
+    # on the current API. Per-store clearance is detected via pricing.clearance{}
+    # (the IN_STORE_CLEARANCE rules); the AlertType.CLEARANCE that does fire comes
+    # from the cold-start rule above, not here. Kept rather than deleted in case
+    # HD ever populates the field — but do not rely on it firing.
     if (
         curr.savings_center == "CLEARANCE"
         and prev.savings_center != "CLEARANCE"

@@ -57,6 +57,8 @@ class Walk:
     label: str
     total: int
     truncated: bool = False  # True when splitting could not get under the cap
+    both_ends: bool = False  # walk both price ends instead of splitting by facet
+    all_brands: bool = False  # capture every brand on the page; the node, not the brand list, is the scope
     # The facet read for this node, reusable as page 0 when the walk covers the
     # same navParam. Excluded from equality so a primed walk still compares
     # equal to the plan that produced it.
@@ -86,6 +88,18 @@ def reachable_cap(settings: Settings) -> int:
     return settings.api_max_start_index + settings.page_size
 
 
+def both_ends_cap(settings: Settings) -> int:
+    """Largest result set two price-ordered ends can cover with a safe overlap.
+
+    PRICE ASC and PRICE DESC each reach `reachable_cap` items, so their union
+    spans up to 2*cap — minus a margin held back so the seam (where the
+    tie-break is not mirrored between the two orderings) always overlaps by
+    several pages rather than meeting at a knife edge.
+    """
+    margin = settings.both_ends_min_overlap_pages * settings.page_size
+    return 2 * reachable_cap(settings) - margin
+
+
 def plan_walks(
     nav_param: str,
     label: str,
@@ -99,18 +113,36 @@ def plan_walks(
 
     Returns (walks, need_facets) where need_facets lists (nav_param, label)
     nodes that are over the cap and need their own facet fetch to split
-    further. Pure function: no I/O — the caller fetches facets and re-plans.
+    further. Pure apart from one log line per routing decision: no network or
+    database I/O — the caller fetches facets and re-plans.
     """
     if total is None or total <= 0:
         return [], []
     cap = reachable_cap(settings)
+    band_cap = both_ends_cap(settings)
+
+    def _route(branch: str) -> None:
+        # Split parents never write a page 0, so this line is the archive's
+        # only record of a parent node's total and route — and the only thing
+        # that shows a node drifting into the both-ends band
+        # (cap < total <= band_cap).
+        log.info("Walk routing", label=label, total=total, branch=branch,
+                 cap=cap, band_cap=band_cap, depth=depth)
+
     if total <= cap:
+        _route("single")
         return [Walk(nav_param, label, total)], []
+    if settings.both_ends_paging and total <= band_cap:
+        # Too big for one walk, small enough for two price ends to cover with
+        # margin — walk both ends in one go instead of splitting by facet.
+        _route("both-ends")
+        return [Walk(nav_param, label, total, both_ends=True)], []
     if depth >= settings.browse_max_split_depth:
         log.warning(
             "Facet split depth exhausted — tail beyond API ceiling is unreachable",
             label=label, total=total, cap=cap,
         )
+        _route("truncated-depth")
         return [Walk(nav_param, label, total, truncated=True)], []
 
     existing_tokens = set(nav_param.split("Z"))
@@ -128,6 +160,7 @@ def plan_walks(
                 walks.append(Walk(child_nav, child_label, ref["count"]))
             else:
                 need.append((child_nav, child_label))
+        _route("category-split")
         return walks, need
 
     if not price_split_used:
@@ -147,12 +180,14 @@ def plan_walks(
                         label=child_label, total=ref["count"], cap=cap,
                     )
                 walks.append(Walk(child_nav, child_label, ref["count"], truncated=truncated))
+            _route("price-split")
             return walks, []
 
     log.warning(
         "No facet available to split oversized set — walking reachable head only",
         label=label, total=total, cap=cap,
     )
+    _route("truncated-no-facet")
     return [Walk(nav_param, label, total, truncated=True)], []
 
 
@@ -241,13 +276,23 @@ async def resolve_walks(
 SCHEDULE_TZ = ZoneInfo("America/New_York")
 
 
-def full_shelf_hours(settings: Settings) -> set[int]:
-    hours = set()
-    for part in str(getattr(settings, "browse_full_shelf_hours_et", "")).split(","):
+def parse_et_hours(csv: str) -> set[int]:
+    """Parse a CSV of Eastern-time hours (0–23) into a set; ignores junk."""
+    hours: set[int] = set()
+    for part in str(csv or "").split(","):
         part = part.strip()
         if part.isdigit() and 0 <= int(part) <= 23:
             hours.add(int(part))
     return hours
+
+
+def current_et_hour(now: datetime | None = None) -> int:
+    """The current hour on Home Depot's clock — the same clock the schedule uses."""
+    return (now or datetime.now(timezone.utc)).astimezone(SCHEDULE_TZ).hour
+
+
+def full_shelf_hours(settings: Settings) -> set[int]:
+    return parse_et_hours(getattr(settings, "browse_full_shelf_hours_et", ""))
 
 
 def effective_shelf_fraction(settings: Settings, now: datetime | None = None) -> float:
@@ -312,19 +357,33 @@ def _safe_label(label: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")[:80]
 
 
-async def walk_and_capture(
+async def _page_direction(
     client: HDClient,
     settings: Settings,
     walk: Walk,
     store_id: str,
     storefilter: str,
     seen_item_ids: set[str],
-    brands: list[str],
-) -> tuple[int, int]:
-    """Paginate one walk; upsert products and append snapshots per page.
+    upper_brands: list[str],
+    now: datetime,
+    *,
+    order_by: dict[str, str] | None,
+    coverage_ids: set[str],
+    expect_ceiling: bool = False,
+    coverage_target: int | None = None,
+) -> tuple[int, int, int | None]:
+    """Page one direction of a walk from startIndex 0 to the API ceiling.
 
-    Returns (products_upserted, snapshots_inserted). Stops on throttle,
-    invalid response, short page, or the API's startIndex ceiling.
+    Records every itemId the API returns (pre-brand-filter) in coverage_ids so a
+    both-ends walk can verify its union spanned the node. order_by=None is the
+    default BEST_MATCH ordering and the only one that may reuse a primed page — a
+    primed facet read is BEST_MATCH and is the wrong page for a price ordering.
+    expect_ceiling silences the "remainder not covered" warning for a both-ends
+    direction, where reaching the ceiling is the intended half-coverage, not a
+    truncation (the union assertion in the caller judges coverage instead).
+    coverage_target stops this direction once the shared union has seen every
+    item (plus a confirmation buffer), so the second pass need not run to the
+    ceiling. Returns (upserts, inserts, total_from_page0).
     """
     # Imported here to keep module import light and avoid cycles.
     from hd.pipeline.discovery import _upsert_products
@@ -332,21 +391,21 @@ async def walk_and_capture(
 
     products_upserted = 0
     snapshots_inserted = 0
-    now = datetime.now(timezone.utc)
-    upper_brands = [b.upper() for b in brands]
+    observed_total: int | None = None
+    confirm_left: int | None = None   # counts down once coverage first hits target
     page = 0
 
     while True:
         start_index = page * settings.page_size
         if start_index > settings.api_max_start_index:
-            if not walk.truncated:
+            if not walk.truncated and not expect_ceiling:
                 log.warning(
                     "Hit API startIndex ceiling mid-walk — remainder not covered",
                     label=walk.label, total=walk.total,
                 )
             break
 
-        if page == 0 and walk.primed is not None:
+        if page == 0 and order_by is None and walk.primed is not None:
             # Already fetched while planning this walk; consumed once so a
             # later pass cannot serve a stale page.
             raw = walk.primed
@@ -361,6 +420,7 @@ async def walk_and_capture(
                     start_index=start_index,
                     page_size=settings.page_size,
                     storefilter=storefilter,
+                    order_by=order_by,
                 )
             except CircuitOpenError:
                 # Too many failures too fast. This ends the run, not just this
@@ -386,23 +446,40 @@ async def walk_and_capture(
         raw_products = search_model.get("products") or []
 
         if page == 0:
-            total = (search_model.get("searchReport") or {}).get("totalProducts")
+            observed_total = (search_model.get("searchReport") or {}).get("totalProducts")
             log.info(
                 "Walk started",
                 label=walk.label, store_id=store_id, storefilter=storefilter,
-                total_products=total, planned=walk.total,
+                total_products=observed_total, planned=walk.total,
+                order=(order_by or {}).get("order"),
             )
 
         if settings.store_raw_json:
+            # Direction in the filename so a both-ends walk's two passes don't
+            # collide: ASC and DESC restart page at 0 and share `now` (one
+            # per-walk timestamp), so without this DESC would silently overwrite
+            # ASC's early pages in raw_responses. Empty for a single walk, so
+            # every existing filename and offline analysis keyed on them is
+            # unchanged.
+            direction = ""
+            if order_by:
+                direction = "_asc" if order_by.get("order") == "ASC" else "_desc"
             await _write_raw_json(
                 settings,
-                f"browse_{_safe_label(walk.label)}_{storefilter}_p{page}",
+                f"browse_{_safe_label(walk.label)}_{storefilter}{direction}_p{page}",
                 store_id, now, raw,
             )
 
+        parsed = parse_products(raw)
+        new_ids_this_page = False
+        for p in parsed:
+            if p.item_id and p.item_id not in coverage_ids:
+                coverage_ids.add(p.item_id)
+                new_ids_this_page = True
+
         products = [
-            p for p in parse_products(raw)
-            if p.brand and p.brand.upper() in upper_brands
+            p for p in parsed
+            if p.brand and (walk.all_brands or p.brand.upper() in upper_brands)
         ]
         if products:
             products_upserted += await _upsert_products(settings, products)
@@ -416,11 +493,96 @@ async def walk_and_capture(
             snapshots_inserted += await _insert_snapshots(settings, snapshots, store_id, now)
             seen_item_ids.update(s.item_id for s in snapshots)
 
+        # Early stop for the second (DESC) pass: once the union has seen every
+        # item, confirm with a few pages that turn up nothing new, then stop
+        # instead of running to the ceiling. Resetting the counter whenever a
+        # page still yields new itemIds makes the rule "N pages with nothing
+        # new", not "N pages" — so an UNDERSTATED totalProducts self-extends
+        # rather than leaving a silent gap (the mirror of grew_past_cap, which
+        # guards the overstated direction). Completeness then rests on "no new
+        # items", never on the count being right.
+        if coverage_target is not None and len(coverage_ids) >= coverage_target:
+            if confirm_left is None or new_ids_this_page:
+                confirm_left = settings.both_ends_confirm_pages
+            if confirm_left <= 0:
+                break
+            confirm_left -= 1
+
         if len(raw_products) < settings.page_size:
             break
         page += 1
 
-    return products_upserted, snapshots_inserted
+    return products_upserted, snapshots_inserted, observed_total
+
+
+async def walk_and_capture(
+    client: HDClient,
+    settings: Settings,
+    walk: Walk,
+    store_id: str,
+    storefilter: str,
+    seen_item_ids: set[str],
+    brands: list[str],
+) -> tuple[int, int]:
+    """Paginate one walk; upsert products and append snapshots per page.
+
+    Returns (products_upserted, snapshots_inserted). Stops on throttle,
+    invalid response, short page, or the API's startIndex ceiling. A both-ends
+    walk pages the cheap end and the dear end and asserts their union covered the
+    node; a shortfall marks the walk truncated rather than silently under-covering.
+    """
+    now = datetime.now(timezone.utc)
+    upper_brands = [b.upper() for b in brands]
+    coverage: set[str] = set()
+
+    if not walk.both_ends:
+        up, ins, _ = await _page_direction(
+            client, settings, walk, store_id, storefilter, seen_item_ids,
+            upper_brands, now, order_by=None, coverage_ids=coverage,
+        )
+        return up, ins
+
+    # ASC runs full — it can only reach the cheap 744, never the whole node —
+    # and hands back the AUTHORITATIVE total it read on page 0, which is the
+    # denominator the assertion must use: the node may have grown since planning.
+    up_a, ins_a, live_total = await _page_direction(
+        client, settings, walk, store_id, storefilter, seen_item_ids,
+        upper_brands, now, order_by={"field": "PRICE", "order": "ASC"},
+        coverage_ids=coverage, expect_ceiling=True,
+    )
+    if client.is_throttled:
+        # ASC-only is structurally half a node — say so, don't report it clean.
+        walk.truncated = True
+        return up_a, ins_a
+
+    up_d, ins_d, _ = await _page_direction(
+        client, settings, walk, store_id, storefilter, seen_item_ids,
+        upper_brands, now, order_by={"field": "PRICE", "order": "DESC"},
+        coverage_ids=coverage, expect_ceiling=True,
+        coverage_target=live_total,
+    )
+
+    # Union assertion — the hard gate, against the LIVE total (planned only as a
+    # fallback). A node that grew past the both-ends cap since planning can't be
+    # covered by two ends either, so that counts as short too. Surface via
+    # walk.truncated, exactly like a facet-split truncation, so a seam gap can
+    # never pass silently as full coverage.
+    denom = live_total if live_total else walk.total
+    covered = len(coverage)
+    grew_past_cap = bool(live_total) and live_total > both_ends_cap(settings)
+    if grew_past_cap or (denom and covered < denom):
+        walk.truncated = True
+        log.warning(
+            "Both-ends coverage short — seam gap or node grew past cap",
+            label=walk.label, covered=covered, total=denom,
+            gap=(denom - covered) if denom else None, grew_past_cap=grew_past_cap,
+        )
+    else:
+        log.info(
+            "Both-ends coverage complete",
+            label=walk.label, covered=covered, total=denom,
+        )
+    return up_a + up_d, ins_a + ins_d
 
 
 async def _pause(settings: Settings) -> None:
@@ -488,6 +650,34 @@ async def run_browse(
                         if walk.truncated:
                             summary.truncated_walks.append(walk.label)
                         await _pause(settings)
+                # Store-wide category nodes (e.g. the grill wall). Deliberately
+                # outside shelf rotation — their value is every-pass coverage
+                # and they are a few pages each — and captured for ALL brands:
+                # the node defines the scope, so the brand filter would silently
+                # drop most of what the walk was configured to see.
+                for label, token in settings.shelf_category_walk_list:
+                    if client.is_throttled:
+                        summary.aborted = True
+                        break
+                    nav = build_nav(settings.root_nav_param, token)
+                    walks = await resolve_walks(
+                        client, settings, nav, label, store_id, "IN_STORE",
+                    )
+                    for walk in walks:
+                        walk.all_brands = True
+                        if client.is_throttled:
+                            summary.aborted = True
+                            break
+                        upserts, inserts = await walk_and_capture(
+                            client, settings, walk, store_id, "IN_STORE",
+                            seen_by_store[store_id], brands,
+                        )
+                        summary.products += upserts
+                        summary.snapshots += inserts
+                        summary.walks += 1
+                        if walk.truncated:
+                            summary.truncated_walks.append(walk.label)
+                        await _pause(settings)
                 log.info(
                     "Shelf tier complete",
                     store_id=store_id,
@@ -524,12 +714,18 @@ async def run_browse(
                     key = f"network|{store_id}|{token}"
                     start = cursors.get(key, 0) % len(categories)
                     picked = [categories[(start + i) % len(categories)] for i in range(min(per_run, len(categories)))]
-                    cursors[key] = (start + len(picked)) % len(categories)
                     log.info(
                         "Network tier categories this run",
                         store_id=store_id, brand=brand,
                         categories=[c.get("label") for c in picked],
                     )
+                    # Advance the cursor only past categories we actually finish,
+                    # not past the ones we merely selected. A run cut short by a
+                    # 206 or the request budget otherwise skips its unwalked tail
+                    # forever, so a slice of the online catalogue would never be
+                    # seen. Counting completions lets the next online run resume
+                    # exactly where this one stopped — the whole set gets covered.
+                    completed = 0
                     for ref in picked:
                         if client.is_throttled:
                             summary.aborted = True
@@ -547,9 +743,11 @@ async def run_browse(
                             walks = await resolve_walks(
                                 client, settings, child_nav, child_label, store_id, "ALL",
                             )
+                        category_finished = True
                         for walk in walks:
                             if client.is_throttled:
                                 summary.aborted = True
+                                category_finished = False
                                 break
                             upserts, inserts = await walk_and_capture(
                                 client, settings, walk, store_id, "ALL",
@@ -561,6 +759,10 @@ async def run_browse(
                             if walk.truncated:
                                 summary.truncated_walks.append(walk.label)
                             await _pause(settings)
+                        if not category_finished:
+                            break
+                        completed += 1
+                    cursors[key] = (start + completed) % len(categories)
     except CircuitOpenError as e:
         # Reached run_browse uncaught before this, killing the process mid-run:
         # no cursor save, no cooldown written, no summary. Now it stops the run

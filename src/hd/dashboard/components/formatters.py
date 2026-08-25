@@ -165,6 +165,7 @@ def fmt_low_date(val: Union[datetime, str, None]) -> str:
 def store_price_verdict(
     effective_price: Union[float, int, None],
     stats: dict | None,
+    recency_days: int | None = None,
 ) -> tuple[str, str] | None:
     """Our history's one-chip verdict on the price you'd pay at a store today.
 
@@ -174,6 +175,12 @@ def store_price_verdict(
 
     The verdict compares against witnessed prices only (gap-immune facts from
     item_price_stats), never a percentage across the coverage gap.
+
+    recency_days applies the deal board's warning-recency rule (see
+    deal_tier): a low set within the bound keeps the warning dress; an older
+    low is dated context, one salience tier down — the SAME words either
+    way, so every surface tells the same fact and only the urgency differs.
+    None keeps the warning dress at any age.
     """
     if effective_price is None or not stats:
         return None
@@ -193,7 +200,21 @@ def store_price_verdict(
             return ("lowest recorded", "best")
         when = fmt_low_date(stats.get("low_ts"))
         label = f"seen ${low:,.2f}" + (f" · {when}" if when else "")
-        return (label, "above")
+        cls = "above"
+        low_ts = stats.get("low_ts")
+        if recency_days is not None and low_ts is not None:
+            if isinstance(low_ts, str):
+                try:
+                    low_ts = datetime.fromisoformat(low_ts)
+                except (ValueError, TypeError):
+                    low_ts = None
+            if low_ts is not None:
+                if low_ts.tzinfo is None:
+                    low_ts = low_ts.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - low_ts
+                if age.days > recency_days:
+                    cls = "context"
+        return (label, cls)
     # Never varied — say so, dated, so the claim is auditable
     since = fmt_low_date(stats.get("first_ts"))
     if since:

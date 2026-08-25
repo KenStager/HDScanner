@@ -336,6 +336,229 @@ class TestWalkAndCapture:
         assert (upserts, inserts) == (0, 0)
 
 
+# ---------------------------------------------------------------- both-ends paging
+
+def _both_ends(settings: Settings) -> Settings:
+    """browse_settings with both-ends on and a 1-page overlap margin.
+
+    With page_size=2 / api_max_start_index=4, reachable_cap=6 and
+    both_ends_cap = 2*6 - 1*2 = 10, so a node of total 7-10 walks both ends.
+    """
+    settings.both_ends_paging = True
+    settings.both_ends_min_overlap_pages = 1
+    return settings
+
+
+class TestBothEndsPlanning:
+    def test_cap_is_two_ends_minus_overlap(self, browse_settings):
+        from hd.pipeline.browse import both_ends_cap
+        assert reachable_cap(_both_ends(browse_settings)) == 6
+        assert both_ends_cap(browse_settings) == 10   # 2*6 - 1*2
+
+    def test_in_window_node_walks_both_ends(self, browse_settings):
+        walks, need = plan_walks("N-5yc1vZzv", "M", 8, {}, _both_ends(browse_settings))
+        assert need == []
+        assert len(walks) == 1 and walks[0].both_ends is True
+
+    def test_at_or_under_reachable_cap_stays_a_single_walk(self, browse_settings):
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 6, {}, _both_ends(browse_settings))
+        assert len(walks) == 1 and walks[0].both_ends is False
+
+    def test_over_both_ends_cap_still_splits(self, browse_settings):
+        # total 20 > cap 10: no facets given, so it falls to a truncated head —
+        # NOT a both-ends walk.
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 20, {}, _both_ends(browse_settings))
+        assert walks[0].both_ends is False and walks[0].truncated is True
+
+    def test_flag_off_never_walks_both_ends(self, browse_settings):
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 8, {}, browse_settings)  # flag default off
+        assert all(not w.both_ends for w in walks)
+
+
+class TestWalkRouting:
+    """Every plan_walks decision emits one routing line. Split parents never
+    write a page 0, so this line is the archive's only record of a parent
+    node's total and route — the drift detector for both-ends eligibility."""
+
+    def _routes(self, logs):
+        return [(e["label"], e["branch"]) for e in logs
+                if e["event"] == "Walk routing"]
+
+    def test_single_bothends_and_category_branches(self, browse_settings):
+        from structlog.testing import capture_logs
+        s = _both_ends(browse_settings)
+        dims = parse_dimensions(
+            make_page([], 20, dims=[cat_dim(("Big", "big", 12), ("Sm", "sm", 3))]))
+        with capture_logs() as logs:
+            plan_walks("N-1", "Small", 5, {}, s)
+            plan_walks("N-2", "Band", 8, {}, s)
+            plan_walks("N-3", "Split", 20, dims, s)
+        assert self._routes(logs) == [
+            ("Small", "single"), ("Band", "both-ends"), ("Split", "category-split")]
+        caps = [(e["cap"], e["band_cap"]) for e in logs if e["event"] == "Walk routing"]
+        assert caps == [(6, 10)] * 3
+
+    def test_price_and_truncated_branches(self, browse_settings):
+        from structlog.testing import capture_logs
+        price_dims = parse_dimensions(
+            make_page([], 10, dims=[price_dim(("$0-$10", "p1", 4), ("$10+", "p2", 6))]))
+        deep_dims = parse_dimensions(make_page([], 100, dims=[cat_dim(("X", "x", 100))]))
+        with capture_logs() as logs:
+            plan_walks("N-4", "Priced", 10, price_dims, browse_settings)
+            plan_walks("N-5", "Bare", 100, {}, browse_settings)
+            plan_walks("N-6", "Deep", 100, deep_dims, browse_settings,
+                       depth=browse_settings.browse_max_split_depth)
+        assert self._routes(logs) == [
+            ("Priced", "price-split"), ("Bare", "truncated-no-facet"),
+            ("Deep", "truncated-depth")]
+
+    def test_zero_total_routes_nothing(self, browse_settings):
+        from structlog.testing import capture_logs
+        with capture_logs() as logs:
+            plan_walks("N-7", "Empty", 0, {}, browse_settings)
+        assert self._routes(logs) == []
+
+
+class TestBothEndsWalk:
+    def _router(self, settings, desc_sequence):
+        """Serve 8 price-ranked items; DESC order chosen by the test."""
+        asc = [str(i) for i in range(8)]
+        def router(v):
+            order = v["orderBy"]["order"]
+            si = v["startIndex"]
+            seq = asc if order == "ASC" else desc_sequence
+            return make_page([make_product(i) for i in seq[si:si + settings.page_size]], 8)
+        return router
+
+    async def test_union_covers_the_node_no_double_snapshots(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.db.models import Product, StoreSnapshot
+        s = _both_ends(browse_settings)
+        await base.init_db(s)
+        # DESC reaches the dear end (7..0), so cheap-6 ∪ dear-6 = all 8.
+        client = FakeClient(self._router(s, [str(i) for i in reversed(range(8))]))
+        seen: set[str] = set()
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 8, both_ends=True)
+        upserts, inserts = await walk_and_capture(
+            client, s, walk, "2619", "IN_STORE", seen, ["Milwaukee"])
+
+        assert walk.truncated is False          # union == total, full coverage
+        assert seen == {str(i) for i in range(8)}
+        assert inserts == 8                     # every item snapshotted exactly once
+        async with base.get_session(s) as session:
+            snaps = (await session.execute(select(StoreSnapshot))).scalars().all()
+            prods = (await session.execute(select(Product))).scalars().all()
+        assert len({sn.item_id for sn in snaps}) == 8     # no duplicate snapshot rows
+        assert len(snaps) == 8
+        assert len(prods) == 8
+
+    async def test_seam_gap_marks_truncated_not_silent(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = _both_ends(browse_settings)
+        await base.init_db(s)
+        # Degenerate DESC returns the SAME cheap items, so the union is only {0..5}
+        # of a claimed 8 — a seam gap. Must surface as truncated, never silent.
+        client = FakeClient(self._router(s, [str(i) for i in range(8)]))
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 8, both_ends=True)
+        await walk_and_capture(
+            client, s, walk, "2619", "IN_STORE", set(), ["Milwaukee"])
+        assert walk.truncated is True
+
+
+class TestBothEndsCostAndCorrectness:
+    def _settings(self, browse_settings, **over):
+        s = _both_ends(browse_settings)
+        s.api_max_start_index = 20        # reachable_cap = 22, room to page
+        s.both_ends_confirm_pages = 2
+        for k, v in over.items():
+            setattr(s, k, v)
+        return s
+
+    def _router(self, settings, n_items, total=None):
+        total = n_items if total is None else total
+        asc = [str(i) for i in range(n_items)]
+        def router(v):
+            si = v["startIndex"]
+            seq = asc if v["orderBy"]["order"] == "ASC" else asc[::-1]
+            return make_page(
+                [make_product(i) for i in seq[si:si + settings.page_size]], total)
+        return router
+
+    async def test_desc_stops_early_so_both_ends_beats_a_full_walk(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = self._settings(browse_settings)         # cap 22, margin 1 → both_ends_cap 42
+        await base.init_db(s)
+        # 30 items in the band. ASC = 11 pages (cheapest 22); DESC needs only the
+        # dear 8, reaching full coverage at page 3, +2 confirm = 6 pages. So 17
+        # requests, not 22 if DESC ran to the ceiling. This is the fix that makes
+        # both-ends cheaper than the split it replaces.
+        client = FakeClient(self._router(s, 30))
+        walk = Walk("N", "M", 30, both_ends=True)
+        await walk_and_capture(client, s, walk, "2619", "IN_STORE", set(), ["Milwaukee"])
+        assert walk.truncated is False
+        assert client._count == 17                  # 11 ASC + 6 DESC (early-stopped)
+
+    async def test_assertion_uses_live_total_not_stale_planned(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = self._settings(browse_settings, api_max_start_index=4)  # reachable 6, cap 10
+        await base.init_db(s)
+        # planned=6 (stale), live=10, but only 8 distinct items ever return — a
+        # real 2-item gap. Judging against planned 6 would pass 8≥6 as complete;
+        # the live-total denominator must catch 8<10.
+        client = FakeClient(self._router(s, 8, total=10))
+        walk = Walk("N", "M", 6, both_ends=True)    # planned < live
+        await walk_and_capture(client, s, walk, "2619", "IN_STORE", set(), ["Milwaukee"])
+        assert walk.truncated is True
+
+    async def test_node_grown_past_cap_is_truncated_even_if_covered(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = self._settings(browse_settings, api_max_start_index=4)  # reachable 6, cap 10
+        await base.init_db(s)
+        # 12 items, live total 12 > both_ends_cap 10: two ends happen to cover all
+        # 12, but the node has outgrown its eligibility, so don't trust it clean.
+        client = FakeClient(self._router(s, 12, total=12))
+        walk = Walk("N", "M", 8, both_ends=True)
+        await walk_and_capture(client, s, walk, "2619", "IN_STORE", set(), ["Milwaukee"])
+        assert walk.truncated is True
+
+    async def test_throttle_after_asc_marks_truncated(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = self._settings(browse_settings)         # api_max 20, so throttle beats the ceiling
+        await base.init_db(s)
+        calls = {"n": 0}
+        page = make_page([make_product("0"), make_product("1")], 40)
+
+        class ThrottleAfterAsc:
+            def __init__(self): self._count = 0
+            @property
+            def is_throttled(self): return calls["n"] > 3   # throttle a few pages in
+            async def post_graphql(self, v):
+                self._count += 1
+                calls["n"] += 1
+                return page
+
+        walk = Walk("N", "M", 30, both_ends=True)
+        await walk_and_capture(ThrottleAfterAsc(), s, walk, "2619", "IN_STORE", set(), ["Milwaukee"])
+        assert walk.truncated is True               # ASC-only half-coverage is not clean
+
+    async def test_understated_total_self_extends_no_silent_gap(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = self._settings(browse_settings)         # api_max 20 (reachable 22), cap 42
+        await base.init_db(s)
+        # 30 real items, but HD understates totalProducts as 24. A FIXED 2-page
+        # window would stop DESC at 28 seen (24 + 48 slack) and the assertion
+        # would pass on the wrong count — a silent gap. The adaptive window keeps
+        # going while pages still yield new ids, so all 30 are fetched.
+        client = FakeClient(self._router(s, 30, total=24))
+        seen: set[str] = set()
+        walk = Walk("N", "M", 24, both_ends=True)
+        _, inserts = await walk_and_capture(
+            client, s, walk, "2619", "IN_STORE", seen, ["Milwaukee"])
+        assert seen == {str(i) for i in range(30)}  # nothing left behind the stale count
+        assert inserts == 30
+        assert walk.truncated is False              # covered 30 ≥ denom 24
+
+
 # ---------------------------------------------------------------- full-walk hours
 
 class TestFullShelfHours:
@@ -679,3 +902,68 @@ class TestRunBrowse:
         browse_settings.brand_tokens = ""
         summary = await run_browse(browse_settings, client=FakeClient(lambda v: make_page([], 0)))
         assert summary.snapshots == 0
+
+
+# ---------------------------------------------------------------- shelf category walks
+
+class TestShelfCategoryWalks:
+    """Store-wide category nodes (the grill wall): every brand captured,
+    walked on every shelf pass, outside rotation."""
+
+    def test_config_parses_label_token_pairs(self):
+        s = Settings(shelf_category_walks="Grills:bxaz, Outdoor-Cookers:cd1m,junk,:x,y:")
+        assert s.shelf_category_walk_list == [("Grills", "bxaz"), ("Outdoor-Cookers", "cd1m")]
+
+    async def test_all_brands_walk_captures_every_brand(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.db.models import Product
+
+        await base.init_db(browse_settings)
+        page = make_page(
+            [make_product("501", brand="Weber"), make_product("502", brand="Traeger")], 2
+        )
+
+        def router(v):
+            return page if v["startIndex"] == 0 else make_page([], 2)
+
+        client = FakeClient(router)
+        walk = Walk("N-5yc1vZbxaz", "Grills", 2, all_brands=True)
+        upserts, inserts = await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert upserts == 2 and inserts == 2
+
+        async with base.get_session(browse_settings) as session:
+            brands = {p.brand for p in (await session.execute(select(Product))).scalars()}
+        assert brands == {"Weber", "Traeger"}
+
+    async def test_shelf_tier_runs_category_walks_after_brand_walks(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.db.models import Product
+
+        await base.init_db(browse_settings)
+        browse_settings.shelf_category_walks = "Grills:bxaz"
+
+        def router(v):
+            nav, start = v["navParam"], v["startIndex"]
+            if nav == "N-5yc1vZzv":
+                return make_page([make_product("111")], 1) if start == 0 else make_page([], 1)
+            if nav == "N-5yc1vZbxaz":
+                if start == 0:
+                    return make_page(
+                        [make_product("501", brand="Weber"),
+                         make_product("502", brand="Traeger")], 2
+                    )
+                return make_page([], 2)
+            raise AssertionError(f"unexpected nav {nav}")
+
+        client = FakeClient(router)
+        summary = await run_browse(browse_settings, client=client, tiers=("shelf",))
+
+        assert summary.walks == 2
+        assert summary.products == 3 and summary.snapshots == 3
+        async with base.get_session(browse_settings) as session:
+            brands = {p.brand for p in (await session.execute(select(Product))).scalars()}
+        assert brands == {"Milwaukee", "Weber", "Traeger"}

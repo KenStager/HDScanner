@@ -29,6 +29,22 @@ from hd.logging import get_logger
 log = get_logger("http.client")
 
 
+def _observe_response(status: int, response: object, context: dict) -> None:
+    """Hand an unusual response to an optional diagnostics sink, if one is present.
+
+    A convention like the CLI's plugin seam: a stock clone has no such module and
+    neither knows nor cares that one can exist. Never raises into the request path.
+    """
+    try:
+        from hd.plugins.diagnostics import on_response
+    except Exception:
+        return
+    try:
+        on_response(status, response, context)
+    except Exception:
+        pass
+
+
 # Headers the federation gateway needs to route the request. These are API
 # parameters, not browser emulation: the gateway selects a schema from
 # x-experience-name and a datacentre from x-hd-dc.
@@ -69,7 +85,26 @@ def build_user_agent(settings: Settings) -> str:
 
 
 def build_headers(settings: Settings) -> dict[str, str]:
-    return {**API_HEADERS, "User-Agent": build_user_agent(settings)}
+    headers = {**API_HEADERS, "User-Agent": build_user_agent(settings)}
+    return _apply_header_override(headers, settings)
+
+
+def _apply_header_override(
+    headers: dict[str, str], settings: Settings
+) -> dict[str, str]:
+    """Apply an optional private header policy; honest defaults if none is present.
+
+    Same convention as the CLI's plugin seam: a stock clone has no such module,
+    so it sends exactly the honest headers above. Never raises into the request.
+    """
+    try:
+        from hd.plugins.headers import override_headers
+    except Exception:
+        return headers
+    try:
+        return override_headers(headers, settings)
+    except Exception:
+        return headers
 
 
 def header_lines(settings: Settings) -> list[str]:
@@ -357,7 +392,17 @@ class HDClient:
                 self._circuit_breaker.record_failure()
                 return self._fail("oversize_response")
 
+            refusal_context = {
+                "request_index": self._request_count,
+                "attempt": attempt,
+                "nav_param": variables.get("navParam"),
+                "start_index": variables.get("startIndex"),
+                "page_size": variables.get("pageSize"),
+                "storefilter": variables.get("storefilter"),
+            }
+
             if status_code == 403:
+                _observe_response(status_code, response, refusal_context)
                 # A refusal ends the run. Pausing 30s and moving to the next
                 # walk meant answering "no" by asking again 51 more times;
                 # the circuit breaker caught it at ten, but only after ten.
@@ -374,6 +419,7 @@ class HDClient:
                 return self._fail("http_403")
 
             if status_code == 206:
+                _observe_response(status_code, response, refusal_context)
                 self._throttled = True
                 until = self._cooldown.start(retry_after)
                 log.warning(
@@ -406,6 +452,7 @@ class HDClient:
             # so being turned away looked like a glitch worth retrying.
             content_type = response.header("Content-Type") or ""
             if "html" in content_type.lower() or body.lstrip()[:1] == "<":
+                _observe_response(status_code, response, refusal_context)
                 self._metrics.records[-1] = replace(
                     self._metrics.records[-1], outcome="challenge_html"
                 )
@@ -448,8 +495,21 @@ class HDClient:
                 # request, and leaving it out of the tally made health checks
                 # read cleaner than the run actually was.
                 self._count_failure("api_error")
+                # An origin-certain payload (graphql-java parsed our variables):
+                # the diagnostics sink keeps these to settle the edge/origin
+                # question. Guarded and no-op without the private overlay.
+                _observe_response(
+                    status_code, response, {**refusal_context, "outcome": "api_error"}
+                )
                 return data  # Return raw error for upstream inspection
 
+            # Hand successful responses to the sink too, so it can bank a
+            # header baseline (which headers a normal 200 even carries). The
+            # sink keeps only the first per run; ordinary 200s are dropped
+            # there, not here, so the request path is unchanged.
+            _observe_response(
+                status_code, response, {**refusal_context, "outcome": "ok"}
+            )
             self._circuit_breaker.record_success()
             return data
 

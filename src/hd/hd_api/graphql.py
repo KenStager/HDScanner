@@ -44,6 +44,7 @@ async def search(
     start_index: int = 0,
     page_size: int = 24,
     storefilter: str = "ALL",
+    order_by: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Execute a searchModel GraphQL query and return raw JSON response."""
     variables: dict[str, Any] = {
@@ -62,7 +63,7 @@ async def search(
             "multiStoreIds": [],
         },
         "filter": {},
-        "orderBy": {"field": "BEST_MATCH", "order": "ASC"},
+        "orderBy": order_by or {"field": "BEST_MATCH", "order": "ASC"},
         "pageSize": page_size,
         "startIndex": start_index,
     }

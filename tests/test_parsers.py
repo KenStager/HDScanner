@@ -27,6 +27,40 @@ class TestParseProducts:
         assert p.item_id == "312345679"
         assert "M12 FUEL" in p.title
 
+    def test_parses_upc_when_present(self):
+        """The UPC is what joins a Home Depot item to a catalogue elsewhere."""
+        raw = {"data": {"searchModel": {"products": [{
+            "itemId": "320326855",
+            "identifiers": {
+                "brandName": "Milwaukee",
+                "productLabel": "M18 FUEL Hammer Drill/Driver",
+                "modelNumber": "2904-20",
+                "upc": "045242637720",
+            },
+        }]}}}
+        p = parse_products(raw)[0]
+        assert p.upc == "045242637720"
+        assert p.model_number == "2904-20"
+
+    def test_missing_upc_is_none_not_an_error(self):
+        """A store-composed bundle need not carry a manufacturer UPC.
+
+        Absent is a legitimate answer here, so it must not cost us the rest of
+        the product — the parse has to survive it and keep every other field.
+        """
+        raw = {"data": {"searchModel": {"products": [{
+            "itemId": "999",
+            "identifiers": {
+                "brandName": "Milwaukee",
+                "productLabel": "M18 FUEL Combo Kit w/ Bonus Battery",
+                "modelNumber": "3697-22-48-11-1850",
+            },
+        }]}}}
+        p = parse_products(raw)[0]
+        assert p.upc is None
+        assert p.model_number == "3697-22-48-11-1850"
+        assert p.brand == "Milwaukee"
+
     def test_handles_empty_response(self):
         products = parse_products({})
         assert products == []

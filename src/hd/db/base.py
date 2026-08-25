@@ -24,6 +24,7 @@ log = get_logger("db.base")
 # applied by hand for databases predating each addition.
 _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("products", "image_url", "TEXT"),
+    ("products", "upc", "VARCHAR(20)"),
     ("stores", "city", "VARCHAR(100)"),
     ("store_snapshots", "clearance_value", "NUMERIC(10,2)"),
     ("store_snapshots", "clearance_dollar_off", "NUMERIC(10,2)"),

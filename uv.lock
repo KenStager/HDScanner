@@ -478,7 +478,7 @@ wheels = [
 
 [[package]]
 name = "hd-clearance-monitor"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -495,6 +495,7 @@ dashboard = [
     { name = "nicegui" },
 ]
 dev = [
+    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-mock" },
@@ -507,7 +508,8 @@ postgres = [
 requires-dist = [
     { name = "aiosqlite" },
     { name = "alembic", specifier = ">=1.13" },
-    { name = "asyncpg", marker = "extra == 'postgres'" },
+    { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29" },
+    { name = "httpx", marker = "extra == 'dev'" },
     { name = "nicegui", marker = "extra == 'dashboard'", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'" },

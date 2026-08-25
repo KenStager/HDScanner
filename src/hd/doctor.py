@@ -188,8 +188,20 @@ def check_liveness(settings: Settings) -> Iterable[Check]:
 
 
 def check_identity(settings: Settings) -> Iterable[Check]:
-    if settings.contact_email:
-        yield Check("identity", OK, f"requests identify as {settings.user_agent} (+{settings.contact_email})")
+    # Report the User-Agent that actually goes on the wire, not the configured
+    # one — a header policy can override it, and doctor must not claim an
+    # identity the requests do not carry.
+    from hd.http.client import build_headers, build_user_agent
+
+    wire_ua = build_headers(settings).get("User-Agent", "")
+    honest_ua = build_user_agent(settings)
+
+    if wire_ua != honest_ua:
+        yield Check("identity", WARN,
+                    f"requests send '{wire_ua}', not the tool identity",
+                    "requests do not carry the tool name or a contact address")
+    elif settings.contact_email:
+        yield Check("identity", OK, f"requests identify as {wire_ua}")
     else:
         yield Check("identity", WARN,
                     "no contact address on requests — nobody at Home Depot can reach you",

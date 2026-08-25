@@ -31,6 +31,7 @@ def _deal(
     deal_age_ts: datetime | None = None,
     product_url: str = "https://www.homedepot.com/p/123",
     item_id: str = "123",
+    discount_observed: bool = True,
 ) -> dict:
     return {
         "item_id": item_id,
@@ -42,6 +43,7 @@ def _deal(
         "deal_type": deal_type,
         "effective_price": effective_price,
         "effective_discount_pct": effective_discount_pct,
+        "discount_observed": discount_observed,
         "in_stock": in_stock,
         "inventory_qty": inventory_qty,
         "deal_age_ts": deal_age_ts or datetime(2026, 3, 20, tzinfo=timezone.utc),
@@ -104,6 +106,20 @@ class TestFormatDealLine:
         assert "$98.10" in line
         assert "51% off" in line
         assert "Special Buys" in line
+
+    def test_observed_discount_reads_as_measured(self):
+        d = _deal(deal_type="online", effective_discount_pct=51,
+                  discount_observed=True)
+        assert "51% off" in _format_deal_line(d)
+
+    def test_unobserved_discount_is_labelled_as_hds_claim(self):
+        """When we measured no drop of our own, HD's number must read as a
+        claim — never as a discount we confirmed."""
+        d = _deal(deal_type="online", effective_discount_pct=47,
+                  discount_observed=False)
+        line = _format_deal_line(d)
+        assert "HD claims 47%" in line
+        assert "47% off" not in line
 
     def test_title_is_linked(self):
         d = _deal(title="Test Tool", product_url="https://www.homedepot.com/p/123")

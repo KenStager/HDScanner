@@ -51,6 +51,12 @@ class Product(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # The manufacturer's UPC, as the API reports it. Kept beside model_number
+    # because the two answer different questions: model_number is how a human
+    # or a specialist retailer names the thing, upc is how a machine joins it
+    # to a catalogue that has never heard of Home Depot. Nullable on purpose —
+    # a store-composed bundle need not have one.
+    upc: Mapped[str | None] = mapped_column(String(20), nullable=True)
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

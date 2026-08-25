@@ -106,9 +106,10 @@ x-debug: false
 **In-store clearance:** visible only per item via `pricing.clearance{value dollarOff percentageOff}`; `storefilter=IN_STORE` equals the BOPIS "Pick Up Today" facet and hides ship-to-store (BOSS) clearance — the browse network tier (storefilter=ALL) covers those
 
 **To detect clearance in a response:**
-- `pricing.promotion.savingsCenter == "CLEARANCE"`
-- `pricing.promotion.promotionTag == "Clearance"`
-- `pricing.promotion.percentageOff` — the discount depth
+- `pricing.clearance{value dollarOff percentageOff}` — the ONLY working signal (per-store, per-item)
+- ~~`pricing.promotion.savingsCenter == "CLEARANCE"`~~ — **verified dead (2026-08):** never once observed across 78k+ snapshots; do not use
+- ~~`pricing.promotion.promotionTag == "Clearance"`~~ — **verified dead (2026-08):** `promotionTag` is NULL in every snapshot; do not use
+- `pricing.promotion.percentageOff` — the discount depth (HD's claim, not a measurement of ours)
 
 **To get store-level inventory:**
 - Navigate: `fulfillment.fulfillmentOptions[].services[].locations[]`
@@ -131,13 +132,20 @@ Run migrations: `hd init-db`
 ## CLI Commands Quick Reference
 
 ```
+hd setup                              # interactive first-run: find stores and brands, write .env, schedule jobs
 hd init-db                            # create/migrate tables + seed the configured stores
 hd add-store <id> [--name] [--state]  # add a store
 hd browse [--stores] [--tier]         # facet-driven brand browse: discover+snapshot by category (default strategy)
 hd discover [--brand] [--pages]       # populate products table (legacy keyword mode)
 hd snapshot [--stores] [--limit]      # fetch + store pricing/inventory snapshots (legacy keyword mode)
-hd run-once                           # full pipeline: browse (or discover+snapshot)+diff+alerts
+hd daily-deals                        # price today's Daily Deals set (Special Buy of the Day)
+hd run-once                           # full pipeline: daily-deals+browse (or discover+snapshot)+diff+alerts
+hd catch-up                           # one-time scan: alert on anything currently deeply discounted
 hd alerts [--limit] [--type] [--since]# print recent alerts
+hd notify [--since] [--dry-run]       # send alerts recorded since the cursor to Slack
+hd canvas-update [--dry-run] [--reset]# refresh the persistent Slack canvas rundown
+hd serve [--host] [--port]            # start the NiceGUI web dashboard
+hd doctor                             # check that this installation is wired up correctly
 hd health                             # print last run health status
 hd backfill-stats                     # rebuild item_price_stats from raw snapshots
 hd prune [--days] [--dry-run]         # delete snapshots past retention (guarded)
@@ -150,6 +158,40 @@ average, distinct days observed — are folded into `item_price_stats` as each s
 lands, so they outlive that deletion. `prune` refuses to run while any item's history is
 uncaptured; run `hd backfill-stats` first. Never rebuild the aggregate from
 `store_snapshots` in normal operation — the rows it came from may already be gone.
+
+---
+
+## Outbound Notifications
+
+Results leave the scanner through Slack, in two separate shapes. Both are
+optional: with no `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` configured, the
+scanner records everything to the database and sends nothing.
+
+**Per-alert messages — `hd notify`.** `notifiers/formatter.py` groups recent
+alerts and renders them as Block Kit cards; `notifiers/webhook.py` posts them
+through `chat.postMessage`. A cursor file (`NOTIFY_CURSOR_PATH`) marks what has
+already been sent, so re-running is idempotent — `--since` is only the fallback
+window used when no cursor exists, and `--reset` deliberately re-sends. The
+scheduled job runs `hd run-once && hd notify`, so alerts follow each scan.
+
+**A standing rundown — `hd canvas-update`.** `notifiers/canvas.py` queries the
+latest snapshot state, formats a markdown document grouped by store, and
+creates or updates a Slack canvas in place (capped at 35,000 characters).
+Unlike the alert messages, this is one living document rather than a stream —
+it answers "what is on the shelf right now", not "what changed". `run-once`
+refreshes it as part of a completed scan.
+
+A failure in either path is logged and never fails the scan: the scan is the
+product, and a notification is a convenience on top of it.
+
+**Optional local extensions.** `cli.py` looks for an `hd.plugins` package
+beside it and, if one is present, calls `register(app)` to attach extra
+commands and `post_run_hooks()` after a completed scan; `http/client.py` offers
+matching hooks for response inspection and header policy. Nothing ships with
+such a package and nothing depends on one existing — a stock clone has none and
+behaves identically. **Do not remove these hooks as dead code**; they are a
+deliberate seam, and each is written so that any failure inside it is swallowed
+rather than allowed into a scan.
 
 ---
 
@@ -174,8 +216,6 @@ Do not skip ahead. Each milestone has an acceptance gate that must pass before t
 
 ## What Does NOT Exist Yet
 
-- No notification system (Discord/email hooks exist as config stubs only)
-- No web dashboard (`hd serve` is a future milestone)
 - No job queue (Celery/Redis is future)
 - No multi-user support
 - No stores beyond your configured stores

@@ -215,7 +215,10 @@ def _identity_html(product: dict, hd_url: str) -> str:
 
 
 def _verdict_chip(effective_price: float | None, stats: dict | None) -> str:
-    verdict = store_price_verdict(effective_price, stats)
+    # Same recency bound as the deal board's tier rule, so a low the board
+    # shows as quiet context can never come back as a red warning here.
+    recency = getattr(_state.settings, "warn_low_recency_days", None)
+    verdict = store_price_verdict(effective_price, stats, recency_days=recency)
     if verdict is None:
         return ""
     label, cls = verdict

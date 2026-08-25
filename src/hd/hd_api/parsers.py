@@ -34,6 +34,7 @@ def parse_products(raw_response: dict[str, Any]) -> list[NormalizedProduct]:
                 title=identifiers.get("productLabel"),
                 canonical_url=identifiers.get("canonicalUrl"),
                 model_number=identifiers.get("modelNumber"),
+                upc=identifiers.get("upc"),
                 image_url=image_url,
             ))
         except (AttributeError, TypeError):

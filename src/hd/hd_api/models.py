@@ -13,6 +13,7 @@ class NormalizedProduct:
     title: str | None = None
     canonical_url: str | None = None
     model_number: str | None = None
+    upc: str | None = None
     image_url: str | None = None
 
 

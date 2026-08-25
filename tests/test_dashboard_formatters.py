@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from hd.dashboard.components.formatters import (
@@ -475,6 +475,28 @@ class TestStorePriceVerdict:
         label, cls = store_price_verdict(169.00, self._stats(99.00, 169.00))
         assert label.startswith("seen $99.00")
         assert "May 10" in label
+        assert cls == "above"
+
+    def test_stale_low_demotes_to_context_under_the_recency_bound(self):
+        """Same words, quieter dress — mirroring deal_tier's rule, so the
+        product page can never dress as a red warning a low the board shows
+        as dated context."""
+        old = self._stats(99.00, 169.00,
+                          low_ts=datetime.now(timezone.utc) - timedelta(days=100))
+        label, cls = store_price_verdict(169.00, old, recency_days=45)
+        assert label.startswith("seen $99.00")
+        assert cls == "context"
+
+    def test_recent_low_keeps_the_warning_dress(self):
+        fresh = self._stats(99.00, 169.00,
+                            low_ts=datetime.now(timezone.utc) - timedelta(days=10))
+        _, cls = store_price_verdict(169.00, fresh, recency_days=45)
+        assert cls == "above"
+
+    def test_no_recency_bound_keeps_the_old_behavior(self):
+        old = self._stats(99.00, 169.00,
+                          low_ts=datetime.now(timezone.utc) - timedelta(days=100))
+        _, cls = store_price_verdict(169.00, old)
         assert cls == "above"
 
     def test_flat_history_is_dated(self):

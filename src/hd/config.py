@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     product_line_filters: str = ""
     tools_nav_param: str = "N-5yc1vZc1xy"
     extra_nav_params: str = ""  # Additional category navParams (CSV), no product_line_filter applied
+    shelf_category_walks: str = ""  # CSV of Label:token — store-wide category nodes walked every shelf pass, every brand captured
     clearance_token: str = "1z11adf"
     max_concurrency: int = 3
     # Tokens available at the start of a run. At the previous value (which
@@ -76,9 +77,31 @@ class Settings(BaseSettings):
     brand_tokens: str = ""                    # CSV of Brand:facet-token, written by `hd setup`
     api_max_start_index: int = 720            # API rejects startIndex > 720 ("Invalid start index range")
     browse_network_categories_per_run: int = 3  # ALL-tier categories walked per store per run
+    # Per-hour tier assignment (US Eastern, CSV). Empty = every run does every
+    # tier (the original behaviour). When set, the IN_STORE shelf tier runs only
+    # at these hours and the ALL/online tier runs at all other scan hours, so the
+    # store can be spread across a couple of runs and the rest spent online.
+    browse_shelf_hours_et: str = ""
     browse_cursor_path: str = ".hd_browse_cursor"
     browse_request_budget: int = 280          # replaces request_budget for browse runs
     browse_max_split_depth: int = 3           # facet-split recursion guard
+    # Both-ends paging: walk a mid-size node from both price ends (orderBy PRICE
+    # ASC + DESC) instead of facet-splitting it, lifting reach from one cap to
+    # ~two and collapsing a split into one walk. OFF by default — a staged,
+    # observed rollout, guarded at runtime by a union-coverage assertion that
+    # marks any seam gap as truncated (never a silent under-cover). A node is
+    # eligible when its total is in (reachable_cap, both_ends_cap], where
+    # both_ends_cap = 2*reachable_cap - both_ends_min_overlap_pages*page_size.
+    # min_overlap 8 keeps ~8 pages of ASC/DESC overlap (cap ~1296) — the safe
+    # default; lower to ~5 (cap ~1368) to also fold in the ~1.36k shelf once the
+    # assertion has confirmed coverage holds.
+    both_ends_paging: bool = False
+    both_ends_min_overlap_pages: int = 8
+    # Once the second (DESC) pass has seen every item (coverage == live total),
+    # walk this many more pages as confirmation, then stop — so a both-ends walk
+    # costs ~size, not a flat 2×ceiling, and beats the split it replaces across
+    # the whole band. Safe because coverage==total already proves completeness.
+    both_ends_confirm_pages: int = 2
     # Fraction of shelf categories walked per run. The shelf tier costs a fixed
     # ~154 page requests every run, six runs a day, to re-read categories that
     # mostly have not changed. At 0.5 each category is seen every other run for
@@ -102,6 +125,9 @@ class Settings(BaseSettings):
     # so the 3:10 ET scheduled run captures the fresh set minutes after launch.
     daily_deals_enabled: bool = True
     daily_deals_url: str = "https://www.homedepot.com/daily-deals"
+    # Hours (US Eastern, CSV) the daily-deals sweep runs. Empty = every run (the
+    # original behaviour); the set is skipped once seen, so extra runs are cheap.
+    daily_deals_hours_et: str = ""
     daily_deals_cursor_path: str = ".hd_dailydeals_cursor"
     daily_deals_max_items: int = 250
     # Items in the day's set that we have never seen are skipped by default:
@@ -128,6 +154,18 @@ class Settings(BaseSettings):
     # scored against whatever the catalog looked like before the gap.
     deal_history_window_days: int = 90
 
+    # How long a witnessed low keeps its warning teeth. A "deal" priced above
+    # a low we recorded recently is warned — the reader could plausibly have
+    # had the better price, and might get it again. Past this age the low
+    # stops overruling a real measured drop (deal_tier lets verified evidence
+    # outrank it) and rides the card as a dated context chip instead. The
+    # durable low never expires, so without this bound every recurring promo
+    # eventually sits above some ancient dip and the warning channel numbs —
+    # a warning anchored to a months-old price is a cried wolf. Bounded
+    # below: zero or negative would silently disable every dated-low
+    # warning, and this is the sole dial on a load-bearing honesty behavior.
+    warn_low_recency_days: int = Field(default=45, ge=1)
+
     # Inter-keyword pacing
     keyword_pause_min_seconds: float = 3.0
     keyword_pause_max_seconds: float = 8.0
@@ -141,6 +179,10 @@ class Settings(BaseSettings):
     # contact_email so a human there can reach a human here.
     user_agent: str = "HDClearanceMonitor/0.1"
     contact_email: str = ""
+    # Optional named header profile. Blank keeps the honest identity above; a
+    # local override module may recognise other values. Public installs leave it
+    # blank and send the tool identity.
+    header_profile: str = ""
 
     # Request limits. There is no connection pooling: the API refuses Python
     # HTTP clients outright, so every request is its own curl process.
@@ -289,4 +331,14 @@ class Settings(BaseSettings):
             brand, sep, token = entry.partition(":")
             if sep and brand.strip() and token.strip():
                 pairs.append((brand.strip(), token.strip()))
+        return pairs
+
+    @property
+    def shelf_category_walk_list(self) -> list[tuple[str, str]]:
+        """Parse shelf_category_walks CSV into (label, facet_token) pairs, skipping malformed entries."""
+        pairs = []
+        for entry in _parse_csv(self.shelf_category_walks):
+            label, sep, token = entry.partition(":")
+            if sep and label.strip() and token.strip():
+                pairs.append((label.strip(), token.strip()))
         return pairs
