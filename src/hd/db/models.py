@@ -266,7 +266,17 @@ class WalkCoverage(Base):
     # Distinct itemIds the API returned across the walk's pages, before any
     # brand filter — what the walk SAW, not what it chose to keep.
     items_observed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # The node's API address — the only stable identity a walk has. `label` is
+    # a display string built as "<parent>/<facet label or raw token>", so it
+    # falls back to the token when HD omits a label and the SAME node can carry
+    # two different labels across runs. Anything that needs to recognise a node
+    # again — resuming a part-walked category, learning that a node's reported
+    # count was wrong — has to key on this, not on the label.
+    # Nullable: rows written before this column existed have no value, and
+    # backfilling one would be inventing a fact we did not record.
+    nav_param: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     __table_args__ = (
         Index("ix_walk_coverage_run", "run_id"),
+        Index("ix_walk_coverage_nav", "nav_param"),
     )

@@ -85,6 +85,31 @@ class Settings(BaseSettings):
     browse_cursor_path: str = ".hd_browse_cursor"
     browse_request_budget: int = 280          # replaces request_budget for browse runs
     browse_max_split_depth: int = 3           # facet-split recursion guard
+    # Admission ceiling for starting a new walk. A walk whose estimated cost
+    # would carry the run past this many requests is deferred to the next run
+    # instead of being started and then cut mid-page by the quota stop. The
+    # distinction matters downstream: a walk cut in flight is recorded
+    # "truncated" and can never ground an absence claim, while a walk never
+    # attempted writes no coverage row at all — "not attempted is not evidence
+    # either". Deferring therefore trades raw rows for trustworthy coverage.
+    #
+    # 0 falls back to browse_request_budget, i.e. the check only guards against
+    # our own hard budget. To buy anything against the API's quota stop this
+    # must be set BELOW the depth at which that stop actually lands, which is
+    # an installation-specific measurement (it moves with the header profile
+    # and the request rate) — hence no shipped default. Derive it from
+    # scan_runs: the request_used of runs whose status is "aborted".
+    browse_walk_admission_ceiling: int = 0
+    # A node walked to "complete" within this many hours is skipped when its
+    # category is re-resolved, so a category too big for one run RESUMES
+    # instead of restarting. Without it the cursor cannot advance past such a
+    # category (it only advances on a finished one), so every subsequent run
+    # re-walks the same prefix forever — measured on this install as one
+    # category walked 157 times while its siblings were walked once each.
+    # Should be a little under the time it takes the rotation to come round,
+    # so a category is refreshed once per cycle rather than re-read per run.
+    # 0 disables resume entirely and restores the restart behaviour.
+    browse_walk_refresh_hours: int = 20
     # Both-ends paging: walk a mid-size node from both price ends (orderBy PRICE
     # ASC + DESC) instead of facet-splitting it, lifting reach from one cap to
     # ~two and collapsing a split into one walk. OFF by default — a staged,

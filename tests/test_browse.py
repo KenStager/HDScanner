@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +12,9 @@ from hd.config import Settings
 from hd.hd_api.parsers import parse_dimensions
 from hd.pipeline.browse import (
     Walk,
+    admission_ceiling,
+    admits,
+    both_ends_cap,
     effective_shelf_fraction,
     full_shelf_hours,
     rotate_shelf_walks,
@@ -20,6 +24,7 @@ from hd.pipeline.browse import (
     resolve_walks,
     run_browse,
     walk_and_capture,
+    walk_cost_estimate,
 )
 
 
@@ -119,6 +124,11 @@ class FakeClient:
 @pytest.fixture
 def browse_settings(tmp_path) -> Settings:
     return Settings(
+        # Do NOT inherit the operator's untracked .env: it carries
+        # both_ends_paging, an admission ceiling, SHELF_CATEGORY_WALKS and a
+        # shelf fraction, so without this these tests mean something different
+        # on this machine than on a fresh clone.
+        _env_file=None,
         database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
         stores="2619",
         brands="Milwaukee",
@@ -1090,3 +1100,592 @@ class TestCoverageRecords:
             walks = (await session.execute(select(WalkCoverage))).scalars().all()
         assert len(runs) == 1 and runs[0].status == "aborted"
         assert walks == []  # nothing attempted, nothing claimed
+
+
+class TestWalkAdmission:
+    """Budget-aware admission: never start a walk the run cannot finish.
+
+    A walk cut in flight is recorded "truncated" and can never ground an
+    absence claim; a walk never attempted writes no coverage row at all. So
+    deferring is strictly better than overreaching, and these tests pin the
+    arithmetic that decides which happens.
+    """
+
+    class _Spent:
+        """Client stand-in — only request_count reaches admits()."""
+
+        def __init__(self, n: int) -> None:
+            self._n = n
+
+        @property
+        def request_count(self) -> int:
+            return self._n
+
+    # ---- the estimate ---------------------------------------------------
+
+    def test_estimate_is_bounded_by_what_the_walk_can_reach(self, browse_settings):
+        # page_size=2, api_max_start_index=4 → reachable cap 6. A 100-item node
+        # cannot be paged past that ceiling, so it costs 3 pages + 1 facet read,
+        # NOT 50 pages. Getting this wrong would defer every large walk forever.
+        assert reachable_cap(browse_settings) == 6
+        assert walk_cost_estimate(Walk("n", "l", 100), browse_settings) == 4
+
+    def test_estimate_of_a_small_node_counts_only_its_own_pages(self, browse_settings):
+        assert walk_cost_estimate(Walk("n", "l", 4), browse_settings) == 3
+
+    def test_both_ends_estimate_assumes_both_directions_run_full(self, browse_settings):
+        """Both-ends must be sized on the worst case, which happens routinely.
+
+        ASC always runs to the API ceiling; DESC stops early ONLY when the
+        union reaches the live total, so every coverage shortfall costs a full
+        second direction. Production logs show that shortfall firing on about
+        half of all both-ends walks, so it is the normal case, not the tail.
+        """
+        browse_settings.both_ends_min_overlap_pages = 1
+        per_direction = browse_settings.api_max_start_index // browse_settings.page_size + 1
+        assert per_direction == 3
+        # 2 directions x 3 pages, + 1 facet read — regardless of node size.
+        assert walk_cost_estimate(
+            Walk("n", "l", 8, both_ends=True), browse_settings) == 7
+        assert walk_cost_estimate(
+            Walk("n", "l", 999, both_ends=True), browse_settings) == 7
+
+    def test_both_ends_never_takes_the_primed_discount(self, browse_settings):
+        """_page_direction reuses a primed page only when order_by is None.
+
+        Both-ends always passes a price ordering, so the primed page is never
+        consumed and discounting for it under-estimates every both-ends walk.
+        """
+        primed = Walk("n", "l", 999, both_ends=True, primed={"any": "page"})
+        plain = Walk("n", "l", 999, both_ends=True)
+        assert walk_cost_estimate(primed, browse_settings) == walk_cost_estimate(
+            plain, browse_settings)
+
+    def test_a_primed_walk_does_not_pay_for_a_facet_read(self, browse_settings):
+        primed = Walk("n", "l", 4, primed={"any": "page"})
+        assert walk_cost_estimate(primed, browse_settings) == 2
+
+    # ---- the ceiling ----------------------------------------------------
+
+    def test_ceiling_falls_back_to_the_request_budget_when_unset(self, browse_settings):
+        browse_settings.browse_walk_admission_ceiling = 0
+        browse_settings.browse_request_budget = 280
+        assert admission_ceiling(browse_settings) == 280
+
+    def test_explicit_ceiling_overrides_the_request_budget(self, browse_settings):
+        browse_settings.browse_walk_admission_ceiling = 237
+        browse_settings.browse_request_budget = 280
+        assert admission_ceiling(browse_settings) == 237
+
+    # ---- the decision ---------------------------------------------------
+
+    def test_admits_a_walk_that_fits(self, browse_settings):
+        browse_settings.browse_walk_admission_ceiling = 20
+        walk = Walk("n", "l", 4)                      # costs 3
+        assert admits(self._Spent(10), browse_settings, walk) is True
+
+    def test_defers_a_walk_that_would_overrun_the_ceiling(self, browse_settings):
+        browse_settings.browse_walk_admission_ceiling = 20
+        walk = Walk("n", "l", 4)                      # costs 3, only 2 left
+        assert admits(self._Spent(18), browse_settings, walk) is False
+
+    def test_admits_exactly_at_the_boundary(self, browse_settings):
+        browse_settings.browse_walk_admission_ceiling = 20
+        walk = Walk("n", "l", 4)                      # costs 3, exactly 3 left
+        assert admits(self._Spent(17), browse_settings, walk) is True
+
+    # ---- the starvation guard -------------------------------------------
+
+    @staticmethod
+    def _oversized(settings) -> Walk:
+        """A walk that cannot fit in a whole run: cost 7 against a ceiling of 6."""
+        settings.both_ends_min_overlap_pages = 1
+        settings.browse_walk_admission_ceiling = 6
+        walk = Walk("n", "l", 999, both_ends=True)   # 5 pages + 1 overlap + 1 facet
+        assert walk_cost_estimate(walk, settings) == 7
+        return walk
+
+    def test_oversized_walk_is_admitted_on_a_fresh_run(self, browse_settings):
+        # A walk costing more than the whole ceiling can never satisfy the
+        # ordinary rule. Deferring it every run would mean never walking it,
+        # so a run still holding half its ceiling takes it and truncates once.
+        walk = self._oversized(browse_settings)
+        assert admits(self._Spent(0), browse_settings, walk) is True
+
+    def test_oversized_walk_is_deferred_once_the_run_is_mostly_spent(
+        self, browse_settings
+    ):
+        # Same walk, but only 2 of 6 left — a later run gives it a deeper pass,
+        # so it waits rather than burning the tail of this one for a stub.
+        walk = self._oversized(browse_settings)
+        assert admits(self._Spent(4), browse_settings, walk) is False
+
+    # ---- the property the whole feature rests on ----------------------
+
+    @staticmethod
+    def _honest_router(total):
+        """Serves exactly `total` items, short page at the end — an accurate node."""
+        def router(v):
+            idx, ps = v["startIndex"], v["pageSize"]
+            items = [make_product(str(i)) for i in range(idx, min(idx + ps, total))]
+            return make_page(items, total)
+        return router
+
+    @staticmethod
+    def _stalling_router(total):
+        """Full pages of the SAME two items: distinct coverage never reaches
+        `total`, so a both-ends union falls short and DESC runs to the ceiling.
+        This is the production shape — 6 of 12 both-ends walks on record."""
+        def router(v):
+            return make_page([make_product("111"), make_product("222")], total)
+        return router
+
+    @pytest.mark.parametrize("total,primed", [
+        (1, False), (5, False), (6, False), (7, False), (100, False), (5, True),
+    ])
+    async def test_estimate_covers_a_single_walk_over_an_accurate_node(
+        self, browse_settings, fresh_db, total, primed
+    ):
+        """The load-bearing property, and nothing asserted it before.
+
+        Every other estimate test hard-codes an arithmetic result, so all of
+        them passed while both-ends walks were under-estimated by a full
+        direction. Over-estimating merely defers a walk to the next run;
+        under-estimating starts one that cannot finish — the exact failure
+        admission control exists to prevent.
+        """
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        client = FakeClient(self._honest_router(total))
+        walk = Walk("N-5yc1vZzv", "M", total)
+        if primed:
+            walk.primed = self._honest_router(total)({"startIndex": 0, "pageSize": 2})
+
+        est = walk_cost_estimate(walk, browse_settings)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "ALL", set(), ["Milwaukee"],
+        )
+        assert client.request_count <= est, (
+            f"estimate {est} under-shot actual {client.request_count} (total={total})"
+        )
+
+    @pytest.mark.parametrize("total", [7, 8, 999])
+    async def test_estimate_covers_a_both_ends_walk_whose_union_falls_short(
+        self, browse_settings, fresh_db, total
+    ):
+        """The case that was broken: DESC runs full whenever the union is short."""
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        client = FakeClient(self._stalling_router(total))
+        walk = Walk("N-5yc1vZzv", "M", total, both_ends=True)
+
+        est = walk_cost_estimate(walk, browse_settings)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "ALL", set(), ["Milwaukee"],
+        )
+        assert walk.truncated is True          # the union did fall short
+        assert client.request_count <= est, (
+            f"estimate {est} under-shot actual {client.request_count} (total={total})"
+        )
+
+    @pytest.mark.parametrize("both_ends", [False, True])
+    async def test_no_walk_can_exceed_the_structural_api_ceiling(
+        self, browse_settings, fresh_db, both_ends
+    ):
+        """The bound that always holds, even for a node that lies about itself.
+
+        A node UNDERSTATING its total self-extends past the estimate (see
+        walk_cost_estimate's KNOWN LIMIT). It can never escape this bound
+        though, because _page_direction stops at startIndex > the API ceiling —
+        so the overshoot the admission ceiling must absorb is bounded, not open.
+        """
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        client = FakeClient(self._stalling_router(1))     # claims 1, serves forever
+        walk = Walk("N-5yc1vZzv", "M", 1, both_ends=both_ends)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "ALL", set(), ["Milwaukee"],
+        )
+        per_direction = (
+            browse_settings.api_max_start_index // browse_settings.page_size + 1
+        )
+        bound = per_direction * (2 if both_ends else 1)
+        assert client.request_count <= bound
+
+    # ---- behaviour in a real run ----------------------------------------
+
+    async def test_deferral_leaves_the_cursor_on_the_unwalked_category(
+        self, browse_settings, fresh_db
+    ):
+        """A budget deferral must not rotate past the category it skipped.
+
+        The unconstrained run walks Garage+Plumbing and leaves the cursor at 2.
+        With a ceiling that only affords Garage, Plumbing must be deferred AND
+        still be the head of the next run's slice — otherwise a run cut short
+        silently drops a slice of the catalogue until the cursor wraps.
+        """
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+        # Root facet read (1) + Garage (3 pages, the router keeps returning full
+        # pages to the ceiling) = 4, past the ceiling. Plumbing is then dropped
+        # WITHOUT even paying its facet read — planning is gated too, or a run
+        # keeps spending quota on nodes it has already decided not to walk.
+        browse_settings.browse_walk_admission_ceiling = 3
+
+        summary = await run_browse(
+            browse_settings, client=FakeClient(full_router()), tiers=("network",),
+        )
+
+        assert summary.deferred_walks == 1
+        assert summary.skipped_walks == 0        # rotation deferral is a different thing
+        assert summary.truncated_walks == []     # nothing was started and cut
+
+        cursors = rotation.load_cursors(browse_settings.browse_cursor_path)
+        assert cursors["network|2619|zv"] == 1   # Garage only; Plumbing still next
+
+        # The honesty property: a walk never attempted claims no coverage.
+        async with base.get_session(browse_settings) as session:
+            labels = [w.label for w in
+                      (await session.execute(select(WalkCoverage))).scalars().all()]
+        assert any("Garage" in l for l in labels)
+        assert not any("Plumbing" in l for l in labels)
+
+    async def test_generous_ceiling_walks_everything_as_before(
+        self, browse_settings, fresh_db
+    ):
+        """Admission control must be inert when the run can afford its work."""
+        from hd.db import base
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+        browse_settings.browse_walk_admission_ceiling = 500
+
+        summary = await run_browse(
+            browse_settings, client=FakeClient(full_router()), tiers=("network",),
+        )
+        assert summary.deferred_walks == 0
+        cursors = rotation.load_cursors(browse_settings.browse_cursor_path)
+        assert cursors["network|2619|zv"] == 2   # unchanged from the baseline test
+
+    async def test_a_run_stays_within_its_admission_ceiling(
+        self, browse_settings, fresh_db
+    ):
+        """The run-level invariant the feature exists to deliver.
+
+        Asserting only that a WALK was deferred misses the point: planning
+        reads (fetch_facets, and the facet reads inside resolve_walks) spend
+        quota too, so a run can be gated at the walk level and still sail past
+        its ceiling on planning alone.
+        """
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        for ceiling in (2, 3, 5, 8, 13):
+            browse_settings.browse_walk_admission_ceiling = ceiling
+            client = FakeClient(full_router())
+            await run_browse(browse_settings, client=client, tiers=("network",))
+            # One walk may overshoot (it is admitted, then paged); the run must
+            # not keep STARTING work past the ceiling. Bound the overshoot by a
+            # single walk's worst case rather than leaving it open-ended.
+            per_direction = (
+                browse_settings.api_max_start_index // browse_settings.page_size + 1
+            )
+            assert client.request_count <= ceiling + per_direction, (
+                f"ceiling {ceiling}: run spent {client.request_count}"
+            )
+
+
+class TestShelfCursorRewind:
+    """A shelf run that stops early must not rotate past what it never walked.
+
+    The network tier already guarantees this and says why in a comment; the
+    shelf tier advanced its cursor over what rotation SELECTED, so anything
+    picked-but-not-walked was skipped until the cursor wrapped. Unreachable
+    while the shelf resolves to a single both-ends walk — which is precisely
+    the condition `hd doctor`'s walk-headroom check now watches for.
+    """
+
+    @staticmethod
+    def _router():
+        """Four shelf categories, one item each, so rotation has a real slice."""
+        cats = {"a": "aaa", "b": "bbb", "c": "ccc", "d": "ddd"}
+
+        def router(v):
+            nav = v["navParam"]
+            if nav == "N-5yc1vZzv":
+                return make_page([], 40, dims=[cat_dim(
+                    ("A", "a", 1), ("B", "b", 1), ("C", "c", 1), ("D", "d", 1),
+                )])
+            return make_page([make_product(cats[nav.rsplit("Z", 1)[-1]])], 1)
+
+        return router
+
+    @staticmethod
+    def _settings(s, ceiling):
+        s.shelf_category_walks = ""      # not part of this scenario
+        s.browse_shelf_fraction = 0.5     # must be < 1.0 or rotation returns early
+        s.browse_full_shelf_hours_et = ""  # or the wall clock forces 1.0 at 4/12 ET
+        s.browse_walk_admission_ceiling = ceiling
+        return s
+
+    async def test_early_stop_rewinds_onto_the_unwalked_pick(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+        # Rotation selects A and B of four. Facet read (1) + walk A (1) = 2 used;
+        # B then estimates 2 against 1 remaining and is deferred.
+        s = self._settings(browse_settings, ceiling=3)
+
+        summary = await run_browse(
+            s, client=FakeClient(self._router()), tiers=("shelf",),
+        )
+        assert summary.deferred_walks == 1
+        assert summary.walks == 1
+
+        cursors = rotation.load_cursors(s.browse_cursor_path)
+        # Rotation had already advanced to 2 over {A,B}. Only A was walked, so
+        # the cursor must be rewound to 1 — B is next, not skipped until wrap.
+        assert cursors["shelf|2619|zv"] == 1
+
+    async def test_full_shelf_hour_never_rewinds_against_an_unsorted_list(
+        self, browse_settings, fresh_db
+    ):
+        """At fraction 1.0 rotation returns early — unsorted, cursor untouched.
+
+        The cursor indexes the LABEL-SORTED order. Rewinding against the
+        unsorted API order would write an index meaning a different category
+        than the one we stopped on, skipping a node the next run should have
+        walked — a regression against the very guarantee the rewind exists for.
+        This path goes live whenever a full-shelf hour fires, and
+        BROWSE_FULL_SHELF_HOURS_ET ships defaulted to "4,12".
+        """
+        from hd.db import base
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+        s = self._settings(browse_settings, ceiling=3)
+        s.browse_shelf_fraction = 1.0            # rotation returns early
+
+        summary = await run_browse(
+            s, client=FakeClient(self._router()), tiers=("shelf",),
+        )
+        assert summary.deferred_walks >= 1       # the run did stop early
+
+        # Rotation never advanced the cursor, so nothing may rewind it either.
+        cursors = rotation.load_cursors(s.browse_cursor_path)
+        assert "shelf|2619|zv" not in cursors or cursors["shelf|2619|zv"] == 0
+
+    @staticmethod
+    def _always_truncates_router():
+        """Category A is over the cap with no facets to split it, so the planner
+        marks it truncated on EVERY run. B, C and D are ordinary one-page nodes."""
+        def router(v):
+            nav = v["navParam"]
+            if nav == "N-5yc1vZzv":
+                return make_page([], 20, dims=[cat_dim(
+                    ("A", "a", 10), ("B", "b", 1), ("C", "c", 1), ("D", "d", 1),
+                )])
+            if nav == "N-5yc1vZzvZa":
+                return make_page([make_product("aaa")], 10)   # no dims -> untruncatable
+            return make_page([make_product({"b": "bbb", "c": "ccc", "d": "ddd"}
+                                           [nav.rsplit("Z", 1)[-1]])], 1)
+        return router
+
+    async def test_a_permanently_truncating_node_does_not_pin_the_cursor(
+        self, browse_settings, fresh_db
+    ):
+        """Rewinding onto a TRUNCATED walk starves every node behind it.
+
+        A deferred walk did no work and wrote no coverage row, so resuming on
+        it is right. A truncated walk is different: it ran, captured what it
+        could, and recorded a truncated row. Some nodes truncate every single
+        time — the in-store shelf's both-ends walk goes short on roughly half
+        its runs — so rewinding onto one pins the cursor there forever and the
+        categories behind it are never walked at all. Rotation must move past
+        it and let it come round again on its own turn.
+        """
+        from hd.db import base
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+        s = self._settings(browse_settings, ceiling=500)   # budget is not the issue
+
+        walked = []
+        for _ in range(2):
+            summary = await run_browse(
+                s, client=FakeClient(self._always_truncates_router()),
+                tiers=("shelf",),
+            )
+            walked.append(list(summary.truncated_walks))
+
+        # A truncates on every run it is picked — that is the premise.
+        assert any("A" in "".join(w) for w in walked)
+
+        # Two runs at fraction 0.5 over four nodes must cover all four. If the
+        # cursor is pinned on A, C and D are never reached.
+        async with base.get_session(s) as session:
+            from hd.db.models import Product
+            seen = {p.item_id for p in
+                    (await session.execute(select(Product))).scalars().all()}
+        assert {"ccc", "ddd"} <= seen, (
+            f"cursor pinned on the truncating node; never reached C/D. saw={sorted(seen)}"
+        )
+
+    async def test_a_complete_shelf_run_leaves_rotation_alone(
+        self, browse_settings, fresh_db
+    ):
+        """The rewind must not fire when everything selected was walked."""
+        from hd.db import base
+        from hd import rotation
+
+        await base.init_db(browse_settings)
+        s = self._settings(browse_settings, ceiling=500)
+
+        summary = await run_browse(
+            s, client=FakeClient(self._router()), tiers=("shelf",),
+        )
+        assert summary.deferred_walks == 0
+        assert summary.walks == 2
+        cursors = rotation.load_cursors(s.browse_cursor_path)
+        assert cursors["shelf|2619|zv"] == 2   # rotation's own advance, untouched
+
+
+class TestObservedTotalCorrection:
+    """A parent's recordCount is a claim; page 0 is a measurement.
+
+    Measured on the live install: three MILWAUKEE/Tools children were
+    advertised by their parent at 603/453/381 and reported 2197/1720/1798 at
+    their own page 0. Being under the cap by the claim, all three were routed
+    as SINGLE walks, ran to the API's startIndex ceiling, covered ~34% — and
+    the cursor advanced past the category as though it were done.
+    """
+
+    def test_an_under_reported_child_is_split_not_walked_whole(self, browse_settings):
+        dims = parse_dimensions(make_page([], 10, dims=[cat_dim(("Big", "big", 5))]))
+        # Claim 5 (under the cap of 6) -> a single walk, and no facet read asked for.
+        walks, need = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings)
+        assert [w.total for w in walks] == [5] and need == []
+
+        # Now we have SEEN this node report 40 at its own page 0.
+        walks2, need2 = plan_walks(
+            "N-5yc1vZzv", "M", 10, dims, browse_settings,
+            observed_totals={"N-5yc1vZzvZbig": 40},
+        )
+        # It must go to `need` for a facet read instead of being walked whole.
+        assert walks2 == [] and need2 == [("N-5yc1vZzvZbig", "M/Big")]
+
+    def test_correction_never_shrinks_a_claim(self, browse_settings):
+        """Only ever revise UPWARD. A stale small observation must not shrink a
+        node the parent now says is large, or we would re-create the bug."""
+        dims = parse_dimensions(make_page([], 10, dims=[cat_dim(("Big", "big", 5))]))
+        walks, need = plan_walks(
+            "N-5yc1vZzv", "M", 10, dims, browse_settings,
+            observed_totals={"N-5yc1vZzvZbig": 1},
+        )
+        assert [w.total for w in walks] == [5]
+
+    def test_unknown_node_is_unaffected(self, browse_settings):
+        dims = parse_dimensions(make_page([], 10, dims=[cat_dim(("Big", "big", 5))]))
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                              observed_totals={"someone/else": 900})
+        assert [w.total for w in walks] == [5]
+
+
+class TestCategoryResume:
+    """A category too big for one run must RESUME, not restart.
+
+    `completed` only advances on a finished category, so an oversized one pins
+    the cursor; every later run then re-resolves it and re-walks the same
+    prefix. Measured: MILWAUKEE/Tools walked 157 times while every sibling
+    category was walked exactly once, and three consecutive runs opened with
+    the identical six walks in identical order.
+    """
+
+    async def _seed(self, s, rows):
+        """rows: (nav_param, status, hours_ago)"""
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        await base.init_db(s)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(s) as session:
+            for nav, status, ago in rows:
+                session.add(WalkCoverage(
+                    run_id=1, store_id="2619", tier="ALL", label=nav,
+                    nav_param=nav, started=now - timedelta(hours=ago),
+                    ended=now - timedelta(hours=ago), status=status,
+                    items_expected=100, items_observed=100 if status == "complete" else 5,
+                ))
+            await session.commit()
+
+    async def test_recent_completions_are_remembered_and_stale_ones_are_not(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+
+        await self._seed(browse_settings, [
+            ("nav/fresh", "complete", 1),
+            ("nav/stale", "complete", 40),
+            ("nav/cut", "truncated", 1),
+        ])
+        totals, recent = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+
+        assert "nav/fresh" in recent          # inside the window
+        assert "nav/stale" not in recent      # outside it -> due for refresh
+        assert "nav/cut" not in recent        # truncated is not "covered"
+        assert totals["nav/cut"] == 100       # but its observed total IS learned
+
+    async def test_a_truncated_walk_still_teaches_its_real_size(
+        self, browse_settings, fresh_db
+    ):
+        """The run-3 case: the walk failed to cover the node, but page 0 told
+        us how big it really is. That lesson is the whole fix for the misroute."""
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+
+        await self._seed(browse_settings, [("N-5yc1vZzvZpt", "truncated", 2)])
+        totals, recent = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert totals == {"N-5yc1vZzvZpt": 100}
+        assert recent == set()
+
+    async def test_memory_is_scoped_to_store_and_tier(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        from hd.pipeline.browse import coverage_memory
+
+        await base.init_db(browse_settings)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(browse_settings) as session:
+            for store, tier in (("2619", "ALL"), ("8452", "ALL"), ("2619", "IN_STORE")):
+                session.add(WalkCoverage(
+                    run_id=1, store_id=store, tier=tier, label="x", nav_param="nav/x",
+                    started=now, ended=now, status="complete",
+                    items_expected=10, items_observed=10))
+            await session.commit()
+        totals, recent = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        # Only the 2619/ALL row may contribute; the shelf tier and the other
+        # store walk the same labels and would otherwise mask each other.
+        assert recent == {"nav/x"} and totals == {"nav/x": 10}
+
+    async def test_a_missing_coverage_table_does_not_gate_a_scan(
+        self, browse_settings, tmp_path
+    ):
+        """Coverage memory is an optimisation. If it cannot be read the scan
+        must still run — planning from facets alone, exactly as before."""
+        from hd.pipeline.browse import coverage_memory
+        broken = browse_settings.model_copy(update={
+            "database_url": f"sqlite+aiosqlite:///{tmp_path}/nonexistent-dir/x.db"})
+        totals, recent = await coverage_memory(broken, "2619", "ALL", 20)
+        assert totals == {} and recent == set()

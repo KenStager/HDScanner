@@ -33,7 +33,7 @@ import math
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from hd import rotation
@@ -84,6 +84,11 @@ class BrowseSummary:
     # Categories deliberately deferred to a later run by shelf rotation. Not a
     # failure, but it does mean this run did not see the whole shelf.
     skipped_walks: int = 0
+    # Walks not started because the run could not afford to finish them. Also
+    # not a failure — the alternative is a truncated walk, which is worse — but
+    # kept separate from skipped_walks: rotation defers on a fixed schedule,
+    # this defers on budget, and only one of them says the run ran short.
+    deferred_walks: int = 0
 
 
 def build_nav(root: str, *tokens: str) -> str:
@@ -109,6 +114,126 @@ def both_ends_cap(settings: Settings) -> int:
     return 2 * reachable_cap(settings) - margin
 
 
+def walk_cost_estimate(walk: Walk, settings: Settings) -> int:
+    """Requests this walk will need, before it is started.
+
+    Bounded by what the walk can actually reach, not by the node's total: the
+    API refuses startIndex past api_max_start_index, so a walk over the cap
+    stops at the reachable head rather than paging the whole node.
+
+    The trailing +1 is a flat safety margin, NOT the facet read — `admits` is
+    called after `resolve_walks` has already paid for that, so it is in
+    `client.request_count` before this estimate is ever compared. Keep the
+    margin: it is what stops a walk that lands exactly on the ceiling from
+    being the request that trips the quota. The primed discount is separate
+    and real — a walk that reuses page 0 genuinely issues one request fewer —
+    so both together still leave the margin intact.
+
+    KNOWN LIMIT, deliberately accepted. For a single walk this is an upper
+    bound only while the node's reported total is accurate. `_page_direction`
+    keeps paging while pages come back full, so a node that UNDERSTATES its
+    total self-extends past this estimate — up to the structural ceiling of
+    `per_direction` pages, never beyond. Sizing every walk at that ceiling
+    instead would be airtight but would admit only ~7 walks per run against a
+    237 ceiling, where runs currently complete 21-47; it would cost far more
+    coverage than the overshoot it prevents. The measured basis for accepting
+    it: across 118 complete walks in `walk_coverage`, observed == expected
+    every time, so no single walk has yet self-extended at all. The ceiling
+    keeps margin below the real quota stop to absorb one such overshoot.
+
+    Both-ends is different and is sized at the worst case, because there the
+    worst case is routine rather than hypothetical — see below.
+    """
+    page_size = max(1, settings.page_size)
+    total = walk.total or 0
+    per_direction = settings.api_max_start_index // page_size + 1
+    if walk.both_ends:
+        # Worst case, and it is reached routinely. ASC always runs to the API
+        # ceiling (a both-ends node is by definition over reachable_cap). DESC
+        # stops early only when the union reaches the live total — so whenever
+        # the union falls SHORT, DESC also runs to the ceiling. That shortfall
+        # is not exotic: it is the "Both-ends coverage short" branch below, and
+        # on this catalogue it fires about half the time (seam duplicates, or a
+        # total that overstates the distinct itemIds the node will return).
+        #
+        # Sizing this from the node's item count instead under-estimates by up
+        # to a full direction — worst at the BOTTOM of the band, where a 745
+        # item node looks like 32 pages and can cost 62. Over-estimating only
+        # defers a walk to the next run; under-estimating starts a walk that
+        # cannot finish, which is the exact failure this function exists to
+        # prevent.
+        pages = 2 * per_direction
+    else:
+        items = min(total, reachable_cap(settings))
+        pages = math.ceil(items / page_size)
+    # A primed page 0 is only reused on the default BEST_MATCH ordering
+    # (_page_direction: `page == 0 and order_by is None`). Both-ends walks
+    # always pass a price ordering, so they never consume it and must not be
+    # discounted for it.
+    discount = 1 if (walk.primed and not walk.both_ends) else 0
+    return max(1, pages) + 1 - discount
+
+
+def admission_ceiling(settings: Settings) -> int:
+    """Request count past which no new walk is started. 0 means "no ceiling".
+
+    The tighter of the two positive budgets, never just the explicit one: a
+    caller that lowers `browse_request_budget` for a bounded run (the setup
+    wizard's install check does exactly this) would otherwise keep a much
+    larger configured ceiling, admit walks it cannot pay for, and have them cut
+    by budget exhaustion — writing truncated coverage rows out of a health
+    check.
+    """
+    candidates = [v for v in (settings.browse_walk_admission_ceiling,
+                              settings.browse_request_budget) if v > 0]
+    return min(candidates) if candidates else 0
+
+
+def budget_spent(client: HDClient, settings: Settings) -> bool:
+    """Whether the run has reached the point where it should stop planning too.
+
+    `admits` gates walks, but the planning reads that PRECEDE a walk —
+    `fetch_facets` and the facet reads inside `resolve_walks` — are requests
+    like any other and count against the same quota. Without this the outer
+    loops keep resolving nodes they will then immediately defer, spending the
+    very margin the ceiling was bought with, and a quota stop landing on a
+    facet read aborts the run just as hard as one landing on a page.
+    """
+    ceiling = admission_ceiling(settings)
+    return ceiling > 0 and client.request_count >= ceiling
+
+
+def admits(client: HDClient, settings: Settings, walk: Walk) -> bool:
+    """Whether this run can still afford to start `walk` and finish it.
+
+    Starting a walk we cannot finish is the expensive mistake: the quota stop
+    cuts it mid-page and the coverage row lands "truncated", which is worth
+    less than nothing to anything reasoning from absence. Deferring instead
+    leaves the walk for a run with room, and writes no row at all.
+
+    The starvation guard covers a walk too large for any single run: deferring
+    it every time would mean never walking it. Such a walk is admitted while
+    the run still holds at least half its ceiling, so it gets the deepest pass
+    available and truncates once rather than never running. With the API's own
+    startIndex ceiling bounding every walk to ~2 caps, this branch is currently
+    unreachable in practice; it exists so a small ceiling cannot starve a node.
+    """
+    ceiling = admission_ceiling(settings)
+    if ceiling <= 0:
+        # 0 means "no budget" everywhere else in this config (see
+        # request_budget), so it has to mean "no ceiling" here too. Without
+        # this the arithmetic below inverts the intent: remaining goes
+        # negative after the first walk and every later one is deferred.
+        return True
+    remaining = ceiling - client.request_count
+    est = walk_cost_estimate(walk, settings)
+    if est <= remaining:
+        return True
+    if est > ceiling:
+        return remaining >= ceiling // 2
+    return False
+
+
 def plan_walks(
     nav_param: str,
     label: str,
@@ -117,6 +242,7 @@ def plan_walks(
     settings: Settings,
     depth: int = 0,
     price_split_used: bool = False,
+    observed_totals: dict[str, int] | None = None,
 ) -> tuple[list[Walk], list[tuple[str, str]]]:
     """Split one result set into walkable pieces using its own facets.
 
@@ -165,8 +291,20 @@ def plan_walks(
         for ref in categories:
             child_nav = build_nav(nav_param, ref["token"])
             child_label = f"{label}/{ref.get('label') or ref['token']}"
-            if ref["count"] <= cap:
-                walks.append(Walk(child_nav, child_label, ref["count"]))
+            # The parent's recordCount is a claim, and it is sometimes wrong by
+            # multiples: three Tools children were advertised at 603/453/381
+            # and reported 2197/1720/1798 at their own page 0 — under the cap
+            # by the claim, 3x over it in fact. Routed as single walks, they
+            # ran to the API ceiling, covered ~34%, and the cursor moved on as
+            # if the category were done. Prefer whatever a walk has actually
+            # SEEN at page 0 over what the parent says about it.
+            claimed = ref["count"]
+            count = max(claimed, (observed_totals or {}).get(child_nav, 0))
+            if count > claimed:
+                log.info("Node count corrected from observation",
+                         label=child_label, claimed=claimed, observed=count)
+            if count <= cap:
+                walks.append(Walk(child_nav, child_label, count))
             else:
                 need.append((child_nav, child_label))
         _route("category-split")
@@ -247,6 +385,7 @@ async def resolve_walks(
     storefilter: str,
     total: int | None = None,
     dimensions: dict[str, list[dict]] | None = None,
+    observed_totals: dict[str, int] | None = None,
 ) -> list[Walk]:
     """Plan walks for a node, fetching facets for any piece still over the cap."""
     raw = None
@@ -254,7 +393,8 @@ async def resolve_walks(
         total, dimensions, raw = await fetch_facets(
             client, settings, nav_param, store_id, storefilter
         )
-    walks, need = plan_walks(nav_param, label, total, dimensions, settings)
+    walks, need = plan_walks(nav_param, label, total, dimensions, settings,
+                             observed_totals=observed_totals)
     _prime(walks, nav_param, raw)
     depth = 1
     while need and depth <= settings.browse_max_split_depth:
@@ -268,6 +408,7 @@ async def resolve_walks(
             c_walks, c_need = plan_walks(
                 child_nav, child_label, c_total, c_dims, settings,
                 depth=depth, price_split_used=False,
+                observed_totals=observed_totals,
             )
             _prime(c_walks, child_nav, c_raw)
             walks.extend(c_walks)
@@ -653,6 +794,7 @@ async def _record_walk(
                 store_id=store_id,
                 tier=storefilter,
                 label=walk.label,
+                nav_param=walk.nav_param,
                 started=started,
                 ended=datetime.now(timezone.utc),
                 status=walk_status(walk),
@@ -710,6 +852,64 @@ async def _record_run_end(
         log.error("Could not finalize scan_runs row", run_id=run_id, error=str(e))
 
 
+async def coverage_memory(
+    settings: Settings, store_id: str, storefilter: str, refresh_hours: int,
+) -> tuple[dict[str, int], set[str]]:
+    """What the durable coverage record already knows about this tier's nodes.
+
+    Returns (observed_totals, recently_completed).
+
+    - **observed_totals**: the largest page-0 total ever recorded per node, so a
+      parent that under-reports a child cannot route it into a walk that cannot
+      finish (see plan_walks).
+    - **recently_completed**: nodes walked to `complete` inside the refresh
+      window. A category too big for one run defers partway, and because
+      `completed` only advances on a finished category the cursor stays put —
+      so the next run RE-RESOLVES the same category and walks the same prefix
+      again. Measured: MILWAUKEE/Tools was walked 157 times while every other
+      Milwaukee category was walked once, and three consecutive runs opened
+      with the identical six walks. Skipping what was just completed turns that
+      restart into forward progress.
+
+    Keyed on nav_param, never label: `label` falls back to the raw facet token
+    when HD omits a label, so the same node can carry two labels across runs.
+    Read-only, one query per tier per run, no API cost.
+    """
+    from sqlalchemy import func, select
+
+    from hd.db import base
+    from hd.db.models import WalkCoverage
+
+    totals: dict[str, int] = {}
+    recent: set[str] = set()
+    try:
+        async with base.get_session(settings) as session:
+            rows = (await session.execute(
+                select(WalkCoverage.nav_param,
+                       func.max(WalkCoverage.items_expected),
+                       func.max(WalkCoverage.ended).filter(
+                           WalkCoverage.status == "complete"))
+                .where(WalkCoverage.nav_param.is_not(None),
+                       WalkCoverage.store_id == store_id,
+                       WalkCoverage.tier == storefilter)
+                .group_by(WalkCoverage.nav_param))).all()
+    except Exception as e:  # coverage memory is an optimisation, never a gate
+        log.warning("Coverage memory unavailable — planning from facets only",
+                    error=str(e))
+        return {}, set()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, refresh_hours))
+    for nav, max_expected, last_complete in rows:
+        if max_expected:
+            totals[nav] = int(max_expected)
+        if last_complete is not None:
+            if last_complete.tzinfo is None:
+                last_complete = last_complete.replace(tzinfo=timezone.utc)
+            if last_complete >= cutoff:
+                recent.add(nav)
+    return totals, recent
+
+
 async def run_browse(
     settings: Settings,
     store_ids: list[str] | None = None,
@@ -748,17 +948,62 @@ async def run_browse(
                     if client.is_throttled:
                         summary.aborted = True
                         break
+                    if budget_spent(client, settings):
+                        break
                     nav = build_nav(settings.root_nav_param, token)
-                    walks = await resolve_walks(
+                    resolved = await resolve_walks(
                         client, settings, nav, brand, store_id, "IN_STORE",
                     )
+                    # rotate_shelf_walks advances its cursor over what it
+                    # SELECTS. The network tier deliberately advances only over
+                    # what it FINISHES, for the reason spelled out there: a run
+                    # cut short otherwise skips its unwalked tail until the
+                    # cursor wraps. Capture the pre-advance position so the same
+                    # guarantee can be restored here if this run stops early.
+                    #
+                    # Only when rotation actually rotates, though. It returns
+                    # early — unsorted and without touching the cursor — on the
+                    # same condition tested here, and the cursor indexes the
+                    # LABEL-SORTED order. Rewinding against the unsorted list
+                    # would write an index meaning a different category than the
+                    # one we stopped on, skipping a node the next run should
+                    # have walked. That path is live whenever a full-shelf hour
+                    # fires (the shipped BROWSE_FULL_SHELF_HOURS_ET default).
+                    rotates = shelf_fraction < 1.0 and len(resolved) > 1
+                    shelf_key = f"shelf|{store_id}|{token}"
+                    shelf_start = (
+                        cursors.get(shelf_key, 0) % len(resolved) if resolved else 0
+                    )
                     walks, skipped = rotate_shelf_walks(
-                        walks, cursors, store_id, token, settings, shelf_fraction
+                        resolved, cursors, store_id, token, settings, shelf_fraction
                     )
                     summary.skipped_walks += skipped
-                    for walk in walks:
+                    # Position of the first walk this run did not ATTEMPT —
+                    # deferred on budget, or cut off by a throttle before it
+                    # started. None means every selected walk was attempted.
+                    # Attempted-but-truncated deliberately does NOT count; see
+                    # the note at the truncation branch below.
+                    first_incomplete: int | None = None
+                    for position, walk in enumerate(walks):
                         if client.is_throttled:
                             summary.aborted = True
+                            if first_incomplete is None:
+                                first_incomplete = position
+                            break
+                        if not admits(client, settings, walk):
+                            log.info(
+                                "Walk deferred — run cannot afford to finish it",
+                                label=walk.label, tier="IN_STORE",
+                                estimate=walk_cost_estimate(walk, settings),
+                                used=client.request_count,
+                                ceiling=admission_ceiling(settings),
+                            )
+                            # Every walk from here on is abandoned, not just
+                            # this one — count them all, or the summary
+                            # understates what the run did not do.
+                            summary.deferred_walks += len(walks) - position
+                            if first_incomplete is None:
+                                first_incomplete = position
                             break
                         walk_started = datetime.now(timezone.utc)
                         upserts, inserts = await walk_and_capture(
@@ -773,7 +1018,25 @@ async def run_browse(
                         summary.walks += 1
                         if walk.truncated:
                             summary.truncated_walks.append(walk.label)
+                            # Deliberately NOT treated as unfinished for the
+                            # rewind. A truncated walk ran, captured what it
+                            # could, and wrote its (truncated) coverage row —
+                            # unlike a deferred walk, which did nothing. Some
+                            # nodes truncate every single time they are walked:
+                            # a node permanently over the cap with no facet to
+                            # split it, or the shelf's both-ends walk, which
+                            # goes short on roughly half its runs. Rewinding
+                            # onto one pins the cursor there and starves every
+                            # category behind it. It comes round again on its
+                            # own turn instead.
                         await _pause(settings)
+                    if rotates and first_incomplete is not None:
+                        # Rewind onto the first walk this run did not finish,
+                        # so the next one resumes there instead of rotating
+                        # past it.
+                        cursors[shelf_key] = (
+                            (shelf_start + first_incomplete) % len(resolved)
+                        )
                 # Store-wide category nodes (e.g. the grill wall). Deliberately
                 # outside shelf rotation — their value is every-pass coverage
                 # and they are a few pages each — and captured for ALL brands:
@@ -783,6 +1046,8 @@ async def run_browse(
                     if client.is_throttled:
                         summary.aborted = True
                         break
+                    if budget_spent(client, settings):
+                        break
                     nav = build_nav(settings.root_nav_param, token)
                     walks = await resolve_walks(
                         client, settings, nav, label, store_id, "IN_STORE",
@@ -791,6 +1056,16 @@ async def run_browse(
                         walk.all_brands = True
                         if client.is_throttled:
                             summary.aborted = True
+                            break
+                        if not admits(client, settings, walk):
+                            log.info(
+                                "Walk deferred — run cannot afford to finish it",
+                                label=walk.label, tier="IN_STORE",
+                                estimate=walk_cost_estimate(walk, settings),
+                                used=client.request_count,
+                                ceiling=admission_ceiling(settings),
+                            )
+                            summary.deferred_walks += 1
                             break
                         walk_started = datetime.now(timezone.utc)
                         upserts, inserts = await walk_and_capture(
@@ -817,9 +1092,14 @@ async def run_browse(
         if "network" in tiers and not client.is_throttled:
             per_run = max(1, settings.browse_network_categories_per_run)
             for store_id in store_ids:
+                observed_totals, recently_done = await coverage_memory(
+                    settings, store_id, "ALL", settings.browse_walk_refresh_hours,
+                )
                 for brand, token in brand_tokens:
                     if client.is_throttled:
                         summary.aborted = True
+                        break
+                    if budget_spent(client, settings):
                         break
                     nav = build_nav(settings.root_nav_param, token)
                     # The root read only supplies the category list; each
@@ -858,6 +1138,15 @@ async def run_browse(
                         if client.is_throttled:
                             summary.aborted = True
                             break
+                        if budget_spent(client, settings):
+                            # Stop before paying a facet read for a category
+                            # this run cannot walk. completed stays put, so the
+                            # cursor leaves it at the head of the next slice.
+                            # Count everything still picked: a run that quietly
+                            # stops planning would otherwise report the same
+                            # summary as one that finished its slice.
+                            summary.deferred_walks += len(picked) - completed
+                            break
                         child_nav = build_nav(nav, ref["token"])
                         child_label = f"{brand}/{ref.get('label') or ref['token']}"
                         if (ref.get("count") or 0) <= reachable_cap(settings):
@@ -866,15 +1155,49 @@ async def run_browse(
                             walks = await resolve_walks(
                                 client, settings, child_nav, child_label,
                                 store_id, "ALL", total=ref.get("count"), dimensions={},
+                                observed_totals=observed_totals,
                             )
                         else:
                             walks = await resolve_walks(
                                 client, settings, child_nav, child_label, store_id, "ALL",
+                                observed_totals=observed_totals,
                             )
+                        # Forward progress. Anything completed inside the
+                        # refresh window is already banked, so re-walking it
+                        # spends the run without covering anything new — which
+                        # is exactly how one oversized category came to be
+                        # walked 157 times while its siblings were walked once.
+                        planned = len(walks)
+                        walks = [w for w in walks if w.nav_param not in recently_done]
+                        if planned and not walks:
+                            # Every piece is already fresh: the category IS
+                            # covered for this pass. Advance past it.
+                            log.info("Category already fresh — advancing",
+                                     label=child_label, walks=planned)
+                            completed += 1
+                            continue
+                        if len(walks) < planned:
+                            log.info("Resuming a part-walked category",
+                                     label=child_label, skipped=planned - len(walks),
+                                     remaining=len(walks))
                         category_finished = True
                         for walk in walks:
                             if client.is_throttled:
                                 summary.aborted = True
+                                category_finished = False
+                                break
+                            if not admits(client, settings, walk):
+                                # Leaves `completed` un-advanced, so this
+                                # category is the head of the next run's slice
+                                # rather than being rotated past unwalked.
+                                log.info(
+                                    "Walk deferred — run cannot afford to finish it",
+                                    label=walk.label, tier="ALL",
+                                    estimate=walk_cost_estimate(walk, settings),
+                                    used=client.request_count,
+                                    ceiling=admission_ceiling(settings),
+                                )
+                                summary.deferred_walks += 1
                                 category_finished = False
                                 break
                             walk_started = datetime.now(timezone.utc)
@@ -911,6 +1234,7 @@ async def run_browse(
             snapshots=summary.snapshots,
             walks=summary.walks,
             deferred_categories=summary.skipped_walks or None,
+            deferred_on_budget=summary.deferred_walks or None,
             truncated=summary.truncated_walks or None,
             requests_used=client.request_count,
             throttled=client.is_throttled,
