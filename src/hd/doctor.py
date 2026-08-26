@@ -303,6 +303,222 @@ async def check_database(settings: Settings) -> list[Check]:
     return out
 
 
+async def check_walk_headroom(settings: Settings) -> list[Check]:
+    """How close each walked node is to falling off the ceiling it rides on.
+
+    A node that fits one walk is walked in one request stream. Grow it past the
+    ceiling and the planner silently re-routes it: a single walk becomes a
+    both-ends pair, and a both-ends pair becomes a multi-walk facet split. The
+    planner handles all three correctly, so this is not an error — but it
+    changes what a run costs, and for the in-store shelf it is the difference
+    between "one walk, ~60 requests" and a facet split that may no longer fit
+    the run it lives in. Nothing else reports the transition coming: the
+    routing decision is a log line that scrolls away.
+
+    Costs no API request. `walk_coverage.items_expected` is the node's own live
+    total as of the last walk that read one, which is exactly the number the
+    planner will compare against the ceiling next time.
+
+    The margin is one seam's worth of overlap (`both_ends_min_overlap_pages`
+    pages). That is not an arbitrary threshold: it is the slack the both-ends
+    walk already holds back to keep its two ends overlapping, so a node inside
+    it is one ordinary restock away from changing route.
+    """
+    from sqlalchemy import func, select
+
+    from hd.db import base
+    from hd.db.models import WalkCoverage
+    from hd.pipeline.browse import both_ends_cap, reachable_cap
+
+    # Every node's own latest measurement, chosen in SQL. An "ORDER BY started
+    # DESC LIMIT n" would only see the last n rows, and a node on a slow
+    # rotation can fall outside that window entirely — the check would then
+    # report an affirmative all-clear over a set it had silently truncated,
+    # which is the one thing this file exists not to do.
+    try:
+        await base.init_db(settings)
+        async with base.get_session(settings) as session:
+            newest = (
+                select(WalkCoverage.store_id, WalkCoverage.tier, WalkCoverage.label,
+                       func.max(WalkCoverage.started).label("started"))
+                .where(WalkCoverage.items_expected.is_not(None))
+                .group_by(WalkCoverage.store_id, WalkCoverage.tier, WalkCoverage.label)
+                .subquery()
+            )
+            rows = (await session.execute(
+                select(WalkCoverage.store_id, WalkCoverage.tier, WalkCoverage.label,
+                       WalkCoverage.items_expected)
+                .join(newest, (WalkCoverage.store_id == newest.c.store_id)
+                      & (WalkCoverage.tier == newest.c.tier)
+                      & (WalkCoverage.label == newest.c.label)
+                      & (WalkCoverage.started == newest.c.started)))).all()
+    except Exception as e:  # a database we cannot read is itself the finding
+        return [Check("walk-headroom", FAIL, f"could not be read: {e}")]
+
+    if not rows:
+        return [Check("walk-headroom", OK, "no walk coverage recorded yet")]
+
+    reach = reachable_cap(settings)
+    band = both_ends_cap(settings) if settings.both_ends_paging else None
+    margin = max(1, settings.both_ends_min_overlap_pages * settings.page_size)
+
+    # store_id belongs in the key: two stores walk the same labels, and without
+    # it one store's row masks the other's and the message names neither.
+    latest: dict[tuple[str, str, str], int] = {}
+    for store_id, tier, label, expected in rows:
+        if expected:
+            latest[(store_id, tier, label)] = expected
+
+    out: list[Check] = []
+    watched = 0
+    for (store_id, tier, label), expected in sorted(latest.items()):
+        if band is not None and reach < expected <= band:
+            # Riding the both-ends band; the next stop is a facet split.
+            headroom, ceiling = band - expected, band
+            now, nxt = "one both-ends walk", "a multi-walk facet split"
+            # band = 2*reachable_cap - overlap_pages*page_size, so LOWERING the
+            # overlap widens the band. Saying "raise" here would push a node
+            # straight over the edge this warning is about — at the cost of the
+            # seam margin, which is why the trade is named rather than hidden.
+            fix = ("lower BOTH_ENDS_MIN_OVERLAP_PAGES to widen the band (at the "
+                   "cost of seam overlap), or budget for the extra walks")
+        elif expected <= reach:
+            # A plain single walk; the next stop is both-ends when enabled,
+            # and a facet split when it is not.
+            headroom, ceiling = reach - expected, reach
+            now = "one walk"
+            nxt = ("a both-ends pair (~2x this walk's requests)" if band is not None
+                   else "a multi-walk facet split")
+            fix = None if band is not None else "enable BOTH_ENDS_PAGING to absorb the growth"
+        else:
+            continue                                   # already past the ceiling
+        watched += 1
+        if headroom < margin:
+            # The route changes at expected > ceiling, so it takes headroom+1
+            # more items to trip it — not headroom. An operator reads this
+            # number as literally true, so it has to be.
+            out.append(Check(
+                "walk-headroom", WARN,
+                f"{label} ({tier}, store {store_id}) is {expected:,} of "
+                f"{ceiling:,} — {headroom + 1} more item(s) turns {now} into {nxt}",
+                fix,
+            ))
+    if not out:
+        # Count only the nodes actually assessed. Nodes already past their
+        # ceiling were skipped above and are not "clear of" anything.
+        out.append(Check("walk-headroom", OK,
+                         f"{watched} walked node(s) below a ceiling, all clear of it"))
+    return out
+
+
+async def check_scan_health(settings: Settings) -> list[Check]:
+    """Is the scan job actually completing runs, and did any die mid-run?
+
+    `scan_runs` records every run's lifecycle (running -> complete | aborted),
+    but nothing reads it back: a hard crash leaves a row at 'running' forever —
+    there is no heartbeat and no finalizer that could fire — and a launchd job
+    that quietly stops firing leaves the newest completed run to age without
+    any log line saying so. The liveness check reads the health-state file,
+    which a crashed process never got to write; this one reads what the run
+    itself durably recorded.
+
+    Costs no API request. Thresholds derive from the configured schedule
+    rather than assuming one: "stalled" means the newest completed run is
+    older than two consecutive slot gaps, whatever the slots are.
+    """
+    from sqlalchemy import select
+
+    from hd.db import base
+    from hd.db.models import ScanRun
+
+    try:
+        await base.init_db(settings)
+        async with base.get_session(settings) as session:
+            rows = (await session.execute(
+                select(ScanRun.id, ScanRun.started, ScanRun.status)
+                .order_by(ScanRun.id))).all()
+    except Exception as e:  # a database we cannot read is itself the finding
+        return [Check("scan-health", FAIL, f"could not be read: {e}")]
+
+    if not rows:
+        return [Check("scan-health", OK, "no scan runs recorded yet")]
+
+    now = datetime.now(timezone.utc)
+
+    def age_hours(started: datetime) -> float:
+        if started.tzinfo is None:  # SQLite stores these naive-UTC
+            started = started.replace(tzinfo=timezone.utc)
+        return (now - started).total_seconds() / 3600
+
+    out: list[Check] = []
+
+    # A run still 'running' an hour after start is a crashed process, not a
+    # slow one: real runs finish in minutes, and the row can never repair
+    # itself. Its walks went unrecorded, which downstream coverage readers
+    # correctly treat as unknown-not-complete.
+    for run_id, started, status in rows:
+        if status == "running" and age_hours(started) > 1:
+            out.append(Check(
+                "scan-health", WARN,
+                f"run {run_id} stuck at 'running' since {started:%Y-%m-%d %H:%M}Z "
+                "— the process died mid-run; its walks are unrecorded",
+                "check hd_launchd.stderr.log around that time",
+            ))
+
+    # Stalled: the newest completed run should never be older than two slot
+    # gaps. Derived from the configured hours so a three-a-day install is not
+    # held to a six-a-day clock.
+    from hd.setup_schedule import SCAN_HOURS_ET as SHIPPED_HOURS
+    hours = sorted(settings.scan_hours_et_list or SHIPPED_HOURS)
+    max_gap = max(
+        (hours[(i + 1) % len(hours)] - h) % 24 or 24
+        for i, h in enumerate(hours)
+    ) if len(hours) > 1 else 24
+    threshold = 2 * max_gap
+    completed = [(rid, st) for rid, st, status in rows if status == "complete"]
+    if completed:
+        newest_id, newest = max(completed, key=lambda r: r[1])
+        age = age_hours(newest)
+        if age > threshold:
+            out.append(Check(
+                "scan-health", WARN,
+                f"newest completed run ({newest_id}) is {age:.1f}h old — more "
+                f"than two slot gaps ({threshold}h); the record is not advancing",
+                "check the launchd job is loaded and hd_launchd.stderr.log",
+            ))
+    elif age_hours(rows[0].started) > threshold:
+        out.append(Check(
+            "scan-health", WARN,
+            f"{len(rows)} run(s) recorded, none ever completed",
+            "check hd_launchd.stderr.log",
+        ))
+
+    # A tail of aborted runs is the throttle biting run after run — each one
+    # individually logged, the streak never surfaced.
+    streak = 0
+    for _, _, status in reversed(rows):
+        if status == "aborted":
+            streak += 1
+        elif status == "complete":
+            break
+    if streak >= 3:
+        out.append(Check(
+            "scan-health", WARN,
+            f"the last {streak} finished runs all aborted — sustained "
+            "throttling or a recurring failure, not a one-off",
+            "check request budgets and the cooldown state",
+        ))
+
+    if not out:
+        detail = (
+            f"{len(rows)} run(s) recorded; newest completed {age:.1f}h ago"
+            if completed else
+            f"{len(rows)} recent run(s) recorded, none completed yet"
+        )
+        out.append(Check("scan-health", OK, detail))
+    return out
+
+
 async def run_checks(settings: Settings) -> list[Check]:
     checks: list[Check] = []
     for fn in (check_scheduler, check_prune_job, check_liveness, check_cooldown,
@@ -315,6 +531,14 @@ async def run_checks(settings: Settings) -> list[Check]:
         checks.extend(await check_database(settings))
     except Exception as e:
         checks.append(Check("database", FAIL, f"check itself failed: {e}"))
+    try:
+        checks.extend(await check_walk_headroom(settings))
+    except Exception as e:
+        checks.append(Check("walk-headroom", FAIL, f"check itself failed: {e}"))
+    try:
+        checks.extend(await check_scan_health(settings))
+    except Exception as e:
+        checks.append(Check("scan-health", FAIL, f"check itself failed: {e}"))
     return checks
 
 
