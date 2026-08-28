@@ -221,6 +221,10 @@ async def _record_walks(s, rows):
             started = now - timedelta(minutes=ago)
             session.add(WalkCoverage(
                 run_id=1, store_id="2619", tier=tier, label=label,
+                # A node identity is required or the row is excluded from the
+                # latest-per-node reduction entirely — which made at least one
+                # test pass through a path other than the one it names.
+                nav_param=f"nav-{label}",
                 started=started, ended=started, status="complete",
                 items_expected=expected, items_observed=expected or 0,
             ))
@@ -573,3 +577,370 @@ async def test_scan_health_is_registered_in_run_checks(tmp_path):
     await base.close_db()
 
     assert any(c.name == "scan-health" for c in checks)
+
+
+# --- coverage quality --------------------------------------------------------
+#
+# "truncated" carries two unrelated meanings; these pin the division between
+# them. A walk that paged to a clean stop while the node's total moved under it
+# missed churn; a walk that saw a third of its node missed coverage. The
+# headline ratio counts both alike, which is what makes it unreadable.
+
+
+async def _record_walk_rows(s, rows):
+    """rows: (label, expected, observed[, nav_param, minutes_ago, status, store, tier]).
+
+    nav_param defaults to the label, so a plain 3-tuple is one distinct node;
+    pass it explicitly to model repeat walks of the SAME node. status defaults
+    to "truncated" — the rows this check is about.
+    """
+    from hd.db import base
+    from hd.db.models import WalkCoverage
+
+    await base.init_db(s)
+    now = datetime.now(timezone.utc)
+    async with base.get_session(s) as session:
+        for i, row in enumerate(rows):
+            label, expected, observed = row[0], row[1], row[2]
+            nav = row[3] if len(row) > 3 else label
+            ago = row[4] if len(row) > 4 else 0
+            status = row[5] if len(row) > 5 else "truncated"
+            store = row[6] if len(row) > 6 else "2619"
+            tier = row[7] if len(row) > 7 else "ALL"
+            started = now - timedelta(minutes=ago)
+            session.add(WalkCoverage(
+                run_id=i + 1, store_id=store, tier=tier, label=label,
+                nav_param=nav, started=started, ended=started,
+                status=status,
+                items_expected=expected, items_observed=observed,
+            ))
+        await session.commit()
+
+
+# Kept: most cases only ever record truncated walks.
+_record_truncated = _record_walk_rows
+
+
+@pytest.mark.asyncio
+async def test_churn_level_shortfalls_are_not_reported_as_lost_coverage(tmp_path):
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    # 252/253 and 635/636: the node's total moved by one item mid-walk.
+    await _record_truncated(s, [("M/Tools/A", 253, 252), ("M/Tools/B", 636, 635)])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert statuses(checks) == [OK]
+    assert "churn-level" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_a_walk_that_missed_most_of_its_node_is_warned(tmp_path):
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [("M/Tools/Power Tools", 2197, 646)])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert statuses(checks) == [WARN]
+    assert "1,551 items" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_the_two_kinds_are_counted_separately_not_summed(tmp_path):
+    """The whole point: one number for churn, one for real loss."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [
+        ("M/Tools/A", 253, 252),          # churn: 1 item
+        ("M/Tools/B", 272, 271),          # churn: 1 item
+        ("M/Tools/Saws", 295, 71),        # material: 224 items
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    detail = checks[0].detail
+    assert "1 truncated walk(s) missed real coverage (224 items)" in detail
+    assert "2 missed only churn (2 items)" in detail
+
+
+@pytest.mark.asyncio
+async def test_the_worst_offenders_are_named(tmp_path):
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [
+        ("M/Tools/Power Tools/Saws", 295, 71),
+        ("M/Tools/Hand Tools", 1720, 674),
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert "Saws 71/295" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_walk_without_a_denominator_is_not_called_healthy(tmp_path):
+    """No expected total means the shortfall is unknown in BOTH directions —
+    folding it into the churn bucket would be inventing a fact."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [("M/Tools/A", 253, 252), ("M/Tools/B", None, 40)])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert WARN in statuses(checks)
+    assert any("cannot be judged in either direction" in c.detail for c in checks)
+
+
+@pytest.mark.asyncio
+async def test_complete_walks_are_not_counted_as_truncation(tmp_path):
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walks(s, [("ALL", "M/Tools/A", 100, 5)])  # status "complete"
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert statuses(checks) == [OK]
+    assert "no truncated walks" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_only_the_latest_walk_of_a_node_counts(tmp_path):
+    """walk_coverage is append-only history. Summing it whole counts one
+    chronically short node once per run it ever ran in — the same node's five
+    truncations are one node's problem, not five."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [
+        ("M/Tools/Saws", 296, 71, "navSaws", 400),
+        ("M/Tools/Saws", 295, 71, "navSaws", 300),
+        ("M/Tools/Saws", 294, 71, "navSaws", 5),
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert "1 truncated walk(s) missed real coverage (223 items)" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_latest_walk_completed_is_not_reported_as_lost(tmp_path):
+    """The node truncated badly, then COMPLETED.
+
+    This is the case the previous version of this test only pretended to
+    cover: it recorded the "recovery" as another truncated row, so it never
+    exercised the status filter at all. Filtering to truncated before reducing
+    to the latest walk makes "latest" mean "latest truncated walk", and a
+    recovered node keeps reporting a truncation it no longer has.
+    """
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walk_rows(s, [
+        ("M/Tools/Saws", 295, 71, "navSaws", 400, "truncated"),
+        ("M/Tools/Saws", 295, 295, "navSaws", 5, "complete"),
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert statuses(checks) == [OK]
+    assert "no truncated walks" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_recovered_only_to_churn_level_is_still_counted(tmp_path):
+    """Recovery to a churn-level truncation is still a truncation — it belongs
+    in the churn bucket, not dropped and not reported as material loss."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walk_rows(s, [
+        ("M/Tools/Saws", 295, 71, "navSaws", 400),
+        ("M/Tools/Saws", 295, 294, "navSaws", 5),
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert statuses(checks)[0] == OK
+    assert "1 truncated walk(s) are churn-level" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_one_stores_walk_does_not_overwrite_another_stores(tmp_path):
+    """nav_param names the same region at every store, so it is stable but not
+    unique. Keyed on the node alone, the later store's row would evict the
+    earlier one and half the estate would vanish from the report."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walk_rows(s, [
+        ("M/Tools/Saws", 295, 71, "navSaws", 400, "truncated", "2619", "ALL"),
+        ("M/Tools/Saws", 295, 71, "navSaws", 5, "truncated", "8452", "ALL"),
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert "2 truncated walk(s) missed real coverage (448 items)" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_a_shelf_walk_does_not_overwrite_the_online_walk_of_the_same_node(tmp_path):
+    """Same node, different storefilter — two different facts."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walk_rows(s, [
+        ("M/root", 1368, 71, "navRoot", 400, "truncated", "2619", "ALL"),
+        ("M/root", 1368, 71, "navRoot", 5, "truncated", "2619", "IN_STORE"),
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert "2 truncated walk(s) missed real coverage" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_blind_rows_alone_are_not_a_clean_bill_of_health(tmp_path):
+    """Rows with no denominator WARN when any judgeable walk exists; they must
+    not flip to OK merely because they are the only rows present."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walk_rows(s, [("M/Tools/A", None, 40), ("M/Tools/B", None, 12)])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    assert statuses(checks) == [WARN]
+    assert "no shortfall can be judged" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_observing_more_than_claimed_never_credits_against_a_real_loss(tmp_path):
+    """A node whose total grew mid-walk can report observed > expected. That
+    negative shortfall must not net off against another node's real loss."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_walk_rows(s, [
+        ("M/Tools/Grew", 85, 86, "navGrew", 10),      # churn bucket, -1
+        ("M/Tools/Churn", 253, 252, "navChurn", 10),  # churn bucket, +1
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    # 1, not 0: the -1 is clamped rather than cancelling the +1.
+    assert "1 items total" in checks[0].detail
+
+
+@pytest.mark.asyncio
+async def test_walks_from_a_retired_shape_are_named_not_counted(tmp_path):
+    """Rows with no nav_param predate the column or come from a walk shape
+    since retired. They say nothing about a current node — but dropping them
+    silently is how a metric starts lying, so they are reported separately."""
+    from hd.db import base
+    from hd.doctor import check_coverage_quality
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [
+        ("M/Tools/Power Tools", 2197, 646, None, 4000),   # retired parent node
+        ("M/Tools/Saws", 295, 294, "navSaws", 5),         # current, churn-level
+    ])
+    checks = await check_coverage_quality(s)
+    await base.close_db()
+
+    # The 1,551-item retired row must NOT appear as current coverage loss.
+    assert statuses(checks)[0] == OK
+    assert "1,551" not in checks[0].detail
+    assert any("not attributable to a current node" in c.detail for c in checks)
+
+
+@pytest.mark.asyncio
+async def test_coverage_quality_is_registered_in_run_checks(tmp_path):
+    """A check nothing calls is a check that does not exist."""
+    from hd.db import base
+    from hd.doctor import run_checks
+
+    s = settings_for(tmp_path)
+    await _record_truncated(s, [("M/Tools/A", 295, 71)])
+    checks = await run_checks(s)
+    await base.close_db()
+
+    assert any(c.name == "coverage-quality" for c in checks)
+
+
+# --- deferred walks are durable ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deferred_walk_count_survives_the_run(tmp_path):
+    """A deferred walk writes no coverage row by design, so scan_runs is its
+    only durable trace. Before this column the count lived in the run summary
+    and the logs, and logs are not a durable record."""
+    from sqlalchemy import select
+
+    from hd.db import base
+    from hd.db.models import ScanRun
+    from hd.pipeline.browse import BrowseSummary, _record_run_end, _record_run_start
+
+    s = settings_for(tmp_path)
+    await base.init_db(s)
+    run_id = await _record_run_start(s, ("network",))
+
+    summary = BrowseSummary()
+    summary.walks = 4
+    summary.deferred_walks = 7
+    summary.deferred_categories = 2
+    await _record_run_end(s, run_id, summary, requests_used=206)
+
+    async with base.get_session(s) as session:
+        stored = (await session.execute(
+            select(ScanRun.deferred_walks, ScanRun.deferred_categories)
+            .where(ScanRun.id == run_id))).one()
+    await base.close_db()
+
+    # Kept apart, never summed: one category resolves to one or many walks, so
+    # 7 + 2 is not a quantity of anything. The admission-ceiling gate is judged
+    # on these numbers.
+    assert stored == (7, 2)
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_deferred_nothing_records_zero_not_null(tmp_path):
+    """Zero is an observation. NULL is reserved for rows predating the column,
+    where we genuinely did not record it."""
+    from sqlalchemy import select
+
+    from hd.db import base
+    from hd.db.models import ScanRun
+    from hd.pipeline.browse import BrowseSummary, _record_run_end, _record_run_start
+
+    s = settings_for(tmp_path)
+    await base.init_db(s)
+    run_id = await _record_run_start(s, ("network",))
+    await _record_run_end(s, run_id, BrowseSummary(), requests_used=67)
+
+    async with base.get_session(s) as session:
+        stored = (await session.execute(
+            select(ScanRun.deferred_walks).where(ScanRun.id == run_id))).scalar_one()
+    await base.close_db()
+
+    assert stored == 0

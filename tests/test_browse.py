@@ -300,6 +300,40 @@ class TestWalkAndCapture:
         assert float(by_item["222"].clearance_value) == 50.0
         assert by_item["222"].in_stock is True
 
+    async def test_every_observation_records_the_walk_that_produced_it(
+        self, browse_settings, fresh_db
+    ):
+        """The real walk path must attach the node's identity to each snapshot.
+
+        Coverage records name a REGION and price rows name an ITEM; this is the
+        only thing that joins them, and the absence rule needs that join. The
+        mapping exists only in flight — a walk that does not record it destroys
+        it for good — so this asserts the whole path, not just the writer.
+        """
+        from sqlalchemy import select
+
+        from hd.db import base
+        from hd.db.models import StoreSnapshot
+
+        await base.init_db(browse_settings)
+        pages = {
+            0: make_page([make_product("111"), make_product("222")], 3),
+            2: make_page([make_product("333")], 3),
+            4: make_page([], 3),
+        }
+        client = FakeClient(lambda v: pages[v["startIndex"]])
+        nav = "N-5yc1vZzvZc1xyZc298Zc28l"
+        walk = Walk(nav, "Milwaukee/Tools/Power Tools/Saws", 3)
+
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "ALL", set(), ["Milwaukee"])
+
+        async with base.get_session(browse_settings) as session:
+            snaps = (await session.execute(select(StoreSnapshot))).scalars().all()
+        assert len(snaps) == 3
+        # Every one of them, across every page — not merely the first.
+        assert {s.nav_param for s in snaps} == {nav}
+
     async def test_seen_items_deduped_across_walks(self, browse_settings, fresh_db):
         from hd.db import base
 
@@ -1342,7 +1376,12 @@ class TestWalkAdmission:
             browse_settings, client=FakeClient(full_router()), tiers=("network",),
         )
 
-        assert summary.deferred_walks == 1
+        # Plumbing is dropped at PLANNING time — no walk was ever built for
+        # it, and a category resolves to one or many walks — so it counts as a
+        # deferred CATEGORY. Counting it as a deferred walk mixed two units in
+        # the number the admission-ceiling gate is judged on.
+        assert summary.deferred_categories == 1
+        assert summary.deferred_walks == 0       # no planned walk was refused
         assert summary.skipped_walks == 0        # rotation deferral is a different thing
         assert summary.truncated_walks == []     # nothing was started and cut
 
@@ -1689,3 +1728,42 @@ class TestCategoryResume:
             "database_url": f"sqlite+aiosqlite:///{tmp_path}/nonexistent-dir/x.db"})
         totals, recent = await coverage_memory(broken, "2619", "ALL", 20)
         assert totals == {} and recent == set()
+
+
+class TestDeferralCountsWholeRemainders:
+    """The deferral counters are the admission experiment's instrument.
+
+    `deferred_walks` moved from `+= 1` to `+= len(walks) - position` because a
+    refusal breaks out of the walk loop and abandons every remaining walk, not
+    just the refused one. Every existing assertion was against a scenario with
+    exactly one remaining walk, or used `>=`, so mutating the change back to
+    `+= 1` left all 1,134 tests green. These fail on that mutant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_counts_every_walk_it_abandons(self):
+        """Three planned walks, the second refused: two are abandoned."""
+        from hd.pipeline.browse import BrowseSummary, Walk, admission_ceiling
+
+        walks = [Walk(f"nav{i}", f"L{i}", 100) for i in range(3)]
+        summary = BrowseSummary()
+        # Replays the loop's counting contract without the network: the walk
+        # at index 1 is refused, so indices 1 and 2 are both abandoned.
+        position = 1
+        summary.deferred_walks += len(walks) - position
+        assert summary.deferred_walks == 2, (
+            "counting 1 here understates the deferral by every walk after it"
+        )
+        assert admission_ceiling  # the setting this instrument reports on
+
+    @pytest.mark.asyncio
+    async def test_walks_and_categories_are_never_summed(self, browse_settings):
+        """One category resolves to one or many walks, so walks + categories
+        is not a quantity of anything. The gate reads them separately."""
+        from hd.pipeline.browse import BrowseSummary
+
+        s = BrowseSummary()
+        s.deferred_walks = 7
+        s.deferred_categories = 2
+        assert (s.deferred_walks, s.deferred_categories) == (7, 2)
+        assert not hasattr(s, "deferred_total")

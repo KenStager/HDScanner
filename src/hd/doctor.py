@@ -519,6 +519,182 @@ async def check_scan_health(settings: Settings) -> list[Check]:
     return out
 
 
+# Below this share of a node's own total, a truncated walk missed something
+# that matters. At or above it, the shortfall is the node's live total moving
+# under the walk — catalog churn, not a collection failure.
+COVERAGE_CHURN_FLOOR = 0.95
+
+
+async def check_coverage_quality(settings: Settings) -> list[Check]:
+    """Does "truncated" mean churn, or does it mean we actually missed a node?
+
+    `walk_status` marks a walk truncated whenever it saw fewer items than the
+    node's own live total — including when it paged to a clean stop and the
+    total simply moved underneath it. That is deliberate under-claiming and the
+    safe direction. But it puts two unrelated quantities behind one word, and
+    the aggregate complete:truncated ratio therefore cannot be read: a walk
+    that missed 6 of 253 items and a walk that missed 1,551 of 2,197 are the
+    same row to it.
+
+    This check does the division the ratio cannot. Both numbers already exist
+    in the record — `items_expected` and `items_observed` — so nothing new is
+    stored; what was missing was anyone computing them.
+
+    Scope, which is load-bearing and has been wrong twice:
+
+    A doctor reports CURRENT health, and `walk_coverage` is append-only across
+    walk shapes that no longer exist. Summing it whole reported a node retired
+    days ago as a live problem and counted one chronically short node once per
+    run it ever ran in — measured 9x too high on this install. So the rows are
+    reduced to the latest walk per node.
+
+    The reduction takes the latest walk of ANY status and only then keeps the
+    truncated ones. Filtering to truncated first makes "latest" mean "latest
+    TRUNCATED walk", so a node that has since completed keeps reporting the
+    truncation it already recovered from. That was the second error, and it
+    named a healthy node (complete, 141/141) as the install's worst offender.
+
+    The key is `(store_id, tier, nav_param)`, not `nav_param` alone.
+    `nav_param` is the only STABLE identity a node has — `label` is a display
+    string that can change between runs — but it is not a UNIQUE one: it is
+    composed from the catalog root plus facet tokens, so the same value names
+    the same region at every store and under either storefilter. Keyed on the
+    node alone, one store's walk silently overwrites another's.
+
+    Rows with no `nav_param` cannot be attributed to a node at all, so they
+    can be nobody's "latest"; they are counted and named separately rather
+    than folded into either bucket or dropped.
+
+    Costs no API request.
+    """
+    from sqlalchemy import select
+
+    from hd.db import base
+    from hd.db.models import WalkCoverage
+
+    try:
+        await base.init_db(settings)
+        async with base.get_session(settings) as session:
+            all_rows = (await session.execute(
+                select(WalkCoverage.label,
+                       WalkCoverage.items_expected,
+                       WalkCoverage.items_observed,
+                       WalkCoverage.nav_param,
+                       WalkCoverage.store_id,
+                       WalkCoverage.tier,
+                       WalkCoverage.status,
+                       WalkCoverage.started)
+                .order_by(WalkCoverage.started))).all()
+    except Exception as e:  # a database we cannot read is itself the finding
+        return [Check("coverage-quality", FAIL, f"could not be read: {e}")]
+
+    # Reduce to the latest walk of EVERY status first, and only then keep the
+    # truncated ones. Filtering to truncated before reducing would make
+    # "latest" mean "latest TRUNCATED walk", so a node that has since
+    # completed would keep reporting the truncation it recovered from — the
+    # same staleness this scoping exists to remove, one step over.
+    #
+    # The key is (store, tier, node), not the node alone: nav_param is
+    # composed from the catalog root plus facet tokens, so the same value
+    # names the same region at every store and under either storefilter.
+    # Keying on it alone would let one store's walk overwrite another's.
+    latest: dict[tuple[str, str, str], tuple[str, int | None, int, str]] = {}
+    for label, expected, observed, nav, store_id, tier, status, _started in all_rows:
+        if nav:
+            latest[(store_id, tier, nav)] = (label, expected, observed, status)
+
+    rows = [(label, expected, observed)
+            for (label, expected, observed, status) in latest.values()
+            if status == "truncated"]
+
+    # Counted from the truncated rows only, and never reduced: a row with no
+    # nav_param cannot be attributed to a node, so it cannot be anyone's
+    # "latest" either.
+    unattributable = sum(
+        1 for _, _, _, nav, _, _, status, _ in all_rows
+        if status == "truncated" and not nav
+    )
+
+    # A truncated walk with no denominator cannot be judged either way. Counted
+    # and reported, never silently folded into the healthy bucket.
+    unjudgeable = sum(1 for _, exp, _ in rows if not exp or exp <= 0)
+    judgeable = [(lab, exp, obs) for lab, exp, obs in rows if exp and exp > 0]
+
+    if not judgeable:
+        # Blind rows are not a clean bill of health. Reporting OK here while
+        # the SAME rows raise a warning as soon as one judgeable walk appears
+        # would invert the check on its own axis.
+        if unjudgeable:
+            out = [Check(
+                "coverage-quality", WARN,
+                f"{unjudgeable} truncated walk(s) recorded no expected total, "
+                "so no shortfall can be judged in either direction",
+            )]
+        else:
+            out = [Check("coverage-quality", OK, "no truncated walks recorded")]
+        if unattributable:
+            out.append(_unattributable_check(unattributable))
+        return out
+
+    churn = [(lab, exp, obs) for lab, exp, obs in judgeable
+             if obs / exp >= COVERAGE_CHURN_FLOOR]
+    material = [(lab, exp, obs) for lab, exp, obs in judgeable
+                if obs / exp < COVERAGE_CHURN_FLOOR]
+
+    # A walk can observe MORE than the node claimed when the total grows
+    # mid-walk (walk_status still calls that truncated if the walk was cut).
+    # Clamping at zero keeps a negative shortfall from silently crediting
+    # itself against a real loss elsewhere in the sum.
+    churn_missed = sum(max(0, exp - obs) for _, exp, obs in churn)
+    material_missed = sum(max(0, exp - obs) for _, exp, obs in material)
+
+    out: list[Check] = []
+    if material:
+        worst = sorted(material, key=lambda r: r[2] / r[1])[:3]
+        worst_txt = ", ".join(
+            f"{lab.rsplit('/', 1)[-1]} {obs}/{exp}" for lab, exp, obs in worst
+        )
+        out.append(Check(
+            "coverage-quality", WARN,
+            f"{len(material)} truncated walk(s) missed real coverage "
+            f"({material_missed:,} items); {len(churn)} missed only churn "
+            f"({churn_missed:,} items). Worst: {worst_txt}",
+            "the headline truncation ratio counts both alike — read this split "
+            "instead, and check the worst nodes against the reachable ceiling",
+        ))
+    else:
+        out.append(Check(
+            "coverage-quality", OK,
+            f"all {len(churn)} truncated walk(s) are churn-level "
+            f"(≥{COVERAGE_CHURN_FLOOR:.0%} seen, {churn_missed:,} items total)",
+        ))
+
+    if unjudgeable:
+        out.append(Check(
+            "coverage-quality", WARN,
+            f"{unjudgeable} truncated walk(s) recorded no expected total, so "
+            "their shortfall cannot be judged in either direction",
+        ))
+    if unattributable:
+        out.append(_unattributable_check(unattributable))
+    return out
+
+
+def _unattributable_check(count: int) -> Check:
+    """Truncated walks with no nav_param cannot be tied to a node.
+
+    They are history — written before the column existed, or by a walk shape
+    since retired — so they say nothing about any node's current state. Named
+    rather than dropped: silently discarding rows is how a metric starts
+    lying, which is the thing this check exists to stop.
+    """
+    return Check(
+        "coverage-quality", OK,
+        f"{count} older truncated walk(s) carry no nav_param and are not "
+        "attributable to a current node; excluded from the split above",
+    )
+
+
 async def run_checks(settings: Settings) -> list[Check]:
     checks: list[Check] = []
     for fn in (check_scheduler, check_prune_job, check_liveness, check_cooldown,
@@ -539,6 +715,10 @@ async def run_checks(settings: Settings) -> list[Check]:
         checks.extend(await check_scan_health(settings))
     except Exception as e:
         checks.append(Check("scan-health", FAIL, f"check itself failed: {e}"))
+    try:
+        checks.extend(await check_coverage_quality(settings))
+    except Exception as e:
+        checks.append(Check("coverage-quality", FAIL, f"check itself failed: {e}"))
     return checks
 
 

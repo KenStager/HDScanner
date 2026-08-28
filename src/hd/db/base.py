@@ -30,6 +30,9 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("store_snapshots", "clearance_dollar_off", "NUMERIC(10,2)"),
     ("store_snapshots", "clearance_percentage_off", "INTEGER"),
     ("walk_coverage", "nav_param", "VARCHAR(200)"),
+    ("scan_runs", "deferred_walks", "INTEGER"),
+    ("scan_runs", "deferred_categories", "INTEGER"),
+    ("store_snapshots", "nav_param", "VARCHAR(200)"),
 )
 
 # Indexes have the same gap as columns: create_all adds them only alongside a

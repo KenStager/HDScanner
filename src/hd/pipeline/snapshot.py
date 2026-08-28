@@ -282,13 +282,22 @@ async def _insert_snapshots(
     matched_snapshots: list,
     store_id: str,
     now: datetime,
+    nav_param: str | None = None,
 ) -> int:
-    """Bulk insert matched snapshots."""
+    """Bulk insert matched snapshots.
+
+    nav_param names the walk these observations came from, so an item can later
+    be attributed to the region a coverage record speaks about. Defaults to
+    None because not every caller walks a node: the daily-deals sweep and the
+    keyword path observe items with no region to name, and recording a region
+    they did not walk would be inventing one.
+    """
     async with get_session(settings) as session:
         for snap in matched_snapshots:
             session.add(StoreSnapshot(
                 ts=now,
                 store_id=store_id,
+                nav_param=nav_param,
                 item_id=snap.item_id,
                 price_value=Decimal(str(snap.price_value)) if snap.price_value is not None else None,
                 price_original=Decimal(str(snap.price_original)) if snap.price_original is not None else None,

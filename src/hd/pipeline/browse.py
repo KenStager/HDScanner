@@ -88,7 +88,17 @@ class BrowseSummary:
     # not a failure — the alternative is a truncated walk, which is worse — but
     # kept separate from skipped_walks: rotation defers on a fixed schedule,
     # this defers on budget, and only one of them says the run ran short.
+    #
+    # WALKS ONLY. Categories deferred before any walk was planned for them go
+    # to deferred_categories below. The two cannot be summed — one category
+    # resolves to one or many walks — and this counter is the instrument the
+    # admission-ceiling experiment is judged on, so a mixed unit here lands on
+    # a gate decision.
     deferred_walks: int = 0
+    # Categories dropped at PLANNING time, before their walks existed, because
+    # the run had already spent its budget. Same cause as deferred_walks, a
+    # different unit.
+    deferred_categories: int = 0
 
 
 def build_nav(root: str, *tokens: str) -> str:
@@ -643,7 +653,9 @@ async def _page_direction(
             if s.item_id in wanted_ids and s.item_id not in seen_item_ids
         ]
         if snapshots:
-            snapshots_inserted += await _insert_snapshots(settings, snapshots, store_id, now)
+            snapshots_inserted += await _insert_snapshots(
+                settings, snapshots, store_id, now, walk.nav_param,
+            )
             seen_item_ids.update(s.item_id for s in snapshots)
 
         # Early stop for the second (DESC) pass: once the union has seen every
@@ -846,6 +858,12 @@ async def _record_run_end(
                     walks=summary.walks,
                     snapshots=summary.snapshots,
                     requests_used=requests_used,
+                    # Deferred walks write no coverage row by design, so this
+                    # is the only durable trace they leave. Written even when
+                    # zero: "this run deferred nothing" is a real observation,
+                    # and only a row predating the column reads NULL.
+                    deferred_walks=summary.deferred_walks,
+                    deferred_categories=summary.deferred_categories,
                 )
             )
     except Exception as e:
@@ -1052,7 +1070,7 @@ async def run_browse(
                     walks = await resolve_walks(
                         client, settings, nav, label, store_id, "IN_STORE",
                     )
-                    for walk in walks:
+                    for position, walk in enumerate(walks):
                         walk.all_brands = True
                         if client.is_throttled:
                             summary.aborted = True
@@ -1065,7 +1083,12 @@ async def run_browse(
                                 used=client.request_count,
                                 ceiling=admission_ceiling(settings),
                             )
-                            summary.deferred_walks += 1
+                            # The break abandons every remaining walk, not
+                            # just this one. Counting 1 here understated the
+                            # deferral — and this counter is the admission
+                            # experiment's instrument, so the understatement
+                            # lands directly on a gate decision.
+                            summary.deferred_walks += len(walks) - position
                             break
                         walk_started = datetime.now(timezone.utc)
                         upserts, inserts = await walk_and_capture(
@@ -1086,7 +1109,7 @@ async def run_browse(
                     store_id=store_id,
                     snapshots=summary.snapshots,
                     requests_used=client.request_count,
-                    deferred_categories=summary.skipped_walks or None,
+                    rotation_skipped=summary.skipped_walks or None,
                 )
 
         if "network" in tiers and not client.is_throttled:
@@ -1145,7 +1168,13 @@ async def run_browse(
                             # Count everything still picked: a run that quietly
                             # stops planning would otherwise report the same
                             # summary as one that finished its slice.
-                            summary.deferred_walks += len(picked) - completed
+                            #
+                            # CATEGORIES, not walks — no walk has been planned
+                            # for these yet, and a category resolves to one or
+                            # many walks. Adding them to deferred_walks mixed
+                            # two units in the number the admission-ceiling
+                            # gate is judged on.
+                            summary.deferred_categories += len(picked) - completed
                             break
                         child_nav = build_nav(nav, ref["token"])
                         child_label = f"{brand}/{ref.get('label') or ref['token']}"
@@ -1181,7 +1210,7 @@ async def run_browse(
                                      label=child_label, skipped=planned - len(walks),
                                      remaining=len(walks))
                         category_finished = True
-                        for walk in walks:
+                        for position, walk in enumerate(walks):
                             if client.is_throttled:
                                 summary.aborted = True
                                 category_finished = False
@@ -1197,7 +1226,9 @@ async def run_browse(
                                     used=client.request_count,
                                     ceiling=admission_ceiling(settings),
                                 )
-                                summary.deferred_walks += 1
+                                # Count every remaining walk, not just this
+                                # one — the break abandons them all.
+                                summary.deferred_walks += len(walks) - position
                                 category_finished = False
                                 break
                             walk_started = datetime.now(timezone.utc)
@@ -1215,6 +1246,22 @@ async def run_browse(
                                 summary.truncated_walks.append(walk.label)
                             await _pause(settings)
                         if not category_finished:
+                            # This category stopped mid-walk (admission defer
+                            # or throttle) and the break below abandons every
+                            # category still in the slice — structurally the
+                            # same abandonment as the budget_spent path above,
+                            # which does count them. Counting only there left
+                            # the rest silently uncounted by EITHER counter,
+                            # and this is the abandonment mode admission
+                            # control actually produces, so the ~Sept 2 gate
+                            # was under-reporting exactly what it measures.
+                            # `- 1` because this category was planned and
+                            # partly walked; its refused walks are already in
+                            # deferred_walks. The two units are never summed,
+                            # so this is not double counting.
+                            summary.deferred_categories += max(
+                                0, len(picked) - completed - 1
+                            )
                             break
                         completed += 1
                     cursors[key] = (start + completed) % len(categories)
@@ -1233,8 +1280,14 @@ async def run_browse(
             products=summary.products,
             snapshots=summary.snapshots,
             walks=summary.walks,
-            deferred_categories=summary.skipped_walks or None,
-            deferred_on_budget=summary.deferred_walks or None,
+            # NOTE for anyone reading log history across 2026-08-28: the key
+            # `deferred_categories` used to carry ROTATION skips and now
+            # carries budget deferrals at planning time. Rotation moved to
+            # `rotation_skipped`. Lines either side of that date mix two
+            # quantities under one key with no marker in the logs themselves.
+            rotation_skipped=summary.skipped_walks or None,
+            deferred_walks=summary.deferred_walks or None,
+            deferred_categories=summary.deferred_categories or None,
             truncated=summary.truncated_walks or None,
             requests_used=client.request_count,
             throttled=client.is_throttled,

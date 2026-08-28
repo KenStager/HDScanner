@@ -230,3 +230,99 @@ class TestWritePathWiring:
             assert stat.obs_count == 2 and stat.obs_days == 2
             assert stat.low_price == Decimal("60.00")
             assert stat.high_price == Decimal("80.00")
+
+
+class TestObservationCarriesItsRegion:
+    """An observation must remember which walk produced it.
+
+    Coverage records name a REGION; price rows name an ITEM. Nothing joined
+    them, and the absence rule needs exactly that join — an item may be called
+    absent only from a walk recorded complete over that item's region. The
+    mapping is knowable only in flight, so a walk that does not record it
+    destroys it for good.
+    """
+
+    async def test_a_walked_observation_records_its_node(self, stats_db: Settings):
+        from sqlalchemy import select
+
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+        from hd.hd_api.models import NormalizedSnapshot
+        from hd.pipeline.snapshot import _insert_snapshots
+
+        now = datetime.now(timezone.utc)
+        nav = "N-5yc1vZzvZc1xyZc298Zc28l"  # Milwaukee/Tools/Power Tools/Saws
+        await _insert_snapshots(
+            stats_db, [NormalizedSnapshot(item_id="1", store_id="2619", price_value=99.0)],
+            "2619", now, nav)
+
+        async with db_base._default.get_session(stats_db) as session:
+            stored = (await session.execute(
+                select(StoreSnapshot.nav_param))).scalars().all()
+        assert stored == [nav]
+
+    async def test_an_unwalked_observation_records_no_region_not_a_wrong_one(
+        self, stats_db: Settings
+    ):
+        """The daily-deals sweep and the keyword path walk no node. NULL means
+        "region unknown" and must never read as a match for any region."""
+        from sqlalchemy import select
+
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot
+        from hd.hd_api.models import NormalizedSnapshot
+        from hd.pipeline.snapshot import _insert_snapshots
+
+        now = datetime.now(timezone.utc)
+        await _insert_snapshots(
+            stats_db, [NormalizedSnapshot(item_id="1", store_id="2619", price_value=99.0)],
+            "2619", now)
+
+        async with db_base._default.get_session(stats_db) as session:
+            stored = (await session.execute(
+                select(StoreSnapshot.nav_param))).scalars().all()
+        assert stored == [None]
+
+    async def test_the_region_joins_an_observation_to_its_coverage_record(
+        self, stats_db: Settings
+    ):
+        """Given an item, find the walk that covers it, and ask whether that
+        walk completed.
+
+        ⚠️ The join below is deliberately minimal because this install scans
+        ONE store. It is NOT a predicate to copy: nav_param is composed from
+        the catalog root plus facet tokens, so the store is not encoded in it
+        and one value names the same region at EVERY store. Anything reasoning
+        from an item's absence must also qualify by store, by tier (a shelf
+        walk is not evidence about the online catalogue), and by run (this
+        table is append-only, so "completed once, ever" is not "completed in
+        the cycle being judged").
+        """
+        from sqlalchemy import select
+
+        from hd.db import base as db_base
+        from hd.db.models import StoreSnapshot, WalkCoverage
+        from hd.hd_api.models import NormalizedSnapshot
+        from hd.pipeline.snapshot import _insert_snapshots
+
+        now = datetime.now(timezone.utc)
+        nav = "N-5yc1vZzvZc1xyZc298Zc28l"
+        await _insert_snapshots(
+            stats_db, [NormalizedSnapshot(item_id="1", store_id="2619", price_value=99.0)],
+            "2619", now, nav)
+        async with db_base._default.get_session(stats_db) as session:
+            session.add(WalkCoverage(
+                run_id=1, store_id="2619", tier="ALL", label="M/Tools/Saws",
+                nav_param=nav, started=now, ended=now, status="truncated",
+                items_expected=295, items_observed=71,
+            ))
+            await session.commit()
+
+        async with db_base._default.get_session(stats_db) as session:
+            status = (await session.execute(
+                select(WalkCoverage.status)
+                .join(StoreSnapshot, StoreSnapshot.nav_param == WalkCoverage.nav_param)
+                .where(StoreSnapshot.item_id == "1"))).scalars().all()
+        # Item 1's region was walked, and that walk did NOT complete — so
+        # nothing may reason from this item's absence.
+        assert status == ["truncated"]

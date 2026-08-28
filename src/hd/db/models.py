@@ -108,6 +108,25 @@ class StoreSnapshot(Base):
     limited_qty: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     out_of_stock: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The walk that produced this observation — `walk_coverage.nav_param`, the
+    # only stable identity a node has.
+    #
+    # Without it, coverage records name a REGION and price rows name an ITEM,
+    # and nothing joins the two. The absence rule needs exactly that join: an
+    # item may be called absent only from a walk recorded complete "over that
+    # item's region", and region membership is knowable only by having once
+    # observed the item there. Nothing else we store carries a category — not
+    # products, and not raw_json, whose payload is identifiers/pricing/
+    # fulfillment/availability/badges/media and no taxonomy at all. So the
+    # mapping existed only in flight and was discarded, unrecoverable
+    # afterwards for every observation already taken.
+    #
+    # NULL is honest and expected: the daily-deals sweep and the keyword
+    # snapshot path do not walk a node, so their observations have no region to
+    # name, and rows written before this column existed have none either.
+    # Absence reasoning must treat a NULL as "region unknown" — never as a
+    # match against whatever region is being asked about.
+    nav_param: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class DailyDealPick(Base):
@@ -230,6 +249,28 @@ class ScanRun(Base):
     walks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     snapshots: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     requests_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Walks this run declined to START because it could not afford to finish
+    # them — admission control only. Rotation's deliberate deferrals are a
+    # different counter (`BrowseSummary.skipped_walks`) and are still
+    # unrecorded; the two are kept apart because rotation defers on a fixed
+    # schedule and only this one says the run ran short.
+    # A deferred walk deliberately writes no walk_coverage row — "not
+    # attempted is not evidence" — so it is invisible in every
+    # coverage-derived metric. In particular the
+    # complete:truncated ratio cannot see admission control working at all: a
+    # deferred walk leaves the numerator AND the denominator, so the ratio
+    # reads the same whether admission control works perfectly or not at all.
+    # Without this column the count lived only in the run summary and in log
+    # lines, and logs are not a durable record — precisely the gap this table
+    # was created to close.
+    # Nullable: rows written before this column existed did not record it, and
+    # backfilling a zero would assert a fact we never observed.
+    deferred_walks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Categories dropped at planning time, before any walk was planned for
+    # them. Same cause, different unit — one category resolves to one or many
+    # walks, so these must never be added to deferred_walks. Kept apart
+    # because the admission-ceiling gate is judged on these numbers.
+    deferred_categories: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         Index("ix_scan_runs_started", "started"),
