@@ -84,19 +84,57 @@ def _search(*totals):
 
 
 def _facets(*responses):
-    """Queue of (total, dimensions) responses returned in order; last repeats."""
+    """Queue of (total, dimensions) responses returned in order; last repeats.
+
+    Yields the REAL arity — (total, dimensions, raw). browse.fetch_facets grew
+    a third element (the page-0 body, kept so a walk can reuse a read it has
+    already paid for) and this stub did not follow, so every test here passed
+    against a two-value contract while the caller raised ValueError on every
+    real call. Brand resolution was dead — `hd setup` could not resolve a
+    brand — and 1,136 tests stayed green, because each one replaced the
+    function it was supposed to be integrating with.
+
+    test_stub_matches_the_real_signature below is what stops that recurring.
+    """
     calls = {"n": 0}
 
-    async def _inner(client, settings, nav_param, store_id, storefilter):
+    async def _inner(client, settings, nav_param, store_id, storefilter,
+                     page_size=None):
         i = min(calls["n"], len(responses) - 1)
         calls["n"] += 1
         note = getattr(client, "note_read", None)
         if note:
             note()
-        return responses[i]
+        total, dimensions = responses[i]
+        return total, dimensions, None
 
     _inner.calls = calls
     return _inner
+
+
+class TestStubFidelity:
+    """A stub that has drifted from the function it replaces tests nothing."""
+
+    async def test_stub_matches_the_real_signature(self, settings, monkeypatch):
+        import inspect
+
+        from hd.pipeline.browse import fetch_facets as real
+
+        stub = _facets((1, {}))
+        real_params = list(inspect.signature(real).parameters)
+        stub_params = list(inspect.signature(stub).parameters)
+        assert stub_params == real_params, (
+            "the facets stub no longer matches browse.fetch_facets; every test "
+            "using it is asserting against a contract that does not exist"
+        )
+
+    async def test_the_real_caller_survives_a_real_shaped_response(
+        self, monkeypatch, settings
+    ):
+        """Exercises read_brand_facet's own unpacking, not the stub's."""
+        monkeypatch.setattr(br, "fetch_facets", _facets((34707, FULL)))
+        got = await br.read_brand_facet(FakeClient(), settings, "8452")
+        assert got["DEWALT"][0] == "4j2"
 
 
 class TestListBrands:

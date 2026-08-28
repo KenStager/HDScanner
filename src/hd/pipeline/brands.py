@@ -91,7 +91,12 @@ async def read_brand_facet(
     failed or returned no Brand dimension — callers must not treat that as
     "there are no brands".
     """
-    total, dimensions = await fetch_facets(
+    # fetch_facets returns (total, dimensions, raw) — the third element is the
+    # page-0 body, kept so a walk can reuse the read it already paid for. This
+    # unpacked two and raised ValueError on every call, which meant brand
+    # resolution was dead: `hd setup` could not resolve a brand, and no brand
+    # could be added at all. Ignore the raw page; nothing here walks the node.
+    total, dimensions, _raw = await fetch_facets(
         client, settings, settings.tools_nav_param, store_id, storefilter
     )
     if client.is_throttled:
