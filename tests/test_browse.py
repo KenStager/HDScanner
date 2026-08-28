@@ -1767,3 +1767,62 @@ class TestDeferralCountsWholeRemainders:
         s.deferred_categories = 2
         assert (s.deferred_walks, s.deferred_categories) == (7, 2)
         assert not hasattr(s, "deferred_total")
+
+
+class TestCrossBrandFairness:
+    """A budget-exhausted run must not always starve the same brand.
+
+    The per-brand cursor keeps a brand fair to ITSELF across runs; nothing
+    kept the brands fair to EACH OTHER. Latent at one brand and guaranteed at
+    two, and it does not starve the second brand to zero — it slows it, so it
+    reaches each maturity level later purely by position in a CSV.
+    """
+
+    def test_the_leading_brand_advances_each_run(self):
+        from hd.pipeline.browse import brand_order_for_run
+
+        brands = [("Milwaukee", "zv"), ("DEWALT", "4j2"), ("RYOBI", "r1")]
+        cursors: dict[str, int] = {}
+        leaders = [
+            brand_order_for_run(brands, cursors, "2619")[0][0] for _ in range(4)
+        ]
+        assert leaders == ["Milwaukee", "DEWALT", "RYOBI", "Milwaukee"]
+
+    def test_rotation_is_a_rotation_not_a_reshuffle(self):
+        """Every brand appears exactly once, order preserved cyclically — the
+        per-brand resume cursors depend on it."""
+        from hd.pipeline.browse import brand_order_for_run
+
+        brands = [("A", "1"), ("B", "2"), ("C", "3")]
+        cursors: dict[str, int] = {}
+        for _ in range(3):
+            order = brand_order_for_run(brands, cursors, "2619")
+            assert sorted(order) == sorted(brands)
+        assert brand_order_for_run(brands, cursors, "2619") == brands
+
+    def test_one_brand_is_the_identity_and_burns_no_cursor(self):
+        from hd.pipeline.browse import brand_order_for_run
+
+        brands = [("Milwaukee", "zv")]
+        cursors: dict[str, int] = {}
+        assert brand_order_for_run(brands, cursors, "2619") == brands
+        assert cursors == {}
+
+    def test_stores_rotate_independently(self):
+        """Each store exhausts the shared budget in its own loop, so one
+        store's rotation must not advance another's."""
+        from hd.pipeline.browse import brand_order_for_run
+
+        brands = [("A", "1"), ("B", "2")]
+        cursors: dict[str, int] = {}
+        brand_order_for_run(brands, cursors, "2619")
+        brand_order_for_run(brands, cursors, "2619")
+        assert brand_order_for_run(brands, cursors, "8452")[0][0] == "A"
+
+    def test_a_corrupt_cursor_cannot_break_the_walk(self):
+        from hd.pipeline.browse import brand_order_for_run, brand_order_cursor_key
+
+        brands = [("A", "1"), ("B", "2")]
+        cursors = {brand_order_cursor_key("2619"): 9999}
+        order = brand_order_for_run(brands, cursors, "2619")
+        assert sorted(order) == sorted(brands)

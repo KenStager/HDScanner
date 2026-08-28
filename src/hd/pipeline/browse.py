@@ -101,6 +101,33 @@ class BrowseSummary:
     deferred_categories: int = 0
 
 
+def brand_order_cursor_key(store_id: str) -> str:
+    """Cursor key for which brand leads this run's network tier."""
+    return f"network|{store_id}|brand-order"
+
+
+def brand_order_for_run(
+    brand_tokens: list[tuple[str, str]],
+    cursors: dict[str, int],
+    store_id: str,
+) -> list[tuple[str, str]]:
+    """`brand_tokens` rotated so a different brand leads each run.
+
+    Advances the cursor as a side effect, so consecutive runs start at
+    consecutive brands and the brand that went last this run goes first next
+    run. With one brand this is the identity and costs nothing.
+
+    Deliberately keyed per store: stores are walked in their own loop and each
+    one exhausts the shared budget independently.
+    """
+    if len(brand_tokens) < 2:
+        return list(brand_tokens)
+    key = brand_order_cursor_key(store_id)
+    offset = cursors.get(key, 0) % len(brand_tokens)
+    cursors[key] = (offset + 1) % len(brand_tokens)
+    return list(brand_tokens[offset:]) + list(brand_tokens[:offset])
+
+
 def build_nav(root: str, *tokens: str) -> str:
     """Compose a navParam from the root and facet tokens."""
     parts = [root] + [t for t in tokens if t]
@@ -962,7 +989,24 @@ async def run_browse(
     try:
         if "shelf" in tiers:
             for store_id in store_ids:
-                for brand, token in brand_tokens:
+                # Rotate which brand goes FIRST, one step per run.
+                #
+                # The per-brand cursor keeps a brand fair to itself across
+                # runs, but nothing kept the brands fair to each other: this
+                # loop walked the CSV in fixed order and breaks on budget, so
+                # a run that ran short always starved whichever brand is last.
+                # Because the per-brand cursor resumes rather than restarts,
+                # that brand is not starved to zero — it is SLOWED, completing
+                # its cycle over more days than the first. For a record whose
+                # whole claim is witnessed price history that is not cosmetic:
+                # price-days are the currency of the maturity ladder, so a
+                # permanently-second brand reaches each level later by
+                # construction, and cross-brand comparisons then rest on
+                # uneven observation cadence.
+                #
+                # Invisible with one brand configured, guaranteed with two.
+                order = brand_order_for_run(brand_tokens, cursors, store_id)
+                for brand, token in order:
                     if client.is_throttled:
                         summary.aborted = True
                         break
@@ -1118,7 +1162,24 @@ async def run_browse(
                 observed_totals, recently_done = await coverage_memory(
                     settings, store_id, "ALL", settings.browse_walk_refresh_hours,
                 )
-                for brand, token in brand_tokens:
+                # Rotate which brand goes FIRST, one step per run.
+                #
+                # The per-brand cursor keeps a brand fair to itself across
+                # runs, but nothing kept the brands fair to each other: this
+                # loop walked the CSV in fixed order and breaks on budget, so
+                # a run that ran short always starved whichever brand is last.
+                # Because the per-brand cursor resumes rather than restarts,
+                # that brand is not starved to zero — it is SLOWED, completing
+                # its cycle over more days than the first. For a record whose
+                # whole claim is witnessed price history that is not cosmetic:
+                # price-days are the currency of the maturity ladder, so a
+                # permanently-second brand reaches each level later by
+                # construction, and cross-brand comparisons then rest on
+                # uneven observation cadence.
+                #
+                # Invisible with one brand configured, guaranteed with two.
+                order = brand_order_for_run(brand_tokens, cursors, store_id)
+                for brand, token in order:
                     if client.is_throttled:
                         summary.aborted = True
                         break
