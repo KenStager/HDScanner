@@ -14,6 +14,7 @@ cleanly, and scans nothing.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ from hd.hd_api.stores import (
     StoreResult,
     search_stores,
 )
+from hd.http.cooldown import ThrottleCooldown
 from hd.logging import get_logger
 
 log = get_logger("setup_wizard")
@@ -43,6 +45,35 @@ _KEY_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
 class SetupAborted(RuntimeError):
     """The user chose to stop, or setup cannot sensibly continue."""
+
+
+def _format_wait(seconds: float) -> str:
+    """Round a cooldown up to a useful, human-sized wait."""
+    total_minutes = max(1, math.ceil(seconds / 60))
+    hours, minutes = divmod(total_minutes, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return " ".join(parts)
+
+
+def _setup_cooldown(root: Path, settings: Settings) -> ThrottleCooldown:
+    """The persisted request cooldown, resolved against this install."""
+    path = Path(settings.throttle_cooldown_path)
+    if not path.is_absolute():
+        path = root / path
+    return ThrottleCooldown(path, settings.throttle_cooldown_seconds)
+
+
+def _client_wait(client: object) -> str | None:
+    """Remaining cooldown for a client, when it exposes one."""
+    cooldown = getattr(client, "cooldown", None)
+    if cooldown is None:
+        return None
+    remaining = cooldown.remaining_seconds()
+    return _format_wait(remaining) if remaining > 0 else None
 
 
 def _cancelled_exceptions() -> tuple[type[BaseException], ...]:
@@ -437,8 +468,12 @@ async def _resolve_brands(console, settings, store_id, client, matches, availabl
         try:
             match = await resolve_brand(client, settings, name, store_id)
         except BrandThrottled as exc:
-            console.print(f"  [yellow]{_e(str(exc))}[/yellow]")
-            continue
+            wait = _client_wait(client)
+            detail = f" Try again in about {wait}." if wait else " Try again later."
+            raise SetupAborted(
+                "Home Depot refused or throttled a request. Setup stopped to honor "
+                f"the cooldown.{detail}"
+            ) from exc
         except BrandResolutionError as exc:
             console.print(f"  [red]{_e(str(exc))}[/red]")
             raise SetupAborted("Could not read Home Depot's brand list") from exc
@@ -559,6 +594,15 @@ async def run_setup(root: Path | None = None) -> int:
     if not checks.ok:
         for problem in checks.problems:
             console.print(f"  [red]blocked:[/red] {_e(problem)}")
+        return 1
+
+    cooldown = _setup_cooldown(root, Settings())
+    if cooldown.is_active():
+        wait = _format_wait(cooldown.remaining_seconds())
+        console.print(
+            f"\n[yellow]Setup paused: Home Depot refused or throttled an earlier request. "
+            f"No request was sent. Try again in about {_e(wait)}.[/yellow]"
+        )
         return 1
 
     env_path = root / ".env"

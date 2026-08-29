@@ -316,6 +316,7 @@ class HDClient:
             # Checked per request rather than once at startup so a cooldown
             # written mid-run — by this client or a concurrent one — takes hold
             # immediately.
+            self._throttled = True
             log.warning(
                 "In throttle cooldown — not requesting",
                 resumes_in_seconds=round(self._cooldown.remaining_seconds()),
