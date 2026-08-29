@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     # costs ~size, not a flat 2×ceiling, and beats the split it replaces across
     # the whole band. Safe because coverage==total already proves completeness.
     both_ends_confirm_pages: int = 2
+    # A short page normally means end-of-results, but Home Depot also serves a
+    # short page mid-set (measured: a 299-item node returning 23 of 24 on page
+    # 2). When coverage has not yet reached the node's own total, the walk keeps
+    # paging and stops only after this many consecutive pages turn up no new
+    # itemId — so an OVERSTATED total costs a few pages instead of the walk
+    # running to the API ceiling.
+    short_page_confirm_pages: int = 2
     # Fraction of shelf categories walked per run. The shelf tier costs a fixed
     # ~154 page requests every run, six runs a day, to re-read categories that
     # mostly have not changed. At 0.5 each category is seen every other run for

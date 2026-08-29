@@ -25,6 +25,7 @@ from hd.pipeline.browse import (
     run_browse,
     walk_and_capture,
     walk_cost_estimate,
+    walk_status,
 )
 
 
@@ -1114,6 +1115,102 @@ class TestCoverageRecords:
         )
         assert walk_status(walk) == "truncated"
         assert walk.observed_ids == 1 and walk.live_total == 5
+
+    async def test_mid_set_short_page_does_not_end_the_walk(
+        self, browse_settings, fresh_db
+    ):
+        """A short page mid-set is not end-of-results — keep paging.
+
+        Home Depot serves a short page in the middle of a set: Power Tools/Saws
+        returned 23 of 24 on page 2 while its own searchReport said 299, and the
+        walk stopped at 71 with 220 items left unobserved. Coverage, not page
+        length, decides when a walk is done.
+        """
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        pages = {
+            0: [make_product("a"), make_product("b")],
+            2: [make_product("c")],                              # short, MID-set
+            4: [make_product("d")],                              # short, completes
+        }
+
+        def router(v):
+            return make_page(pages.get(v.get("startIndex", 0), []), 4)
+
+        client = FakeClient(router)
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 4)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert walk.observed_ids == 4 and walk.live_total == 4
+        assert walk_status(walk) == "complete"
+        assert client.request_count == 3   # the old rule stopped after 2
+
+    async def test_short_page_at_full_coverage_still_ends_the_walk(
+        self, browse_settings, fresh_db
+    ):
+        """The ordinary case is unchanged: an honest node stops where it did."""
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+        pages = {0: [make_product("a"), make_product("b")], 2: [make_product("c")]}
+
+        def router(v):
+            return make_page(pages.get(v.get("startIndex", 0), []), 3)
+
+        client = FakeClient(router)
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 3)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert walk_status(walk) == "complete"
+        assert client.request_count == 2   # no extra page bought
+
+    async def test_overstated_total_stops_after_pages_with_nothing_new(
+        self, browse_settings, fresh_db
+    ):
+        """An inflated totalProducts costs a few pages, never an unbounded walk."""
+        from hd.db import base
+
+        settings = browse_settings.model_copy(
+            update={"api_max_start_index": 20, "short_page_confirm_pages": 2}
+        )
+        await base.init_db(settings)
+
+        def router(v):
+            if v.get("startIndex", 0) == 0:
+                return make_page([make_product("a"), make_product("b")], 99)
+            return make_page([make_product("a")], 99)   # short, never anything new
+
+        client = FakeClient(router)
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 99)
+        await walk_and_capture(
+            client, settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert walk_status(walk) == "truncated"
+        # page 0, then 3 pages with nothing new (stale 1, 2, 3 > confirm 2).
+        assert client.request_count == 4
+        assert client.request_count < settings.api_max_start_index // settings.page_size + 1
+
+    async def test_empty_page_always_ends_the_walk(self, browse_settings, fresh_db):
+        """An empty page is the hard terminator, whatever the claimed total."""
+        from hd.db import base
+
+        await base.init_db(browse_settings)
+
+        def router(v):
+            if v.get("startIndex", 0) == 0:
+                return make_page([make_product("a"), make_product("b")], 99)
+            return make_page([], 99)
+
+        client = FakeClient(router)
+        walk = Walk("N-5yc1vZzv", "Milwaukee", 99)
+        await walk_and_capture(
+            client, browse_settings, walk, "2619", "IN_STORE", set(), ["Milwaukee"],
+        )
+        assert client.request_count == 2
+        assert walk_status(walk) == "truncated"
 
     async def test_throttled_run_is_recorded_aborted(self, browse_settings, fresh_db):
         from hd.db import base

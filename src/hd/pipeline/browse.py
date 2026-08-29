@@ -580,6 +580,7 @@ async def _page_direction(
     snapshots_inserted = 0
     observed_total: int | None = None
     confirm_left: int | None = None   # counts down once coverage first hits target
+    stale_pages = 0                   # consecutive pages that added no new itemId
     page = 0
 
     while True:
@@ -666,6 +667,7 @@ async def _page_direction(
             if p.item_id and p.item_id not in coverage_ids:
                 coverage_ids.add(p.item_id)
                 new_ids_this_page = True
+        stale_pages = 0 if new_ids_this_page else stale_pages + 1
 
         products = [
             p for p in parsed
@@ -700,8 +702,42 @@ async def _page_direction(
                 break
             confirm_left -= 1
 
-        if len(raw_products) < settings.page_size:
+        if not raw_products:
             break
+
+        if len(raw_products) < settings.page_size:
+            # A short page is the ordinary end-of-set signal, and for a node
+            # whose count is honest it still is: coverage has reached the total
+            # and we stop exactly where we used to.
+            #
+            # It is NOT sufficient on its own. Home Depot also returns a short
+            # page in the MIDDLE of a set — measured on Power Tools/Saws, whose
+            # page 2 came back with 23 of 24 while its own searchReport claimed
+            # 299. Treating that as the end stopped the walk at 71 items and
+            # left 220 of them unobserved for days, with no other walk covering
+            # them. The same cut hit the shelf's ASC direction at page 28,
+            # which is what opened the union gap that made the walk truncated.
+            #
+            # So the short page only ends the walk once coverage says the set
+            # is done. Otherwise keep paging, bounded by the same rule the
+            # both-ends confirm uses — N pages that turn up nothing new — so an
+            # OVERSTATED total costs a few pages, never an unbounded walk.
+            target = coverage_target or observed_total
+            if target is None or len(coverage_ids) >= target:
+                break
+            if stale_pages > settings.short_page_confirm_pages:
+                log.warning(
+                    "Short page with coverage still incomplete — stopping, "
+                    "nothing new for several pages",
+                    label=walk.label, page=page, covered=len(coverage_ids),
+                    total=target,
+                )
+                break
+            log.info(
+                "Short page mid-set — continuing, coverage incomplete",
+                label=walk.label, page=page, got=len(raw_products),
+                covered=len(coverage_ids), total=target,
+            )
         page += 1
 
     return products_upserted, snapshots_inserted, observed_total
