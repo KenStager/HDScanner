@@ -183,6 +183,66 @@ class TestOverviewStats:
         stats = await get_overview_stats(seeded_settings)
         assert stats["active_products"] == 2  # 100001 + 100002 active, 100003 inactive
 
+    async def test_watched_matches_active_on_a_healthy_record(
+        self, seeded_settings: Settings
+    ):
+        """When every active item was observed recently, nothing is flagged."""
+        stats = await get_overview_stats(seeded_settings)
+        assert stats["watched_products"] == stats["active_products"] == 2
+        assert stats["unwatched_products"] == 0
+
+    async def test_never_observed_product_is_not_counted_as_watched(
+        self, seeded_settings: Settings
+    ):
+        """"Watched" means observed, not merely discovered.
+
+        Nothing ever sets is_active False — discovery.py only ever sets it True
+        — so the active count is a high-water mark. Measured on a live install:
+        468 product rows carried no price observation at all. Counting those as
+        watched overstates what the record can actually speak to.
+        """
+        from hd.db import base as db_base
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(Product(
+                item_id="100004", brand="Milwaukee", title="Discovered, never priced",
+                model_number="0000-00", is_active=True,
+                first_seen_ts=now - timedelta(days=90),
+                last_seen_ts=now - timedelta(days=90),
+            ))
+
+        stats = await get_overview_stats(seeded_settings)
+        assert stats["active_products"] == 3
+        assert stats["watched_products"] == 2
+        assert stats["unwatched_products"] == 1
+
+    async def test_observation_older_than_the_window_is_not_watched(
+        self, seeded_settings: Settings
+    ):
+        """An item last seen before the window counts as gone dark, not watched."""
+        from hd.db import base as db_base
+
+        now = datetime.now(timezone.utc)
+        async with db_base._default.get_session(seeded_settings) as session:
+            session.add(Product(
+                item_id="100005", brand="Milwaukee", title="Gone dark",
+                model_number="0000-01", is_active=True,
+                first_seen_ts=now - timedelta(days=90),
+                last_seen_ts=now - timedelta(days=40),
+            ))
+            session.add(StoreSnapshot(
+                store_id="2619", item_id="100005",
+                ts=now - timedelta(days=40),
+                price_value=Decimal("50.00"),
+                in_stock=True, out_of_stock=False,
+            ))
+
+        stats = await get_overview_stats(seeded_settings)
+        assert stats["active_products"] == 3
+        assert stats["watched_products"] == 2
+        assert stats["unwatched_products"] == 1
+
     async def test_total_snapshots(self, seeded_settings: Settings):
         stats = await get_overview_stats(seeded_settings)
         assert stats["total_snapshots"] == 4  # 3 for 2619 + 1 for 8425

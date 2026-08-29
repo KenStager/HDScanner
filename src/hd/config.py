@@ -134,6 +134,14 @@ class Settings(BaseSettings):
     # itemId — so an OVERSTATED total costs a few pages instead of the walk
     # running to the API ceiling.
     short_page_confirm_pages: int = 2
+    # An item counts as "watched" on the dashboard only if the record has
+    # actually observed it inside this window. Product rows are only ever
+    # activated, never retired, so a raw active-product count is a high-water
+    # mark that can never fall — it would keep counting SKUs the retailer has
+    # delisted. Deliberately generous: a node is normally re-walked about once
+    # a day, so this flags items that have genuinely gone dark, not ordinary
+    # rotation lag.
+    dashboard_watched_days: int = 7
     # Fraction of shelf categories walked per run. The shelf tier costs a fixed
     # ~154 page requests every run, six runs a day, to re-read categories that
     # mostly have not changed. At 0.5 each category is seen every other run for

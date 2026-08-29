@@ -227,7 +227,16 @@ def _status_line(stats: dict) -> None:
         ui.label("·")
         ui.label(f"{stats['clearance_count']} clearance deals")
         ui.label("·")
-        ui.label(f"{stats['active_products']:,} items watched")
+        # Watched means observed, not merely once discovered — see
+        # get_overview_stats. The shortfall only appears when there is one, so
+        # a healthy record reads exactly as it did before.
+        ui.label(f"{stats.get('watched_products', stats['active_products']):,} items watched")
+        unwatched = stats.get("unwatched_products") or 0
+        if unwatched:
+            ui.label("·")
+            ui.label(
+                f"{unwatched:,} not seen in {stats.get('watched_days', 7)}d"
+            ).classes("hd-status-muted")
         nxt = _next_scan_label()
         if nxt:
             ui.label("·")

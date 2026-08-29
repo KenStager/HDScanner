@@ -93,6 +93,31 @@ async def get_overview_stats(settings: Settings) -> dict[str, Any]:
             )
         ).scalar() or 0
 
+        # How many of those the record has actually SEEN lately. Product rows
+        # are only ever set active (never retired), so active_products is a
+        # high-water mark: it counts every item ever discovered, including ones
+        # the retailer has since delisted. The header says "items watched", and
+        # watching is something we either did or did not do — so count the
+        # items observed inside the window and keep the shortfall alongside it
+        # rather than letting the larger number stand in for both.
+        watched_cutoff = datetime.now(timezone.utc) - timedelta(
+            days=settings.dashboard_watched_days
+        )
+        watched_products = (
+            await session.execute(
+                select(func.count(func.distinct(StoreSnapshot.item_id)))
+                .where(
+                    StoreSnapshot.ts >= watched_cutoff,
+                    # Scoped to the active set the header counts against, so
+                    # the two numbers are drawn from the same population and
+                    # the shortfall between them cannot go negative.
+                    StoreSnapshot.item_id.in_(
+                        select(Product.item_id).where(Product.is_active.is_(True))
+                    ),
+                )
+            )
+        ).scalar() or 0
+
         latest_snapshot_ts = (
             await session.execute(
                 select(StoreSnapshot.ts).order_by(desc(StoreSnapshot.ts)).limit(1)
@@ -193,6 +218,9 @@ async def get_overview_stats(settings: Settings) -> dict[str, Any]:
 
     return {
         "active_products": active_products,
+        "watched_products": watched_products,
+        "unwatched_products": max(0, active_products - watched_products),
+        "watched_days": settings.dashboard_watched_days,
         "total_snapshots": total_snapshots,
         "latest_snapshot_ts": latest_snapshot_ts,
         "alert_count_24h": alert_count_24h,
