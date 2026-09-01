@@ -319,10 +319,18 @@ class TestPlanWalks:
 
     def test_a_band_with_no_count_pushes_toward_walking_everything(self):
         """The None band contributes nothing, so the counts no longer balance
-        and the merchandising bucket is kept rather than dropped."""
+        and the merchandising bucket is kept rather than dropped.
+
+        Shaped to sit ON the boundary. The counted bands total 9 against a node
+        of 10, so reading the missing count as 0 leaves `covered` exactly one
+        short and everything is walked — while reading it as anything ≥1 would
+        balance the sum and drop the bucket. An earlier version of this test
+        used a wider gap and passed against a `_count` that returned 1 for a
+        missing value, which is the specific claim the docstring makes.
+        """
         refinements = [
             {"label": "$0 - $10", "token": "p1", "count": None},
-            {"label": "$10 - $20", "token": "p2", "count": 4},
+            {"label": "$10 - $20", "token": "p2", "count": 9},
             {"label": "Special Values", "token": "7", "count": 3},
         ]
         kept = price_partition(refinements, total=10, label="Tools")

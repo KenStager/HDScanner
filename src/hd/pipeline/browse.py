@@ -376,10 +376,32 @@ def price_partition(
 # one run and carrying only the node itself on the next — and the node's own
 # token is filtered out as already-in-nav, leaving nothing to split on, so the
 # same node routes "category-split" one run and "price-split" a few hours
-# later. The routing log measured one ~1,700-item node flipping 15 times in 9
-# days. The two axes produce different child navParams and the freshness skip
+# later. The two axes produce different child navParams and the freshness skip
 # is keyed on navParam, so nothing recognises the second pass as a repeat: the
 # node is re-read whole, at a measured ~48 requests/day.
+#
+# ONE node, not a general property of the dimension: MILWAUKEE/Tools/Hand Tools
+# flipped ~15 times in 9 days and no other node in the routing log flipped at
+# all. Size the fix to that.
+#
+# And it may be a symptom rather than the disease. Three nodes whose true sizes
+# are ~1,715, ~1,800 and ~2,240 all intermittently report a total in the narrow
+# band 1,473-1,494 — eighteen such readings in the log, with 1494 landing five
+# separate times on a node that otherwise reads 1,794-1,811. A real count does
+# not hit the same integer five times while its ordinary value drifts every
+# run. The likeliest reading is that the API sometimes answers with a result
+# set for a different scope than the navParam asked for; a response that is not
+# about this node would of course carry a Category dimension that does not
+# describe its children. Both branches occur at both the high and the low
+# readings, so the flip tracks the response, not the count.
+#
+# That matters for the fix. Recording the split (below) would make a roll-up's
+# arithmetic sound while still reconciling responses that were not about the
+# node in hand. `observed_totals` already holds each node's own high-water and
+# is already threaded into this function to correct a CHILD's claimed count; a
+# page-0 total that comes back at a fraction of a node's own recorded high-water
+# is almost certainly a bad read, and declining to route off one costs no schema
+# change. Understand the degraded read before paying for a migration.
 #
 # Rolling a completed split up to the node it split was tried as the fix and
 # WITHDRAWN. Summing a node's recently-completed children silently assumes they
@@ -421,8 +443,13 @@ def plan_walks(
         # only record of a parent node's total and route — and the only thing
         # that shows a node drifting into the both-ends band
         # (cap < total <= band_cap).
-        log.info("Walk routing", label=label, total=total, branch=branch,
-                 cap=cap, band_cap=band_cap, depth=depth)
+        # navParam as well as label: `label` falls back to the raw facet token
+        # when HD omits one, so the same node can carry two labels across runs
+        # and a routing history keyed on it cannot be trusted to be one node's.
+        # This line is, by the comment above, the only durable record a split
+        # parent leaves — attributing it needs the stable identifier.
+        log.info("Walk routing", label=label, nav_param=nav_param, total=total,
+                 branch=branch, cap=cap, band_cap=band_cap, depth=depth)
 
     if total <= cap:
         _route("single")
