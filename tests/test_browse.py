@@ -20,6 +20,7 @@ from hd.pipeline.browse import (
     rotate_shelf_walks,
     build_nav,
     plan_walks,
+    price_partition,
     reachable_cap,
     resolve_walks,
     run_browse,
@@ -229,6 +230,125 @@ class TestPlanWalks:
         assert not any(w.truncated for w in walks)
         assert need == []
 
+    def test_merchandising_price_buckets_the_ranges_contain_are_not_walked(
+        self, browse_settings
+    ):
+        """The Price dimension is not a partition. "Special Values" sits in it
+        beside the dollar ranges and OVERLAPS them, so walking the dimension
+        whole reads the same items twice. Measured live: the ranges alone
+        summed to 1,807 against a node total of 1,802, and the merchandising
+        bucket added 679 reads that could reach nothing new."""
+        dims = parse_dimensions(make_page([], 10, dims=[price_dim(
+            ("$0 - $10", "p1", 4), ("$10 - $20", "p2", 6),
+            ("Special Values", "7", 5))]))
+        walks, need = plan_walks("N-5yc1vZzvZc", "Tools", 10, dims, browse_settings)
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZcZp1", "N-5yc1vZzvZcZp2"]
+        assert need == []
+
+    def test_the_open_ended_top_band_is_a_band_not_a_merchandising_bucket(
+        self, browse_settings
+    ):
+        """The top price band does not lead with "$" — it reads "Over $5000".
+
+        It appears in 940 of the 5,652 responses on file and holds up to 27
+        items in a single node. A leading-"$" test classifies it as
+        merchandising, and since the remaining bands over-report anyway it
+        would then be DROPPED: every item above $5,000 gone, with no error and
+        no coverage row to show for it. This is the whole reason the match is
+        on a currency amount anywhere in the label.
+
+        The counts below are shaped like production — the bands over-report
+        against the node total — so the leading-"$" rule reaches the drop and
+        loses the band, rather than being saved by the containment check.
+        """
+        dims = parse_dimensions(make_page([], 10, dims=[price_dim(
+            ("$0 - $10", "p1", 12), ("Over $5000", "p9", 4),
+            ("Special Values", "7", 3))]))
+        walks, _need = plan_walks("N-5yc1vZzvZc", "Tools", 10, dims, browse_settings)
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZcZp1", "N-5yc1vZzvZcZp9"]
+
+    def test_an_unmeasured_price_bucket_is_dropped_but_warned_about(
+        self, browse_settings
+    ):
+        """Classification is by exclusion, and that is an assumption.
+
+        Anything with no currency amount in its label is treated as contained
+        by the bands. True of "Special Values"; not a general law. An ADDITIVE
+        refinement with no price in its label would be dropped silently in the
+        99.4% of nodes where the counts balance. The drop still happens — the
+        counting argument is the same — but a label nobody has measured must
+        announce itself, or a new bucket goes unnoticed indefinitely.
+        """
+        from structlog.testing import capture_logs
+        dims = parse_dimensions(make_page([], 10, dims=[price_dim(
+            ("$0 - $10", "p1", 12), ("Free Delivery", "fd", 5))]))
+        with capture_logs() as logs:
+            walks, _need = plan_walks("N-5yc1vZzvZc", "Tools", 10, dims, browse_settings)
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZcZp1"]
+        warnings = [entry for entry in logs if entry.get("log_level") == "warning"]
+        assert any(entry.get("unknown") == ["Free Delivery"] for entry in warnings)
+
+    def test_the_measured_bucket_is_dropped_without_that_warning(self, browse_settings):
+        """The counterpart: "Special Values" is measured, so it is not noise.
+
+        Scoped to the unknown-refinement warning specifically — a price split
+        emits other warnings of its own (a band over the API ceiling, here),
+        and a blanket "no warnings" assertion would pass for the wrong reason.
+        """
+        from structlog.testing import capture_logs
+        dims = parse_dimensions(make_page([], 10, dims=[price_dim(
+            ("$0 - $10", "p1", 12), ("Special Values", "7", 5))]))
+        with capture_logs() as logs:
+            plan_walks("N-5yc1vZzvZc", "Tools", 10, dims, browse_settings)
+        assert not [entry for entry in logs if "unknown" in entry]
+
+    def test_a_refinement_with_no_count_does_not_raise(self):
+        """`parse_dimensions` deliberately preserves a missing recordCount as
+        None. `plan_walks` pre-filters those out, so this is about a DIRECT
+        call: the function must state a precondition or survive without one.
+        Reading None as zero can only shrink the bands' total, which pushes the
+        decision toward walking everything — the safe direction.
+        """
+        refinements = [
+            {"label": "$0 - $10", "token": "p1", "count": None},
+            {"label": "$10 - $20", "token": "p2", "count": 12},
+            {"label": "Special Values", "token": "7", "count": None},
+        ]
+        kept = price_partition(refinements, total=10, label="Tools")
+        assert [r["token"] for r in kept] == ["p1", "p2"]
+
+    def test_a_band_with_no_count_pushes_toward_walking_everything(self):
+        """The None band contributes nothing, so the counts no longer balance
+        and the merchandising bucket is kept rather than dropped."""
+        refinements = [
+            {"label": "$0 - $10", "token": "p1", "count": None},
+            {"label": "$10 - $20", "token": "p2", "count": 4},
+            {"label": "Special Values", "token": "7", "count": 3},
+        ]
+        kept = price_partition(refinements, total=10, label="Tools")
+        assert [r["token"] for r in kept] == ["p1", "p2", "7"]
+
+    def test_a_merchandising_bucket_the_ranges_do_not_cover_is_still_walked(
+        self, browse_settings
+    ):
+        """Containment is checked, not assumed. If the ranges fall short then
+        something is reachable only through the other bucket, and coverage
+        outranks economy."""
+        dims = parse_dimensions(make_page([], 10, dims=[price_dim(
+            ("$0 - $10", "p1", 3), ("Special Values", "7", 7))]))
+        walks, _need = plan_walks("N-5yc1vZzvZc", "Tools", 10, dims, browse_settings)
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZcZp1", "N-5yc1vZzvZcZ7"]
+
+    def test_a_price_dimension_of_only_merchandising_buckets_is_left_alone(
+        self, browse_settings
+    ):
+        """With no ranges to compare against there is nothing to prove
+        contained — and these buckets are then the only split on offer."""
+        dims = parse_dimensions(make_page([], 10, dims=[price_dim(
+            ("Special Values", "7", 6), ("New Lower Prices", "8", 4))]))
+        walks, _need = plan_walks("N-5yc1vZzvZc", "Tools", 10, dims, browse_settings)
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZcZ7", "N-5yc1vZzvZcZ8"]
+
     def test_no_facets_marks_truncated(self, browse_settings):
         walks, need = plan_walks("N-5yc1vZzv", "Milwaukee", 100, {}, browse_settings)
         assert len(walks) == 1 and walks[0].truncated
@@ -261,6 +381,35 @@ class TestResolveWalks:
         navs = sorted(w.nav_param for w in walks)
         assert navs == ["N-5yc1vZzvZbigZa", "N-5yc1vZzvZbigZb", "N-5yc1vZzvZsm"]
         assert not any(w.truncated for w in walks)
+
+    async def test_the_price_partition_reaches_a_child_split_two_levels_down(
+        self, browse_settings
+    ):
+        """`price_partition` is only worth anything if the pipeline reaches it.
+
+        The unit tests call `plan_walks` directly, so a broken hand-off between
+        `resolve_walks` and `plan_walks` would leave every one of them green
+        while the merchandising bucket went on being walked in production. This
+        drives the real recursion: an over-cap child gets its own facet read,
+        that read comes back with a Price dimension, and the bucket the bands
+        already contain must not appear in the returned plan.
+        """
+        def router(v):
+            nav = v["navParam"]
+            if nav == "N-5yc1vZzv":
+                return make_page([], 10, dims=[cat_dim(("Big", "big", 8), ("Small", "sm", 2))])
+            if nav == "N-5yc1vZzvZbig":
+                return make_page([], 8, dims=[price_dim(
+                    ("$0 - $10", "p1", 5), ("$10 - $20", "p2", 4),
+                    ("Special Values", "7", 3))])
+            raise AssertionError(f"unexpected nav {nav}")
+
+        client = FakeClient(router)
+        walks = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzv", "Milwaukee", "2619", "IN_STORE",
+        )
+        navs = sorted(w.nav_param for w in walks)
+        assert navs == ["N-5yc1vZzvZbigZp1", "N-5yc1vZzvZbigZp2", "N-5yc1vZzvZsm"]
 
 
 # ---------------------------------------------------------------- walking

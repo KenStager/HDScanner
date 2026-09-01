@@ -271,6 +271,129 @@ def admits(client: HDClient, settings: Settings, walk: Walk) -> bool:
     return False
 
 
+# A price band is the only refinement in the Price dimension that partitions by
+# price. Home Depot also files merchandising buckets there ("Special Values"),
+# which OVERLAP the bands rather than extending them.
+#
+# Matched on a currency amount ANYWHERE in the label, not a leading "$". The
+# top band is open-ended and reads "Over $5000" — it appears in 940 of the
+# 5,652 responses on file and holds up to 27 items in a single node. A
+# leading-"$" test called it merchandising and would have dropped it, hiding
+# every item above $5,000 with no error and no coverage row to show for it.
+# Searching for the amount also errs the safe way: an unrecognised bucket that
+# happens to carry a price is walked rather than discarded.
+PRICE_BAND_LABEL = re.compile(r"\$\s*[\d,]")
+
+# Non-band Price refinements known by measurement to be contained by the bands.
+# Anything else that reaches the drop is an assumption, not a finding, and says
+# so in the log — see the classification note in price_partition.
+KNOWN_CONTAINED_PRICE_LABELS = frozenset({"Special Values"})
+
+
+def _count(refinement: dict) -> int:
+    """A refinement's count, treating an absent one as zero.
+
+    `parse_dimensions` deliberately preserves a missing recordCount as None.
+    Zero is the safe reading here: it can only shrink the bands' total and so
+    only ever pushes this function toward walking everything.
+    """
+    return refinement.get("count") or 0
+
+
+def price_partition(
+    refinements: list[dict], total: int, label: str = "",
+) -> list[dict]:
+    """The Price refinements to walk: the bands, minus what they already hold.
+
+    The Price dimension is not a partition. Alongside the price bands it
+    carries merchandising buckets — "Special Values" is the only one this
+    catalog serves, across 5,652 saved responses — and those are a SUBSET of
+    the bands, not a slice beside them. Walking the dimension whole therefore
+    reads the same items twice. Measured on two nodes: the bands alone already
+    summed to 1,748 against a node total of 1,709, and to 1,807 against 1,802,
+    while the merchandising bucket added a further 593 and 679 reads that could
+    reach nothing new — and inserted zero snapshots, because the ids were
+    already in this store's seen set.
+
+    **What the check proves, stated exactly: the COUNTS balance.** It does not
+    prove set containment — two different sets can be the same size — and the
+    slack is sometimes one item. Across the 1,510 over-cap responses on file
+    that carry both bands and a merchandising bucket, the median margin is +54
+    but the minimum is **+1** (MILWAUKEE/Outdoors: total 812, bands 813). At
+    +1, a single item outside every band makes the arithmetic balance anyway.
+    The check still earns its place — it fires on 31 real responses — but it is
+    a counting argument, not a proof, and it is the reason the drop is limited
+    to buckets already measured to be contained.
+
+    **Classification is by exclusion, which is an assumption.** Anything
+    carrying no currency amount is treated as contained. That is true of
+    "Special Values" and is not a general law: an ADDITIVE refinement with no
+    price in its label — "Free Delivery", "Clearance" — would be dropped
+    silently in the 99.4% of nodes where the counts balance. The band regex
+    errs safe for the reverse case (an unknown bucket that carries a price is
+    walked), so this is the exposed direction, and any label outside
+    KNOWN_CONTAINED_PRICE_LABELS is logged as a warning rather than waved
+    through. Widen that set only after measuring the new bucket.
+
+    A dimension with no bands at all is returned untouched: then the
+    merchandising buckets are the only split on offer.
+    """
+    bands: list[dict] = []
+    others: list[dict] = []
+    for ref in refinements:
+        is_band = bool(PRICE_BAND_LABEL.search(ref.get("label") or ""))
+        (bands if is_band else others).append(ref)
+    if not bands or not others:
+        return refinements
+    covered = sum(_count(r) for r in bands)
+    if covered < total:
+        log.info(
+            "Price bands do not cover the node — walking every refinement",
+            label=label, total=total, covered=covered,
+            extra=[r.get("label") for r in others],
+        )
+        return refinements
+    strangers = [r.get("label") for r in others
+                 if (r.get("label") or "") not in KNOWN_CONTAINED_PRICE_LABELS]
+    if strangers:
+        log.warning(
+            "Unknown Price refinement assumed contained by the bands — verify "
+            "it is not additive before trusting this drop",
+            label=label, unknown=strangers, total=total, covered=covered,
+        )
+    log.info(
+        "Dropping price refinements the bands already contain",
+        label=label, total=total, covered=covered,
+        dropped=[r.get("label") for r in others],
+        saved_items=sum(_count(r) for r in others),
+    )
+    return bands
+
+
+# KNOWN, MEASURED, UNFIXED: the split axis below is not stable per node.
+#
+# The Category dimension for a given node comes back carrying its children on
+# one run and carrying only the node itself on the next — and the node's own
+# token is filtered out as already-in-nav, leaving nothing to split on, so the
+# same node routes "category-split" one run and "price-split" a few hours
+# later. The routing log measured one ~1,700-item node flipping 15 times in 9
+# days. The two axes produce different child navParams and the freshness skip
+# is keyed on navParam, so nothing recognises the second pass as a repeat: the
+# node is re-read whole, at a measured ~48 requests/day.
+#
+# Rolling a completed split up to the node it split was tried as the fix and
+# WITHDRAWN. Summing a node's recently-completed children silently assumes they
+# partition it, and they do not: replayed over 43 real runs it marked one node
+# covered 5 times when neither axis had covered it, which would have skipped
+# ~220 items with nothing but an INFO line to show for it. It also needed the
+# parent's own items_expected as a denominator, which exists only for a node
+# whose split once FAILED and can never be refreshed, since a successful split
+# writes no row for the parent.
+#
+# A correct version needs the split recorded rather than inferred from navParam
+# shape — a `split_parent`/`split_axis` column on WalkCoverage — so that a
+# roll-up can be scoped to one real split. That is a schema change and is not
+# attempted here.
 def plan_walks(
     nav_param: str,
     label: str,
@@ -348,10 +471,11 @@ def plan_walks(
         return walks, need
 
     if not price_split_used:
-        prices = [
-            r for r in dimensions.get(PRICE_DIMENSION, [])
-            if r.get("count") and r["count"] > 0
-        ]
+        prices = price_partition(
+            [r for r in dimensions.get(PRICE_DIMENSION, [])
+             if r.get("count") and r["count"] > 0],
+            total, label=label,
+        )
         if prices:
             walks = []
             for ref in prices:
@@ -951,6 +1075,9 @@ async def coverage_memory(
       Milwaukee category was walked once, and three consecutive runs opened
       with the identical six walks. Skipping what was just completed turns that
       restart into forward progress.
+
+      Only nodes a walk actually carried. Rolling a completed split UP to the
+      node it split was tried and withdrawn: see the note above plan_walks.
 
     Keyed on nav_param, never label: `label` falls back to the raw facet token
     when HD omits a label, so the same node can carry two labels across runs.
