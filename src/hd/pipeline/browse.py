@@ -497,14 +497,22 @@ def price_partition(
 # grows — page 0 gives 24, page 1 gives the rest, page 2 gives none, so the
 # walk reaches its natural end every time and is still one short.
 #
-# Do not go looking for a bad count, and do not go looking for one phantom
-# item. The claim is right: the union of everything the band has ever returned
-# is 43, exactly what it now claims. 39 of those appear in every run and 4
-# flicker. So the defect is that pagination yields one fewer than the set it is
-# paging, not that totalProducts invents an item — walk_status is right to call
-# the walk truncated, and the node can never be declared covered. That is the
-# pre-existing phantom-item defect, it is worth its own look, and it is why
-# this fix is per-child rather than per-node.
+# Do not go looking for a bad count, do not go looking for one phantom item,
+# and do not go looking at the paging. The count is right: across the 4 runs
+# that claim 43 the union of what they returned is exactly 43, so all 43 exist.
+# Each of those runs returned 42 and omitted ONE — and not the same one:
+# 325682043 in the first, 317097247 in the other three.
+#
+# The omission is not at a page boundary. When they are returned at all, those
+# two sit at position 14 and position 36 of 42, mid-page in both cases; the
+# pages stay 24 then 18 either way because offset paging just closes the gap.
+# So a single traversal is served a result set of 42 out of a true 43, with an
+# arbitrary member absent, and pages that set faithfully. The defect is in what
+# one request is willing to return, not in how the walk pages it.
+#
+# walk_status is right to call the walk truncated and the node can never be
+# declared covered. That is the pre-existing phantom-item defect, it is worth
+# its own look, and it is why this fix is per-child rather than per-node.
 #
 # ALSO UNRESOLVED: the degraded read. Three nodes whose true sizes are ~1,715,
 # ~1,800 and ~2,240 all intermittently report a total in the narrow band
