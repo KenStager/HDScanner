@@ -430,8 +430,27 @@ def price_partition(
 # (20 bands) saw 1,736, sharing 1,722: 3 category-only and 14 price-only. The
 # same-node-across-a-day churn baseline over the same corpus is 1.45%, so the
 # 0.99% the axes disagree by is smaller than the noise the catalogue makes on
-# its own. Sticking to one axis for one window costs nothing measurable, and
-# the preference lapsing at the window boundary keeps both axes exercised.
+# its own. Sticking to one axis for one window therefore costs nothing
+# measurable.
+#
+# Both axes stay in use, but be honest about how much less. In the 12-run
+# replay the preference lapsed on 3 runs, and only 1 of those 3 fell on a run
+# where the Category dimension had come back at all, so the planner chose
+# category once in 12 where today it chooses it 5 times in 12 — the same 5 runs
+# on which the dimension was available at all. That is the trade: the minority
+# axis is exercised about a fifth as often, against a measured 0.99%
+# disagreement between what the two axes see. If that disagreement ever grows,
+# this is the line to revisit.
+#
+# What the disagreement is made of, since this is where the change could lose
+# something. Of the 3 items the category axis saw and the price axis did not,
+# two are demonstrably price-reachable: the $160.86 one turns up under a band
+# on 3 saved runs (under $20 - $30, not the band its displayed price implies —
+# worth its own look) and the $416.94 one under its own band on 2 of that
+# band's 8 saved runs. The third, at $149.97, appears nowhere under any band in
+# the corpus — but it first enters the record at all on 2026-09-03 04:07, and
+# its band was last walked 2026-09-02 20:07, so no price sweep has yet had the
+# chance to see it. Absence of opportunity, not absence of access.
 #
 # NOT VERIFIED IN PRODUCTION, and the kill condition is the one the admission
 # ceiling already uses: if daily requests have not fallen and the
@@ -440,18 +459,46 @@ def price_partition(
 # runs it covers, against the ~48/day the flip was measured to cost; that is a
 # reconstruction from saved pages and recorded rows, not a live reading.
 #
+# THE SAVING IS NET, NOT PER RUN, and that is worth knowing before reading the
+# first day of logs as a regression. Holding one axis for a window concentrates
+# a full sweep into one run where the flipping behaviour sometimes spread it
+# over two, so in the same replay 4 of the 12 runs spend MORE on this node than
+# they actually did — worst +75 — while the twelve together spend 125 fewer.
+# The worst single-run figure it produces for this node is 120 requests against
+# an observed actual peak of 103. Read that against the ceiling actually in
+# force, not the code default: BROWSE_WALK_ADMISSION_CEILING is set to 237, so
+# admission_ceiling() is 237 rather than browse_request_budget's 280, and one
+# node spiking to 120 is about half of it. BROWSE_NETWORK_CATEGORIES_PER_RUN is
+# set to 12, so up to twelve top-level categories compete for that same 237.
+#
+# That is a live risk and not a theoretical one, because of what a deferral
+# does in the network-tier loop below. Each band costs single digits, far under
+# the ceiling, so the starvation clause in admits() never engages for this node
+# and it is the ordinary "can I afford this walk" test that eventually fails.
+# When it does, the tail of this node's own children defers AND category_finished
+# goes False, which leaves `completed` un-advanced and breaks out of the slice —
+# abandoning every other category the run had picked. So a spike here does not
+# only risk this node; it can starve whatever was scheduled behind it.
+#
 # WHAT THIS DOES NOT FIX, measured on the same corpus. A node-level rule —
 # "skip the other axis once every child of the recorded split is complete" —
 # cannot fire here at all, and would have shipped inert: BOTH axes of this node
 # contain a child that has never once completed. Hand Tools/$400 - $500 is 0
 # complete in 10 attempts and Hand Tools/Measuring Tools 0 in 8, each short by
-# exactly one item every time. Reading the saved pages back shows why: page 0
-# returns 24 items, page 1 returns 18, page 2 returns none — pagination runs to
-# its natural end and yields 42 distinct itemIds against a totalProducts of 43,
-# identically on three separate runs. The denominator over-claims by one, so
-# walk_status is right to call the walk truncated and the node can never be
-# declared covered. That is the pre-existing phantom-item defect, it is worth
-# its own look, and it is why this fix is per-child rather than per-node.
+# exactly one item every time. Reading the saved pages back shows the shape of
+# it. Across all 8 saved runs of $400 - $500 the band claims N and pagination
+# returns N-1, with N rising 41, 40, 42, 42, 43, 43, 43, 43 as the catalogue
+# grows — page 0 gives 24, page 1 gives the rest, page 2 gives none, so the
+# walk reaches its natural end every time and is still one short.
+#
+# Do not go looking for a bad count, and do not go looking for one phantom
+# item. The claim is right: the union of everything the band has ever returned
+# is 43, exactly what it now claims. 39 of those appear in every run and 4
+# flicker. So the defect is that pagination yields one fewer than the set it is
+# paging, not that totalProducts invents an item — walk_status is right to call
+# the walk truncated, and the node can never be declared covered. That is the
+# pre-existing phantom-item defect, it is worth its own look, and it is why
+# this fix is per-child rather than per-node.
 #
 # ALSO UNRESOLVED: the degraded read. Three nodes whose true sizes are ~1,715,
 # ~1,800 and ~2,240 all intermittently report a total in the narrow band
