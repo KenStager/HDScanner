@@ -486,13 +486,21 @@ def price_partition(
 # abandoning every other category the run had picked. So a spike here does not
 # only risk this node; it can starve whatever was scheduled behind it.
 #
-# WHAT THIS DOES NOT FIX, measured on the same corpus. A node-level rule —
-# "skip the other axis once every child of the recorded split is complete" —
-# cannot fire here at all, and would have shipped inert: BOTH axes of this node
-# contain a child that has never once completed. Hand Tools/$400 - $500 is 0
-# complete in 10 attempts and Hand Tools/Measuring Tools 0 in 8, each short by
-# exactly one item every time. Reading the saved pages back shows the shape of
-# it. Across all 8 saved runs of $400 - $500 the band claims N and pagination
+# WHAT THIS DOES NOT FIX. A node-level rule — "skip the other axis once every
+# child of the recorded split is complete" — has still never been able to fire
+# here, because no run has yet had every child of either axis complete at the
+# same time. But be careful with the reason, because the first post-merge run
+# corrected it. The original claim here was that both axes contain a child that
+# has NEVER completed: Hand Tools/$400 - $500 0 in 10 attempts and
+# Hand Tools/Measuring Tools 0 in 8, each short by exactly one item. On
+# 2026-09-03 16:00 ET that band claimed 44 and returned all 44, so it now
+# stands at 1 complete in 11 and the "never" was wrong. Measuring Tools is
+# still 0 in 8.
+#
+# So the one-short behaviour is INTERMITTENT, not a fixed property of these
+# nodes, and a node-level rule is blocked by a coincidence that has not yet
+# happened rather than by one that cannot. Reading the saved pages back shows
+# the shape of it. Across all 8 saved runs of $400 - $500 the band claims N and pagination
 # returns N-1, with N rising 41, 40, 42, 42, 43, 43, 43, 43 as the catalogue
 # grows — page 0 gives 24, page 1 gives the rest, page 2 gives none, so the
 # walk reaches its natural end every time and is still one short.
