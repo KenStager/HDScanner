@@ -72,7 +72,7 @@ def check_scheduler(settings: Settings) -> Iterable[Check]:
     """The scan job exists, is loaded, and runs the interpreter we think it does."""
     plists = [
         p for p in _plists()
-        if not any(job in p.name for job in ("dashboard", "prune", "backup"))
+        if not any(job in p.name for job in ("dashboard", "prune", "backup", "dailydeals"))
     ]
     if not plists:
         yield Check("scheduler", FAIL, "no scan job installed",

@@ -175,6 +175,24 @@ class Settings(BaseSettings):
     # record none of the ~110 daily deals were a tracked brand. Raise this to
     # spend that many requests probing unknown ids anyway.
     daily_deals_probe_unknown: int = 0
+    # `hd daily-deals --wait-for-refresh` re-reads the page every
+    # daily_deals_poll_seconds until the embedded set's end date changes, for
+    # at most daily_deals_poll_max reads, then sweeps the new set. Six reads two
+    # minutes apart span 3:00 to 3:10 Eastern. Any read that fails or does not
+    # parse ends the poll; there is no retry.
+    daily_deals_poll_seconds: int = 120
+    daily_deals_poll_max: int = 6
+    # Installs must not all arrive on the refresh at the same instant (the
+    # argument scan_minute makes): the first read waits a per-install 0..N s,
+    # and each interval is stretched by a random 0..N s. Only ever delays.
+    daily_deals_poll_jitter_seconds: int = 15
+    # Every read of the page appends one JSON line here: end date, item count,
+    # a digest of the item list. The routine sweep reads the page on the runs
+    # DAILY_DEALS_HOURS_ET selects (empty = every run), so with it empty this
+    # records whether the list changes between reads for one page request per
+    # run and no API requests. Priced items are appended before they are
+    # written to the database. Gitignored; rolls one generation at 8 MB.
+    daily_deals_evidence_path: str = "diagnostics/daily_deals_polls.jsonl"
 
 
     # True-savings verdicts need real history: an item first seen minutes ago

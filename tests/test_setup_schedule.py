@@ -371,3 +371,31 @@ class TestCadence:
 
         for i in range(50):
             assert 0 <= scan_minute(Path(f"/x/{i}")) < 60
+
+
+class TestDealsPollJob:
+    WORK = Path("/Users/bob/HDScanner")
+    HD = Path("/Users/bob/HDScanner/.venv/bin/hd")
+
+    def test_poll_slot_sits_on_the_refresh_in_local_time(self):
+        from hd.setup_schedule import deals_poll_slot
+
+        assert deals_poll_slot(tz=EASTERN, on=WINTER) == ScheduleSlot(3, 0)
+        pacific = ZoneInfo("America/Los_Angeles")
+        assert deals_poll_slot(tz=pacific, on=WINTER) == ScheduleSlot(0, 0)
+
+    def test_poll_job_polls_then_notifies_and_never_scans(self):
+        import plistlib
+
+        from hd.setup_schedule import render_deals_poll_plist
+
+        text = render_deals_poll_plist("com.bob.hdscanner.dailydeals", self.WORK, self.HD, ScheduleSlot(3, 0))
+        data = plistlib.loads(text.encode())
+        cmd = data["ProgramArguments"][-1]
+        assert "daily-deals --wait-for-refresh" in cmd
+        assert cmd.rstrip().endswith("notify")
+        assert "run-once" not in cmd
+        assert data["StartCalendarInterval"] == [{"Hour": 3, "Minute": 0}]
+        assert data["RunAtLoad"] is False
+        assert data["Label"] == "com.bob.hdscanner.dailydeals"
+        assert data["StandardErrorPath"].endswith("hd_dailydeals.stderr.log")

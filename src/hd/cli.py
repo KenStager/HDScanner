@@ -272,8 +272,23 @@ def browse(
 @app.command()
 def daily_deals(
     force: bool = typer.Option(False, "--force", help="Re-process even if today's set was already swept"),
+    wait_for_refresh: bool = typer.Option(
+        False, "--wait-for-refresh",
+        help="Re-read the page every DAILY_DEALS_POLL_SECONDS until the set changes "
+             "(at most DAILY_DEALS_POLL_MAX reads), then sweep. Start it at 3:00 Eastern.",
+    ),
+    alert: bool = typer.Option(
+        True, "--alert/--no-alert",
+        help="After a sweep, diff the new snapshots and write alerts; `hd notify` delivers them. "
+             "--no-alert loses the drop alert for good: the next run's diff compares this "
+             "sweep's price with its own and sees no change.",
+    ),
 ) -> None:
     """Price today's Daily Deals set (Special Buy of the Day) for configured brands."""
+    if force and wait_for_refresh:
+        console.print("[red]--force re-sweeps the set on the page now; --wait-for-refresh waits "
+                      "for it to change. Pick one.[/red]")
+        raise typer.Exit(code=2)
     setup_logging()
     settings = Settings()
     _need_stores(settings.store_list)
@@ -281,21 +296,56 @@ def daily_deals(
 
     async def _daily():
         from hd.db.base import init_db as _init_tables, close_db
-        from hd.pipeline.daily_deals import run_daily_deals
+        from hd.logging import get_logger
+        from hd.pipeline.daily_deals import run_daily_deals, wait_for_refresh as _wait
 
+        log = get_logger("pipeline.daily_deals")
         await _init_tables(settings)
-        summary = await run_daily_deals(settings, force=force)
-        await close_db()
-        return summary
+        alert_count = 0
+        try:
+            if wait_for_refresh:
+                summary = await _wait(settings)
+            else:
+                summary = await run_daily_deals(settings, force=force)
+            if alert and not summary.skipped and summary.snapshots:
+                from hd.pipeline.alerts import write_alerts
+                from hd.pipeline.diff import run_diff
 
-    s = _run(_daily())
-    if s.skipped:
+                found = await run_diff(settings=settings)
+                if found:
+                    alert_count = await write_alerts(settings=settings, alerts=found)
+                log.info("Diff complete", alerts=alert_count)
+        finally:
+            await close_db()
+        return summary, alert_count
+
+    s, alert_count = _run(_daily())
+    if s.stopped == "unavailable":
+        console.print(
+            f"[red]Daily-deals page unavailable on read {s.polls} — stopped without retry. "
+            "The next scheduled run sweeps the set as usual.[/red]"
+        )
+        raise typer.Exit(code=2)
+    if s.stopped in ("unchanged", "late"):
+        why = "started too far from 3:00 Eastern to poll" if s.stopped == "late" else "unchanged"
+        console.print(
+            f"[yellow]Daily-deals set {why} after {s.polls} read(s) — "
+            "left to the next scheduled run.[/yellow]"
+        )
+    elif s.stopped == "cooldown":
+        console.print("[yellow]Deferred — an earlier run was throttled and the cooldown is still active. "
+                      "No page was read.[/yellow]")
+    elif s.stopped == "locked":
+        console.print("[yellow]Another sweep is running — nothing done here.[/yellow]")
+    elif s.skipped:
         console.print("[yellow]Skipped — set already processed or page unavailable "
                       "(use --force to re-run).[/yellow]")
     else:
+        when = f" {s.seconds_to_flip:.0f}s after the poll began" if s.seconds_to_flip is not None else ""
         console.print(
-            f"[green]Daily deals ({s.end_date}): {s.items_checked} items checked, "
-            f"{s.brand_matches} brand match(es), {s.snapshots} snapshot(s).[/green]"
+            f"[green]Daily deals ({s.end_date}){when}: {s.items_checked} items checked, "
+            f"{s.brand_matches} brand match(es), {s.snapshots} snapshot(s), "
+            f"{alert_count} alert(s).[/green]"
         )
 
 
@@ -355,6 +405,74 @@ async def _report_scan_health(settings: Settings, *, ok: bool) -> str | None:
     else:
         log.warning("Health transition could not be sent", transition=transition)
     return transition
+
+
+@app.command()
+def install_deals_poll(
+    load: bool = typer.Option(
+        False, "--load",
+        help="Also register the job with launchd. Without it the plist is written and the load command printed.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the plist instead of writing it"),
+) -> None:
+    """Write the launchd job that prices the Daily Deals set the minute it refreshes.
+
+    The job runs `hd daily-deals --wait-for-refresh && hd notify` at 3:00
+    Eastern, converted to this machine's clock. It is written but not loaded
+    unless --load is given, so the schedule can be reviewed before a single
+    request is made. Re-run after a daylight-saving change: the slot is
+    computed for the date it is written.
+    """
+    from pathlib import Path
+
+    from hd.setup_schedule import (
+        deals_poll_slot,
+        hd_executable,
+        is_macos,
+        label_for,
+        launch_agents_dir,
+        load_agent,
+        render_deals_poll_plist,
+        write_agent,
+    )
+
+    hd = hd_executable()
+    if hd is None:
+        console.print("[red]Could not find the `hd` executable beside the interpreter; "
+                      "refusing to write a job that would fail at every slot.[/red]")
+        raise typer.Exit(code=1)
+    root = Path.cwd()
+    slot = deals_poll_slot()
+    if not is_macos():
+        from hd.setup_schedule import _shell
+
+        console.print("launchd jobs are macOS only. Add this line with `crontab -e` "
+                      f"(it is 3:00 Eastern on this machine's clock):")
+        console.print(
+            f"{slot.minute} {slot.hour} * * * cd {_shell(root)} && {_shell(hd)} daily-deals "
+            f"--wait-for-refresh && {_shell(hd)} notify",
+            markup=False, highlight=False, soft_wrap=True,
+        )
+        raise typer.Exit(code=1)
+
+    label = f"{label_for()}.dailydeals"
+    contents = render_deals_poll_plist(label, root, hd, slot)
+    if dry_run:
+        # Plain text: Rich would wrap the XML at 80 columns when piped to a file.
+        console.print(contents, markup=False, highlight=False, soft_wrap=True)
+        if load:
+            console.print("[dim]--dry-run: nothing written, so --load was ignored.[/dim]")
+        return
+    path = write_agent(launch_agents_dir() / f"{label}.plist", contents)
+    console.print(f"[green]Wrote {path}[/green] — polls from {slot.hour:02d}:{slot.minute:02d} local (3:00 Eastern).")
+    if load:
+        ok, output = _run(load_agent(path))
+        if not ok:
+            console.print(f"[red]launchctl refused the job: {output}[/red]")
+            raise typer.Exit(code=1)
+        console.print("[green]Loaded.[/green] It fires at the next 3:00 Eastern; nothing runs now.")
+    else:
+        console.print(f"[dim]Not loaded. Activate with: launchctl load {path}[/dim]")
 
 
 @app.command()

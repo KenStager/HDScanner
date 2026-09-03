@@ -94,3 +94,30 @@ class TestUnguardedCommands:
     @pytest.mark.parametrize("args", [["--help"], ["alerts", "--limit", "1"], ["health"]])
     def test_no_guard(self, args):
         assert runner.invoke(app, args).exit_code == 0
+
+
+class TestDealsPollCommands:
+    def test_force_and_wait_for_refresh_are_refused_together(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("STORES", "2619")
+        monkeypatch.setenv("BRANDS", "Milwaukee")
+        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path}/g.db")
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["daily-deals", "--force", "--wait-for-refresh"])
+        assert result.exit_code == 2
+        assert "Pick one" in result.output
+
+    def test_dry_run_prints_a_plist_that_parses(self, monkeypatch, tmp_path):
+        import plistlib
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("hd.setup_schedule.is_macos", lambda: True)
+        monkeypatch.setattr("hd.setup_schedule.hd_executable", lambda: tmp_path / "hd")
+        result = runner.invoke(app, ["install-deals-poll", "--dry-run", "--load"])
+        assert result.exit_code == 0, result.output
+        xml, _, trailer = result.output.partition("</plist>")
+        data = plistlib.loads((xml + "</plist>").encode())
+        assert data["Label"].endswith(".dailydeals")
+        assert "daily-deals --wait-for-refresh" in data["ProgramArguments"][-1]
+        assert data["WorkingDirectory"] == str(tmp_path)
+        assert "--load was ignored" in trailer
+        assert not list(tmp_path.glob("*.plist"))

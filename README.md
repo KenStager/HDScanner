@@ -194,12 +194,20 @@ schedule. `hd setup` offers to install one; to do it later:
 hd setup      # answer no to the steps you already have
 ```
 
-You get three jobs:
+You get these jobs:
 
 - **Scan** — three times a day, eight hours apart, on a minute derived from
   your install so that everyone running this does not arrive at once. The
   04:00 Eastern slot lands just after the daily-deals refresh and checks it
   first, so no separate run is needed
+- **Deals poll** (optional) — `hd install-deals-poll` writes a fourth job that
+  starts at 3:00 Eastern and re-reads the daily-deals page every two minutes
+  until the set changes, at most six reads, then prices the new set on the
+  spot and sends the alerts to Slack. A read that fails or does not parse ends
+  the poll with no retry, and the 04:00 scan sweeps as usual. A deal that
+  sells out before 04:00 is witnessed at its deal price instead of at the
+  regular price it leaves behind. The job is written but not loaded until you
+  pass `--load`; every read is appended to `diagnostics/daily_deals_polls.jsonl`
 - **Prune** — once a day, deleting snapshots past the retention window
 - **Dashboard** — always on, if you installed the dashboard extra. It starts at
   login and comes back after a crash or a reboot, so your deal board is a URL

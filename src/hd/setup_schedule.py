@@ -100,6 +100,17 @@ def daily_deals_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
     return _to_local(HD_DEALS_REFRESH.hour + carry, minute, tz=tz, on=on)
 
 
+def deals_poll_slot(*, tz=None, on: datetime | None = None) -> ScheduleSlot:
+    """Local time to start polling for the Daily Deals refresh.
+
+    The poll job (`hd daily-deals --wait-for-refresh`) begins on the refresh
+    itself rather than after a grace period: it re-reads the page until the
+    set changes, so starting early costs one cheap read and starting late
+    costs the minutes that a deal which sells out fast does not have.
+    """
+    return _to_local(HD_DEALS_REFRESH.hour, HD_DEALS_REFRESH.minute, tz=tz, on=on)
+
+
 def deals_slot_needed(hours_et=SCAN_HOURS_ET) -> bool:
     """Whether the deals refresh needs a slot of its own.
 
@@ -311,6 +322,59 @@ def render_prune_plist(label: str, workdir: Path, hd_path: Path, slot: ScheduleS
   <string>{_xml(str(workdir) + "/hd_prune.stderr.log")}</string>
 
   <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
+"""
+
+
+def render_deals_poll_plist(label: str, workdir: Path, hd_path: Path, slot: ScheduleSlot) -> str:
+    """launchd job that prices the Daily Deals set the minute it refreshes.
+
+    Separate from the scan job on purpose: it reads one HTML page a few times
+    and prices only the listed items of tracked brands, so it costs a handful
+    of requests where a scan slot would cost a full pipeline run. The routine
+    scan keeps its own sweep as the fallback and reports the set as already
+    processed when this job got there first.
+    """
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{_xml(label)}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>export PYTHONUNBUFFERED=1; cd {_xml(_shell(workdir))} &amp;&amp; {_xml(_shell(hd_path))} daily-deals --wait-for-refresh &amp;&amp; {_xml(_shell(hd_path))} notify</string>
+  </array>
+
+  <!-- Local time for 3:00 Eastern, when Home Depot resets its Daily Deals.
+       The job re-reads the page every couple of minutes until the set
+       changes, then prices it, so the slot sits on the refresh, not after it. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>{slot.hour}</integer><key>Minute</key><integer>{slot.minute}</integer></dict>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{_xml(workdir)}</string>
+
+  <key>StandardOutPath</key>
+  <string>{_xml(str(workdir) + "/hd_dailydeals.stdout.log")}</string>
+  <key>StandardErrorPath</key>
+  <string>{_xml(str(workdir) + "/hd_dailydeals.stderr.log")}</string>
+
+  <!-- launchd starts a slot it missed as soon as the machine wakes, so this
+       can land hours late and beside the routine scan. The poll handles
+       that itself: far from 3:00 it takes one read and stops, and the sweep
+       holds a lock so two processes never price the same set. RunAtLoad
+       would only add a run at every login. -->
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
   <false/>
 </dict>
 </plist>
