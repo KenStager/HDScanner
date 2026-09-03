@@ -214,7 +214,8 @@ class TestPlanWalks:
     def test_over_cap_splits_by_category(self, browse_settings):
         dims = parse_dimensions(make_page([], 10, dims=[cat_dim(("Big", "big", 7), ("Small", "sm", 3))]))
         walks, need = plan_walks("N-5yc1vZzv", "Milwaukee", 10, dims, browse_settings)
-        assert walks == [Walk("N-5yc1vZzvZsm", "Milwaukee/Small", 3)]
+        assert walks == [Walk("N-5yc1vZzvZsm", "Milwaukee/Small", 3,
+                              split_parent="N-5yc1vZzv", split_axis="category")]
         assert need == [("N-5yc1vZzvZbig", "Milwaukee/Big")]
 
     def test_category_token_already_in_nav_skipped(self, browse_settings):
@@ -1930,7 +1931,7 @@ class TestCategoryResume:
             ("nav/stale", "complete", 40),
             ("nav/cut", "truncated", 1),
         ])
-        totals, recent = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        totals, recent, _axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
 
         assert "nav/fresh" in recent          # inside the window
@@ -1947,7 +1948,7 @@ class TestCategoryResume:
         from hd.pipeline.browse import coverage_memory
 
         await self._seed(browse_settings, [("N-5yc1vZzvZpt", "truncated", 2)])
-        totals, recent = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        totals, recent, _axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert totals == {"N-5yc1vZzvZpt": 100}
         assert recent == set()
@@ -1966,7 +1967,7 @@ class TestCategoryResume:
                     started=now, ended=now, status="complete",
                     items_expected=10, items_observed=10))
             await session.commit()
-        totals, recent = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        totals, recent, _axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         # Only the 2619/ALL row may contribute; the shelf tier and the other
         # store walk the same labels and would otherwise mask each other.
@@ -1980,8 +1981,8 @@ class TestCategoryResume:
         from hd.pipeline.browse import coverage_memory
         broken = browse_settings.model_copy(update={
             "database_url": f"sqlite+aiosqlite:///{tmp_path}/nonexistent-dir/x.db"})
-        totals, recent = await coverage_memory(broken, "2619", "ALL", 20)
-        assert totals == {} and recent == set()
+        totals, recent, axis = await coverage_memory(broken, "2619", "ALL", 20)
+        assert totals == {} and recent == set() and axis == {}
 
 
 class TestDeferralCountsWholeRemainders:
@@ -2080,3 +2081,415 @@ class TestCrossBrandFairness:
         cursors = {brand_order_cursor_key("2619"): 9999}
         order = brand_order_for_run(brands, cursors, "2619")
         assert sorted(order) == sorted(brands)
+
+
+class TestRecordedSplitAxis:
+    """The split is recorded, so the next run reads the axis instead of guessing.
+
+    A node too big for one walk is split by facet and writes no coverage row of
+    its own — only its children do. MILWAUKEE/Tools/Hand Tools splits on
+    Category one run and on Price the next, the two produce different child
+    navParams, and the freshness skip is keyed on navParam, so the second pass
+    looked like a set of nodes never walked before and the whole ~1,700-item
+    node was re-read. Measured at ~48 requests/day.
+
+    These tests pin the recorded fact (parent + axis on every child a split
+    produces), the preference that reads it back, the clause that makes the
+    preference lapse, and the two call sites that carry it — the wiring is
+    tested on purpose: a previous round of this work found that deleting a
+    feature's call site left the entire suite passing.
+    """
+
+    def test_category_children_record_their_parent_and_axis(self, browse_settings):
+        dims = parse_dimensions(make_page([], 10, dims=[cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2))]))
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings)
+        assert walks and all(w.split_parent == "N-5yc1vZzv" for w in walks)
+        assert all(w.split_axis == "category" for w in walks)
+
+    def test_price_children_record_their_parent_and_axis(self, browse_settings):
+        dims = parse_dimensions(make_page([], 10, dims=[
+            price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]))
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings)
+        assert walks and all(w.split_parent == "N-5yc1vZzv" for w in walks)
+        assert all(w.split_axis == "price" for w in walks)
+
+    def test_a_node_that_is_its_own_walk_records_no_split(self, browse_settings):
+        """single / both-ends / truncated walks ARE the node, not a piece of one."""
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 3, {}, browse_settings)
+        assert walks == [Walk("N-5yc1vZzv", "M", 3)]
+        assert walks[0].split_parent is None and walks[0].split_axis is None
+        # over the cap with nothing to split on: still its own node
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 999, {}, browse_settings)
+        assert walks[0].truncated and walks[0].split_parent is None
+
+    def test_recorded_price_axis_wins_over_the_category_default(self, browse_settings):
+        """The whole point. Categories ARE available; the record says price;
+        price is what gets planned, so the children land on the navParams the
+        freshness skip already knows."""
+        dims = parse_dimensions(make_page([], 10, dims=[
+            cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2)),
+            price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]))
+        walks, need = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                                 recent_axis={"N-5yc1vZzv": "price"})
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZ12kx", "N-5yc1vZzvZ12ky"]
+        assert all(w.split_axis == "price" for w in walks) and need == []
+        # and without the record, the same facets route to Category as before
+        plain, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings)
+        assert [w.split_axis for w in plain] == ["category", "category"]
+
+    def test_the_preference_is_scoped_to_the_node_that_recorded_it(self, browse_settings):
+        dims = parse_dimensions(make_page([], 10, dims=[
+            cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2)),
+            price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]))
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                              recent_axis={"N-someone-else": "price"})
+        assert all(w.split_axis == "category" for w in walks)
+
+    def test_a_preference_this_run_cannot_build_falls_back(self, browse_settings):
+        """Preference only. If Price cannot partition the node the planner takes
+        the branch it would have taken anyway rather than walking nothing."""
+        dims = parse_dimensions(make_page([], 10, dims=[cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2))]))
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                              recent_axis={"N-5yc1vZzv": "price"})
+        assert walks and all(w.split_axis == "category" for w in walks)
+
+    def test_a_recorded_category_axis_changes_nothing(self, browse_settings):
+        dims = parse_dimensions(make_page([], 10, dims=[
+            cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2)),
+            price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]))
+        a, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings)
+        b, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                          recent_axis={"N-5yc1vZzv": "category"})
+        assert a == b
+
+    async def test_the_pair_reaches_the_coverage_row(self, browse_settings, fresh_db):
+        from sqlalchemy import select
+
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        from hd.pipeline.browse import _record_walk
+        await base.init_db(browse_settings)
+        w = Walk("N-aZb", "M/b", 5, split_parent="N-a", split_axis="price")
+        w.observed_ids = 5
+        w.live_total = 5
+        await _record_walk(browse_settings, 1, w, "2619", "ALL", datetime.now(timezone.utc))
+        async with base.get_session(browse_settings) as s:
+            row = (await s.execute(select(WalkCoverage))).scalars().one()
+            assert (row.split_parent, row.split_axis) == ("N-a", "price")
+        await base.close_db()
+
+
+class TestRecordedAxisIsReadBack:
+    """coverage_memory turns the recorded pair into the planner's preference."""
+
+    async def _seed(self, s, rows):
+        """rows: (nav, parent, axis, status, hours_ago)"""
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        await base.init_db(s)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(s) as session:
+            for nav, parent, axis, status, ago in rows:
+                session.add(WalkCoverage(
+                    run_id=1, store_id="2619", tier="ALL", label=nav, nav_param=nav,
+                    split_parent=parent, split_axis=axis,
+                    started=now - timedelta(hours=ago), ended=now - timedelta(hours=ago),
+                    status=status, items_expected=10,
+                    items_observed=10 if status == "complete" else 1))
+            await session.commit()
+
+    async def test_the_most_recent_axis_wins_while_a_child_is_still_fresh(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [
+            ("N-aZc1", "N-a", "category", "complete", 30),   # older split
+            ("N-aZ12kx", "N-a", "price", "complete", 2),     # newer, still fresh
+        ])
+        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert axis == {"N-a": "price"} and "N-aZ12kx" in recent
+
+    async def test_the_preference_lapses_once_no_child_is_fresh(
+        self, browse_settings, fresh_db
+    ):
+        """A node whose whole split has gone stale is due a full sweep. The
+        freshness skip would skip nothing whichever axis were chosen, so the
+        preference is dropped and the ordinary category-first order picks
+        again. Without this the preference never lapses at all — runs land
+        every ~4h against a 20h window — and the node is pinned for good to
+        whichever axis it happened to start on."""
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [
+            # Split touched 2h ago, so the split itself is well inside the
+            # window — but that child truncated, so it is not covered...
+            ("N-aZ12ky", "N-a", "price", "truncated", 2),
+            # ...and the one child that did complete has gone stale.
+            ("N-aZ12kx", "N-a", "price", "complete", 30),
+        ])
+        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert recent == set(), "neither child is covered inside the window"
+        assert axis == {}, "a split with no fresh child must not steer the planner"
+
+    async def test_a_split_whose_children_have_all_gone_stale_is_not_a_preference(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [("N-aZ12kx", "N-a", "price", "complete", 40)])
+        _, _, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert axis == {}
+
+    async def test_a_tie_leaves_the_default_alone(self, browse_settings, fresh_db):
+        """Both axes recorded at the same instant. Breaking that by a coin flip
+        is the flapping this exists to stop."""
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [
+            ("N-aZc1", "N-a", "category", "complete", 2),
+            ("N-aZ12kx", "N-a", "price", "complete", 2),
+        ])
+        _, _, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert axis == {}
+
+    async def test_the_preference_is_scoped_to_store_and_tier(
+        self, browse_settings, fresh_db
+    ):
+        """The child IS fresh in the tier being planned, so the lapse clause
+        would let this through; only the scoping stops it. Written this way
+        because the obvious version passed with the scoping deleted."""
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        from hd.pipeline.browse import coverage_memory
+        await base.init_db(browse_settings)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(browse_settings) as session:
+            # this tier knows the node is covered, but recorded no split for it
+            session.add(WalkCoverage(
+                run_id=1, store_id="2619", tier="ALL", label="x",
+                nav_param="N-aZ12kx", started=now, ended=now,
+                status="complete", items_expected=10, items_observed=10))
+            # the split was recorded somewhere else entirely
+            for store, tier in (("8452", "ALL"), ("2619", "IN_STORE")):
+                session.add(WalkCoverage(
+                    run_id=1, store_id=store, tier=tier, label="x", nav_param="N-aZ12kx",
+                    split_parent="N-a", split_axis="price", started=now, ended=now,
+                    status="complete", items_expected=10, items_observed=10))
+            await session.commit()
+        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert "N-aZ12kx" in recent
+        assert axis == {}, "another store's split must not steer this one"
+
+    async def test_rows_written_before_the_columns_existed_are_ignored(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [("N-aZ12kx", None, None, "complete", 2)])
+        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert recent == {"N-aZ12kx"} and axis == {}
+
+
+def _two_level_router(seen: list[str]):
+    """Root -> Tools -> Hand, where Hand offers BOTH axes.
+
+    Models the real shape: the node whose axis flips is a depth-1 child of a
+    category that itself had to be split, so the preference only reaches it if
+    it is threaded all the way down.
+    """
+    both = [cat_dim(("A", "ca", 4), ("B", "cb", 3)),
+            price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]
+
+    def router(v):
+        nav = v.get("navParam") or ""
+        seen.append(nav)
+        if nav == "N-5yc1vZzv":
+            return make_page([], 20, dims=[cat_dim(("Tools", "c1", 20))])
+        if nav == "N-5yc1vZzvZc1":
+            return make_page([], 20, dims=[cat_dim(("Hand", "c2", 20))])
+        if nav == "N-5yc1vZzvZc1Zc2":
+            return make_page([], 20, dims=both)
+        return make_page([], 0)
+    return router
+
+
+class TestTheRecordedAxisIsActuallyWiredThrough:
+    """Both call sites, tested on purpose.
+
+    A previous round of this work shipped a feature whose call site could be
+    deleted with all 1,162 tests still passing. The unit tests above prove
+    plan_walks reads a preference; these prove something hands it one.
+    """
+
+    async def test_resolve_walks_carries_it_to_a_depth_one_child(
+        self, browse_settings, fresh_db
+    ):
+        """The flipping node is a grandchild. Deleting recent_axis from the
+        re-plan inside resolve_walks must fail here."""
+        seen: list[str] = []
+        client = FakeClient(_two_level_router(seen))
+        walks = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzvZc1", "M/Tools", "2619", "ALL",
+            recent_axis={"N-5yc1vZzvZc1Zc2": "price"},
+        )
+        navs = sorted(w.nav_param for w in walks)
+        assert navs == ["N-5yc1vZzvZc1Zc2Z12kx", "N-5yc1vZzvZc1Zc2Z12ky"], navs
+        assert all(w.split_axis == "price" for w in walks)
+        assert all(w.split_parent == "N-5yc1vZzvZc1Zc2" for w in walks)
+
+        # ...and with nothing recorded, the same facets go to Category.
+        walks2 = await resolve_walks(
+            client, browse_settings, "N-5yc1vZzvZc1", "M/Tools", "2619", "ALL",
+        )
+        assert sorted(w.nav_param for w in walks2) == [
+            "N-5yc1vZzvZc1Zc2Zca", "N-5yc1vZzvZc1Zc2Zcb"]
+
+    async def test_run_browse_reads_the_record_and_skips_the_second_axis(
+        self, browse_settings, fresh_db
+    ):
+        """End to end: the record says this node was split on price and one
+        band is still fresh, so the run plans price and walks only the band
+        that is not. Deleting recent_axis from either resolve_walks call in
+        run_browse must fail here."""
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        await base.init_db(browse_settings)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(browse_settings) as session:
+            session.add(WalkCoverage(
+                run_id=1, store_id="2619", tier="ALL", label="M/Tools/Hand/$0 - $10",
+                nav_param="N-5yc1vZzvZc1Zc2Z12kx",
+                split_parent="N-5yc1vZzvZc1Zc2", split_axis="price",
+                started=now - timedelta(hours=2), ended=now - timedelta(hours=2),
+                status="complete", items_expected=6, items_observed=6))
+            await session.commit()
+
+        seen: list[str] = []
+        await run_browse(browse_settings, client=FakeClient(_two_level_router(seen)),
+                         tiers=("network",))
+        await base.close_db()
+
+        walked = {n for n in seen if n.startswith("N-5yc1vZzvZc1Zc2Z")}
+        assert "N-5yc1vZzvZc1Zc2Z12ky" in walked, (
+            "the run should have walked the band that is not fresh")
+        assert "N-5yc1vZzvZc1Zc2Z12kx" not in walked, (
+            "the fresh band should have been skipped, not re-read")
+        assert not {n for n in walked if n.endswith(("Zca", "Zcb"))}, (
+            "planning the category axis here is the duplication this fixes")
+
+
+class TestTheRefactorDidNotDoubleTheWork:
+    """The price branch became a closure shared by the preferred and default
+    paths. price_partition logs a warning for any bucket label outside the
+    measured allow-list, so calling it twice would double that warning and
+    double the work on the commonest path in the planner.
+
+    The at-most-once test is a forward guard, not a mutation-verified one: as
+    the branches stand today no small edit makes the closure run twice, because
+    the preferred path returns and the fall-through path is reached only when
+    there are no categories. It is here so a later edit that reintroduces the
+    duplication is caught, and it is not counted among the guards that were
+    confirmed to fail against a mutant."""
+
+    @pytest.mark.parametrize("recorded", [None, "price", "category"])
+    def test_price_partition_runs_at_most_once_per_plan(
+        self, browse_settings, monkeypatch, recorded
+    ):
+        from hd.pipeline import browse as mod
+        calls = []
+        real = mod.price_partition
+
+        def counting(refs, total, label=None):
+            calls.append(label)
+            return real(refs, total, label=label)
+
+        monkeypatch.setattr(mod, "price_partition", counting)
+        dims = parse_dimensions(make_page([], 10, dims=[
+            cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2)),
+            price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]))
+        mod.plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                       recent_axis={"N-5yc1vZzv": recorded} if recorded else None)
+        assert len(calls) <= 1, f"price_partition called {len(calls)} times"
+
+    def test_a_price_bucket_over_the_cap_is_still_marked_truncated(self, browse_settings):
+        """Carried over from the branch this closure replaced: a band that is
+        itself too big is walked head-only, not dropped and not deferred."""
+        dims = parse_dimensions(make_page([], 20, dims=[
+            price_dim(("$0 - $10", "12kx", 14), ("$10 - $20", "12ky", 7))]))
+        walks, need = plan_walks("N-5yc1vZzv", "M", 20, dims, browse_settings)
+        big = [w for w in walks if w.nav_param.endswith("12kx")]
+        assert big and big[0].truncated and need == []
+        assert big[0].split_axis == "price"
+
+
+class TestEveryPieceOfASplitRecordsIt:
+    """The one walk that used to record no split.
+
+    A category child too big to walk and too deep to split further is walked
+    head-only at the bottom of resolve_walks. It is still a piece of its
+    parent's split, and it used to be the only such piece that said nothing —
+    so anything later counting a split's children would have counted one
+    short, without a row to show for the omission. That is the shape of the
+    mistake that made the withdrawn roll-up unsound, so it is closed here
+    even though nothing today reads the count.
+    """
+
+    async def test_a_child_that_turns_out_to_fit_still_names_its_parent(
+        self, browse_settings, fresh_db
+    ):
+        """`need` is populated from the PARENT's claimed count. The child's own
+        page 0 then says it fits after all, so plan_walks returns it as a walk
+        in its own right — and plan_walks, called on that child, cannot know it
+        was handed over as a piece of something bigger. The caller supplies it.
+        """
+        def router(v):
+            nav = v.get("navParam") or ""
+            if nav == "N-5yc1vZzv":
+                # parent claims the child is over the cap of 6
+                return make_page([], 40, dims=[cat_dim(("Big", "big", 40))])
+            # the child's own page 0 disagrees: it fits in one walk
+            return make_page([], 3)
+
+        walks = await resolve_walks(
+            FakeClient(router), browse_settings, "N-5yc1vZzv", "M", "2619", "ALL",
+        )
+        child = [w for w in walks if w.nav_param == "N-5yc1vZzvZbig"]
+        assert child, [w.nav_param for w in walks]
+        assert not child[0].truncated, "the child fits; this is the single-walk path"
+        assert child[0].split_parent == "N-5yc1vZzv"
+        assert child[0].split_axis == "category"
+
+    async def test_a_grandchild_keeps_its_own_parent_not_its_grandparent(
+        self, browse_settings, fresh_db
+    ):
+        """The caller must only tag the walk that IS the child. A child that
+        plan_walks split further already named itself as the parent, and
+        overwriting that would record a grandparent."""
+        def router(v):
+            nav = v.get("navParam") or ""
+            if nav == "N-5yc1vZzv":
+                return make_page([], 40, dims=[cat_dim(("Big", "big", 40))])
+            return make_page([], 40, dims=[cat_dim(("Leaf", "lf", 3))])
+
+        walks = await resolve_walks(
+            FakeClient(router), browse_settings, "N-5yc1vZzv", "M", "2619", "ALL",
+        )
+        leaf = [w for w in walks if w.nav_param == "N-5yc1vZzvZbigZlf"]
+        assert leaf, [w.nav_param for w in walks]
+        assert leaf[0].split_parent == "N-5yc1vZzvZbig", "must be the immediate parent"
+
+    def test_a_node_walked_head_only_by_the_planner_records_no_split(
+        self, browse_settings
+    ):
+        """Contrast: when plan_walks itself gives up on a node, that walk IS
+        the node, not a piece of one, and must stay untagged."""
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 999, {}, browse_settings)
+        assert walks[0].truncated
+        assert walks[0].split_parent is None and walks[0].split_axis is None

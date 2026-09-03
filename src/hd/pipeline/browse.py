@@ -72,6 +72,14 @@ class Walk:
     # error, an unusable page, or a throttle. Distinct from `truncated`,
     # which is a planning-time judgment; walk_status folds both together.
     cut: bool = field(default=False, compare=False)
+    # The split this walk is a piece of: the parent's navParam and the
+    # dimension it was split on. Both None for a walk that IS its own node.
+    # Persisted to walk_coverage so the next run can read which axis the
+    # record is keyed on instead of guessing it from navParam shape — see the
+    # note above plan_walks. Compared, unlike the runtime fields below: two
+    # plans that split the same node on different axes are different plans.
+    split_parent: str | None = None
+    split_axis: str | None = None
 
 
 @dataclass
@@ -370,52 +378,95 @@ def price_partition(
     return bands
 
 
-# KNOWN, MEASURED, UNFIXED: the split axis below is not stable per node.
+# THE SPLIT AXIS IS NOT STABLE PER NODE, AND THE RECORD NOW SAYS WHICH ONE IT USED.
 #
 # The Category dimension for a given node comes back carrying its children on
 # one run and carrying only the node itself on the next — and the node's own
 # token is filtered out as already-in-nav, leaving nothing to split on, so the
-# same node routes "category-split" one run and "price-split" a few hours
-# later. The two axes produce different child navParams and the freshness skip
-# is keyed on navParam, so nothing recognises the second pass as a repeat: the
-# node is re-read whole, at a measured ~48 requests/day.
+# same node routed "category-split" one run and "price-split" a few hours
+# later. The two axes produce different child navParams, the freshness skip is
+# keyed on navParam, and nothing recognised the second pass as a repeat: the
+# node was re-read whole, at a measured ~48 requests/day.
 #
-# ONE node, not a general property of the dimension: MILWAUKEE/Tools/Hand Tools
-# flipped ~15 times in 9 days and no other node in the routing log flipped at
-# all. Size the fix to that.
+# ONE node, not a general property of the dimension. Counted over the whole
+# routing log: MILWAUKEE/Tools/Hand Tools flipped 21 times in 37 runs, and of
+# the 23 other nodes routed more than once, not one ever changed branch. The
+# fix is sized to that.
 #
-# And it may be a symptom rather than the disease. Three nodes whose true sizes
-# are ~1,715, ~1,800 and ~2,240 all intermittently report a total in the narrow
-# band 1,473-1,494 — eighteen such readings in the log, with 1494 landing five
+# WHAT SHIPPED: the split is RECORDED. Every child a split produces carries its
+# parent's navParam and the axis it was split on into walk_coverage, and
+# coverage_memory reads the most recent axis per parent back out. A node split
+# inside the freshness window is split on the SAME axis again, so its children
+# carry the navParams the record already holds and the existing per-navParam
+# freshness skip does the rest. The preference lapses as soon as no child of
+# that split is fresh any more — the node is then due a full sweep, the skip
+# would skip nothing whichever axis were picked, and the ordinary
+# category-first order chooses again. Without that clause the preference never
+# lapses at all: runs land every ~4h against a 20h window, so the node would be
+# pinned for good to whichever axis it happened to start on.
+#
+# Deliberately NOT a roll-up. Nothing here concludes that a parent is covered:
+# every skip is still the one the scanner already trusted — this exact
+# navParam completed inside the window. All the recorded axis does is stop the
+# planner from asking the same question in a vocabulary the record cannot
+# answer. That matters, because rolling a completed split UP to the node it
+# split was tried as the fix and WITHDRAWN: summing a node's recently-completed
+# children silently assumes they partition it, and they do not. The review that
+# withdrew it replayed it over 43 real runs and recorded 5 covers where neither
+# axis had covered the node, the worst skipping ~220 items behind a single INFO
+# line. Re-replaying it here reproduced that failure mode but not that count —
+# a harness that judges one decision per run against the itemIds the saved
+# pages actually returned puts it at 1 unsound skip in 6 firings over
+# 2026-08-31 to 09-03, which is a different window and a different question, so
+# treat the 5 as the earlier review's number and not as a reproduction. It also
+# needed the parent's own items_expected as a denominator,
+# which exists only for a node whose split once FAILED and can never be
+# refreshed, since a successful split writes no row for the parent. Recording
+# the axis needs neither a sum nor a denominator.
+#
+# MEASURED BEFORE TRUSTING IT, because the whole saving rests on the two axes
+# being the same set of items and nobody had checked. Over 2026-09-02/03 the
+# category axis (17 children) saw 1,725 distinct itemIds and the price axis
+# (20 bands) saw 1,736, sharing 1,722: 3 category-only and 14 price-only. The
+# same-node-across-a-day churn baseline over the same corpus is 1.45%, so the
+# 0.99% the axes disagree by is smaller than the noise the catalogue makes on
+# its own. Sticking to one axis for one window costs nothing measurable, and
+# the preference lapsing at the window boundary keeps both axes exercised.
+#
+# NOT VERIFIED IN PRODUCTION, and the kill condition is the one the admission
+# ceiling already uses: if daily requests have not fallen and the
+# complete:truncated ratio in walk_coverage has not held after a week, revert
+# rather than tune. The replay says ~38 requests/day on this node over the 12
+# runs it covers, against the ~48/day the flip was measured to cost; that is a
+# reconstruction from saved pages and recorded rows, not a live reading.
+#
+# WHAT THIS DOES NOT FIX, measured on the same corpus. A node-level rule —
+# "skip the other axis once every child of the recorded split is complete" —
+# cannot fire here at all, and would have shipped inert: BOTH axes of this node
+# contain a child that has never once completed. Hand Tools/$400 - $500 is 0
+# complete in 10 attempts and Hand Tools/Measuring Tools 0 in 8, each short by
+# exactly one item every time. Reading the saved pages back shows why: page 0
+# returns 24 items, page 1 returns 18, page 2 returns none — pagination runs to
+# its natural end and yields 42 distinct itemIds against a totalProducts of 43,
+# identically on three separate runs. The denominator over-claims by one, so
+# walk_status is right to call the walk truncated and the node can never be
+# declared covered. That is the pre-existing phantom-item defect, it is worth
+# its own look, and it is why this fix is per-child rather than per-node.
+#
+# ALSO UNRESOLVED: the degraded read. Three nodes whose true sizes are ~1,715,
+# ~1,800 and ~2,240 all intermittently report a total in the narrow band
+# 1,473-1,494 — eighteen such readings in the log, with 1494 landing five
 # separate times on a node that otherwise reads 1,794-1,811. A real count does
 # not hit the same integer five times while its ordinary value drifts every
 # run. The likeliest reading is that the API sometimes answers with a result
-# set for a different scope than the navParam asked for; a response that is not
-# about this node would of course carry a Category dimension that does not
-# describe its children. Both branches occur at both the high and the low
-# readings, so the flip tracks the response, not the count.
-#
-# That matters for the fix. Recording the split (below) would make a roll-up's
-# arithmetic sound while still reconciling responses that were not about the
-# node in hand. `observed_totals` already holds each node's own high-water and
-# is already threaded into this function to correct a CHILD's claimed count; a
-# page-0 total that comes back at a fraction of a node's own recorded high-water
-# is almost certainly a bad read, and declining to route off one costs no schema
-# change. Understand the degraded read before paying for a migration.
-#
-# Rolling a completed split up to the node it split was tried as the fix and
-# WITHDRAWN. Summing a node's recently-completed children silently assumes they
-# partition it, and they do not: replayed over 43 real runs it marked one node
-# covered 5 times when neither axis had covered it, which would have skipped
-# ~220 items with nothing but an INFO line to show for it. It also needed the
-# parent's own items_expected as a denominator, which exists only for a node
-# whose split once FAILED and can never be refreshed, since a successful split
-# writes no row for the parent.
-#
-# A correct version needs the split recorded rather than inferred from navParam
-# shape — a `split_parent`/`split_axis` column on WalkCoverage — so that a
-# roll-up can be scoped to one real split. That is a schema change and is not
-# attempted here.
+# set for a different scope than the navParam asked for. Recording the axis
+# does not diagnose that, though it does make the planner stop reacting to it:
+# the flips of 2026-09-02 and 09-03 all happened at full totals of 1,723-1,726,
+# so the degraded read is a separate fault and not the cause of the flip.
+# `observed_totals` already holds each node's own high-water and is already
+# threaded into this function; declining to route off a page-0 total that comes
+# back at a fraction of it costs no schema change. Understand the degraded read
+# before paying for anything more.
 def plan_walks(
     nav_param: str,
     label: str,
@@ -425,6 +476,7 @@ def plan_walks(
     depth: int = 0,
     price_split_used: bool = False,
     observed_totals: dict[str, int] | None = None,
+    recent_axis: dict[str, str] | None = None,
 ) -> tuple[list[Walk], list[tuple[str, str]]]:
     """Split one result set into walkable pieces using its own facets.
 
@@ -432,6 +484,15 @@ def plan_walks(
     nodes that are over the cap and need their own facet fetch to split
     further. Pure apart from one log line per routing decision: no network or
     database I/O — the caller fetches facets and re-plans.
+
+    `recent_axis` maps a node's navParam to the axis the RECORD says it was
+    last split on inside the freshness window (see coverage_memory). A node
+    named there is split on that axis again when this run's facets still
+    support it, so its children carry the navParams the record already holds
+    and the caller's per-navParam freshness skip can recognise them. Absent,
+    empty, or naming an axis this run cannot build, the ordinary
+    category-then-price order applies unchanged. Preference only — it never
+    creates a walk and never suppresses one.
     """
     if total is None or total <= 0:
         return [], []
@@ -472,6 +533,46 @@ def plan_walks(
         r for r in dimensions.get(CATEGORY_DIMENSION, [])
         if r.get("count") and r["count"] > 0 and r["token"] not in existing_tokens
     ]
+
+    def _price_walks() -> list[Walk] | None:
+        """The price-split branch, or None when Price cannot partition the node."""
+        if price_split_used:
+            return None
+        prices = price_partition(
+            [r for r in dimensions.get(PRICE_DIMENSION, [])
+             if r.get("count") and r["count"] > 0],
+            total, label=label,
+        )
+        if not prices:
+            return None
+        out: list[Walk] = []
+        for ref in prices:
+            child_nav = build_nav(nav_param, ref["token"])
+            child_label = f"{label}/{ref.get('label') or ref['token']}"
+            truncated = ref["count"] > cap
+            if truncated:
+                log.warning(
+                    "Price bucket still over API ceiling — walking reachable head only",
+                    label=child_label, total=ref["count"], cap=cap,
+                )
+            out.append(Walk(child_nav, child_label, ref["count"], truncated=truncated,
+                            split_parent=nav_param, split_axis="price"))
+        return out
+
+    # The record's axis wins over the category-first default, but only when
+    # this run's facets can actually build it. Category needs no branch of its
+    # own here: it is already the default, so a recorded "category" simply
+    # falls through to the block below and takes it if the dimension is there.
+    preferred = (recent_axis or {}).get(nav_param)
+    if preferred == "price" and categories:
+        price_walks = _price_walks()
+        if price_walks is not None:
+            log.info("Splitting on the axis the record holds",
+                     label=label, nav_param=nav_param, axis="price",
+                     children=len(price_walks), categories_available=len(categories))
+            _route("price-split")
+            return price_walks, []
+
     if categories:
         walks: list[Walk] = []
         need: list[tuple[str, str]] = []
@@ -491,32 +592,17 @@ def plan_walks(
                 log.info("Node count corrected from observation",
                          label=child_label, claimed=claimed, observed=count)
             if count <= cap:
-                walks.append(Walk(child_nav, child_label, count))
+                walks.append(Walk(child_nav, child_label, count,
+                                  split_parent=nav_param, split_axis="category"))
             else:
                 need.append((child_nav, child_label))
         _route("category-split")
         return walks, need
 
-    if not price_split_used:
-        prices = price_partition(
-            [r for r in dimensions.get(PRICE_DIMENSION, [])
-             if r.get("count") and r["count"] > 0],
-            total, label=label,
-        )
-        if prices:
-            walks = []
-            for ref in prices:
-                child_nav = build_nav(nav_param, ref["token"])
-                child_label = f"{label}/{ref.get('label') or ref['token']}"
-                truncated = ref["count"] > cap
-                if truncated:
-                    log.warning(
-                        "Price bucket still over API ceiling — walking reachable head only",
-                        label=child_label, total=ref["count"], cap=cap,
-                    )
-                walks.append(Walk(child_nav, child_label, ref["count"], truncated=truncated))
-            _route("price-split")
-            return walks, []
+    price_walks = _price_walks()
+    if price_walks is not None:
+        _route("price-split")
+        return price_walks, []
 
     log.warning(
         "No facet available to split oversized set — walking reachable head only",
@@ -574,6 +660,7 @@ async def resolve_walks(
     total: int | None = None,
     dimensions: dict[str, list[dict]] | None = None,
     observed_totals: dict[str, int] | None = None,
+    recent_axis: dict[str, str] | None = None,
 ) -> list[Walk]:
     """Plan walks for a node, fetching facets for any piece still over the cap."""
     raw = None
@@ -582,12 +669,29 @@ async def resolve_walks(
             client, settings, nav_param, store_id, storefilter
         )
     walks, need = plan_walks(nav_param, label, total, dimensions, settings,
-                             observed_totals=observed_totals)
+                             observed_totals=observed_totals,
+                             recent_axis=recent_axis)
     _prime(walks, nav_param, raw)
     depth = 1
-    while need and depth <= settings.browse_max_split_depth:
-        next_need: list[tuple[str, str]] = []
-        for child_nav, child_label in need:
+    # Carry the node each pending child was split OUT OF alongside it. Only the
+    # category branch produces `need`, so the axis is always "category"; the
+    # parent is whichever plan_walks call handed the child back.
+    #
+    # It is needed because plan_walks cannot tag these itself. Called on a
+    # `need` child it sees only that child's own navParam and has no idea the
+    # node was handed to it as a piece of something bigger, so whenever it
+    # decides the child is a walk in its own right — under the cap after all,
+    # both-ends, or truncated — it returns an untagged walk and that piece of
+    # the parent's split records no split. Reachable and not rare: `need` is
+    # populated from the PARENT's claimed count, the child's own page 0 is then
+    # read, and the two disagree often enough that this file already carries a
+    # correction for it. A missing child is exactly the silent omission that
+    # made the withdrawn roll-up unsound, so the caller supplies what the
+    # callee cannot know.
+    pending: list[tuple[str, str, str]] = [(n, lb, nav_param) for n, lb in need]
+    while pending and depth <= settings.browse_max_split_depth:
+        next_pending: list[tuple[str, str, str]] = []
+        for child_nav, child_label, parent_nav in pending:
             if client.is_throttled:
                 return walks
             c_total, c_dims, c_raw = await fetch_facets(
@@ -597,15 +701,34 @@ async def resolve_walks(
                 child_nav, child_label, c_total, c_dims, settings,
                 depth=depth, price_split_used=False,
                 observed_totals=observed_totals,
+                # The node that flips axis is a depth-1 child, not a root, so
+                # the preference has to reach this call to do anything at all.
+                recent_axis=recent_axis,
             )
             _prime(c_walks, child_nav, c_raw)
+            for w in c_walks:
+                # Only the walk that IS this child. Anything plan_walks split
+                # further already carries the child as its own split_parent,
+                # and overwriting that would name a grandparent.
+                if w.split_parent is None and w.nav_param == child_nav:
+                    w.split_parent = parent_nav
+                    w.split_axis = "category"
             walks.extend(c_walks)
-            next_need.extend(c_need)
-        need = next_need
+            next_pending.extend((n, lb, child_nav) for n, lb in c_need)
+        pending = next_pending
         depth += 1
-    for child_nav, child_label in need:
+    # Belt and braces: with the depth guard inside plan_walks firing at exactly
+    # browse_max_split_depth, the last iteration above can never hand anything
+    # back, so this loop does not currently run — traced with a router that
+    # yields a fresh over-cap child at every level, and the chain terminated on
+    # plan_walks' own "truncated-depth" branch instead. Left in place, and
+    # tagged like any other piece of a split, because it is the fallback for a
+    # loop bound changing.
+    for child_nav, child_label, parent_nav in pending:
         log.warning("Unsplit oversized node — walking reachable head only", label=child_label)
-        walks.append(Walk(child_nav, child_label, reachable_cap(settings) + 1, truncated=True))
+        walks.append(Walk(child_nav, child_label, reachable_cap(settings) + 1,
+                          truncated=True,
+                          split_parent=parent_nav, split_axis="category"))
     return walks
 
 
@@ -1026,6 +1149,8 @@ async def _record_walk(
                 status=walk_status(walk),
                 items_expected=denom,
                 items_observed=walk.observed_ids or 0,
+                split_parent=walk.split_parent,
+                split_axis=walk.split_axis,
             ))
     except Exception as e:
         log.error("Coverage record failed", label=walk.label, error=str(e))
@@ -1086,10 +1211,10 @@ async def _record_run_end(
 
 async def coverage_memory(
     settings: Settings, store_id: str, storefilter: str, refresh_hours: int,
-) -> tuple[dict[str, int], set[str]]:
+) -> tuple[dict[str, int], set[str], dict[str, str]]:
     """What the durable coverage record already knows about this tier's nodes.
 
-    Returns (observed_totals, recently_completed).
+    Returns (observed_totals, recently_completed, recent_axis).
 
     - **observed_totals**: the largest page-0 total ever recorded per node, so a
       parent that under-reports a child cannot route it into a walk that cannot
@@ -1106,6 +1231,19 @@ async def coverage_memory(
       Only nodes a walk actually carried. Rolling a completed split UP to the
       node it split was tried and withdrawn: see the note above plan_walks.
 
+    - **recent_axis**: for each node that was split inside the refresh window,
+      the axis its most recent recorded split used. Read straight off the
+      `split_parent`/`split_axis` pair the planner wrote — a fact, not a shape
+      inferred from the child navParams. plan_walks splits that node the same
+      way again, so its children land on the navParams `recently_completed`
+      already holds instead of arriving as an unrecognised second vocabulary.
+      A node absent here is one the record has nothing recent to say about,
+      and it is planned exactly as before.
+
+      This carries no claim that the parent is covered. It decides which
+      question to ask, never what the answer is; the answer still comes from
+      `recently_completed`, one navParam at a time.
+
     Keyed on nav_param, never label: `label` falls back to the raw facet token
     when HD omits a label, so the same node can carry two labels across runs.
     Read-only, one query per tier per run, no API cost.
@@ -1117,6 +1255,7 @@ async def coverage_memory(
 
     totals: dict[str, int] = {}
     recent: set[str] = set()
+    axis_seen: dict[str, tuple[datetime, str]] = {}
     try:
         async with base.get_session(settings) as session:
             rows = (await session.execute(
@@ -1128,21 +1267,83 @@ async def coverage_memory(
                        WalkCoverage.store_id == store_id,
                        WalkCoverage.tier == storefilter)
                 .group_by(WalkCoverage.nav_param))).all()
+            axis_rows = (await session.execute(
+                select(WalkCoverage.split_parent,
+                       WalkCoverage.split_axis,
+                       WalkCoverage.nav_param,
+                       func.max(WalkCoverage.ended))
+                .where(WalkCoverage.split_parent.is_not(None),
+                       WalkCoverage.split_axis.is_not(None),
+                       WalkCoverage.store_id == store_id,
+                       WalkCoverage.tier == storefilter)
+                .group_by(WalkCoverage.split_parent,
+                          WalkCoverage.split_axis,
+                          WalkCoverage.nav_param))).all()
     except Exception as e:  # coverage memory is an optimisation, never a gate
         log.warning("Coverage memory unavailable — planning from facets only",
                     error=str(e))
-        return {}, set()
+        return {}, set(), {}
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, refresh_hours))
+
+    def _aware(ts: datetime | None) -> datetime | None:
+        if ts is not None and ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts
+
     for nav, max_expected, last_complete in rows:
         if max_expected:
             totals[nav] = int(max_expected)
-        if last_complete is not None:
-            if last_complete.tzinfo is None:
-                last_complete = last_complete.replace(tzinfo=timezone.utc)
-            if last_complete >= cutoff:
-                recent.add(nav)
-    return totals, recent
+        last_complete = _aware(last_complete)
+        if last_complete is not None and last_complete >= cutoff:
+            recent.add(nav)
+
+    # A parent that has been split on BOTH axes has rows for each; the more
+    # recent split wins. Ties are left to the ordinary category-first default
+    # rather than broken arbitrarily — a coin flip here is the flapping this
+    # exists to stop.
+    #
+    # AND ONLY WHILE THAT SPLIT STILL HAS SOMETHING TO OFFER. The preference
+    # is emitted for a parent only if at least one child of the recorded split
+    # is itself still complete-in-window. Once every child has gone stale the
+    # node is due for a full sweep, the freshness skip would skip nothing
+    # whichever axis were chosen, and the preference is dropped so the ordinary
+    # category-first order picks again.
+    #
+    # Without that clause the preference never lapses in practice and the node
+    # is pinned to whichever axis it happened to start on: runs land every ~4h
+    # against a 20h window, so "the last split is inside the window" is true
+    # forever. Pinning was measured, in a replay of the real run history, to be
+    # what the naive version actually does. Lapsing at the sweep boundary keeps
+    # both axes exercised while still removing the mid-window flip, which is
+    # the whole cost.
+    # No cutoff test on the split time itself: it would be dead. A parent is
+    # only emitted below if one of its children is in `recent`, and a child in
+    # `recent` completed inside the window, so that child's own row already
+    # puts the split inside it. Mutation testing found the redundant test —
+    # removing it changed no outcome — so it is gone rather than left to look
+    # like a guard that is holding something.
+    for parent, ax, child_nav, last_split in axis_rows:
+        last_split = _aware(last_split)
+        if last_split is None:
+            continue
+        prev = axis_seen.get(parent)
+        if prev is None or last_split > prev[0]:
+            axis_seen[parent] = (last_split, ax)
+        elif last_split == prev[0] and ax != prev[1]:
+            axis_seen[parent] = (last_split, "")
+
+    kids_by_split: dict[tuple[str, str], set[str]] = {}
+    for parent, ax, child_nav, _ in axis_rows:
+        kids_by_split.setdefault((parent, ax), set()).add(child_nav)
+
+    recent_axis: dict[str, str] = {}
+    for parent, (_, ax) in axis_seen.items():
+        if not ax:
+            continue
+        if any(k in recent for k in kids_by_split.get((parent, ax), ())):
+            recent_axis[parent] = ax
+    return totals, recent, recent_axis
 
 
 async def run_browse(
@@ -1349,7 +1550,7 @@ async def run_browse(
         if "network" in tiers and not client.is_throttled:
             per_run = max(1, settings.browse_network_categories_per_run)
             for store_id in store_ids:
-                observed_totals, recently_done = await coverage_memory(
+                observed_totals, recently_done, recent_axis = await coverage_memory(
                     settings, store_id, "ALL", settings.browse_walk_refresh_hours,
                 )
                 # Rotate which brand goes FIRST, one step per run.
@@ -1436,11 +1637,13 @@ async def run_browse(
                                 client, settings, child_nav, child_label,
                                 store_id, "ALL", total=ref.get("count"), dimensions={},
                                 observed_totals=observed_totals,
+                                recent_axis=recent_axis,
                             )
                         else:
                             walks = await resolve_walks(
                                 client, settings, child_nav, child_label, store_id, "ALL",
                                 observed_totals=observed_totals,
+                                recent_axis=recent_axis,
                             )
                         # Forward progress. Anything completed inside the
                         # refresh window is already banked, so re-walking it

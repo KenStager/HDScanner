@@ -316,8 +316,31 @@ class WalkCoverage(Base):
     # Nullable: rows written before this column existed have no value, and
     # backfilling one would be inventing a fact we did not record.
     nav_param: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # The split this walk came out of, RECORDED at planning time rather than
+    # inferred later from navParam shape.
+    #
+    # A node too big for one walk is split by facet, and the node itself then
+    # writes no coverage row — only its children do. Nothing in a child's own
+    # row said which node it was split from or on which dimension, so a later
+    # reader had to guess from the navParam, and the guess is not available:
+    # the same node splits on Category one run and on Price the next (the API
+    # returns the Category dimension intermittently), and the two produce
+    # different child navParams. Without these two columns the second axis
+    # looks like a set of nodes never walked before, and the whole node is
+    # re-read — measured at ~48 requests/day on MILWAUKEE/Tools/Hand Tools.
+    #
+    # split_parent is the parent's nav_param; split_axis is the dimension the
+    # planner split on ("category" or "price"). Both NULL for a walk that is
+    # its own node rather than a piece of one.
+    #
+    # Nullable and never backfilled, for the same reason as nav_param above:
+    # rows written before these columns existed did not record the fact, and
+    # deriving one now would be inventing it.
+    split_parent: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    split_axis: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     __table_args__ = (
         Index("ix_walk_coverage_run", "run_id"),
         Index("ix_walk_coverage_nav", "nav_param"),
+        Index("ix_walk_coverage_split", "split_parent"),
     )

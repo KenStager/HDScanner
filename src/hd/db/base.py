@@ -33,6 +33,8 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("scan_runs", "deferred_walks", "INTEGER"),
     ("scan_runs", "deferred_categories", "INTEGER"),
     ("store_snapshots", "nav_param", "VARCHAR(200)"),
+    ("walk_coverage", "split_parent", "VARCHAR(200)"),
+    ("walk_coverage", "split_axis", "VARCHAR(10)"),
 )
 
 # Indexes have the same gap as columns: create_all adds them only alongside a
@@ -41,6 +43,7 @@ _INDEX_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("ix_snapshot_store_item_ts", "store_snapshots", "store_id, item_id, ts"),
     ("ix_snapshot_ts", "store_snapshots", "ts"),
     ("ix_walk_coverage_nav", "walk_coverage", "nav_param"),
+    ("ix_walk_coverage_split", "walk_coverage", "split_parent"),
 )
 
 
