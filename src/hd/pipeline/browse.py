@@ -471,6 +471,12 @@ def price_partition(
 # node spiking to 120 is about half of it. BROWSE_NETWORK_CATEGORIES_PER_RUN is
 # set to 12, so up to twelve top-level categories compete for that same 237.
 #
+# And there is no headroom to absorb it. Over the 7 days to 2026-09-03 the
+# busiest run used 236 requests against that ceiling of 237, and the run of
+# 2026-09-03 00:00 ET spent 233 and deferred 9 walks and 5 categories. Roughly
+# a third of runs already defer something. So this does not land on a budget
+# with room in it; it lands on one that is already binding.
+#
 # That is a live risk and not a theoretical one, because of what a deferral
 # does in the network-tier loop below. Each band costs single digits, far under
 # the ceiling, so the starvation clause in admits() never engages for this node
