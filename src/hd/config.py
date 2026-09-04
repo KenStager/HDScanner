@@ -170,11 +170,22 @@ class Settings(BaseSettings):
     daily_deals_hours_et: str = ""
     daily_deals_cursor_path: str = ".hd_dailydeals_cursor"
     daily_deals_max_items: int = 250
-    # Items in the day's set that we have never seen are skipped by default:
-    # identifying one costs an API request, and across every completed sweep on
-    # record none of the ~110 daily deals were a tracked brand. Raise this to
-    # spend that many requests probing unknown ids anyway.
-    daily_deals_probe_unknown: int = 0
+    # Items in the day's set we have never seen carry no brand on the page, so
+    # the catalog cannot answer for them. Skipping them was the default while
+    # the sweep read the set once a day: identifying one costs an API request,
+    # and across every completed sweep on record none of the ~110 daily deals
+    # was a tracked brand.
+    #
+    # Raised to cover the whole set by owner decision 2026-09-03. The catalog
+    # filter can only recognise a tool we have already catalogued, so the one
+    # case it is blind to is a tracked brand appearing in the deals for the
+    # FIRST time — which is the case the poll exists to catch. Probing costs one
+    # request per unknown id, once per set (the cursor and sweep lock mean a set
+    # is only ever swept once), against a client budget that sizes itself to the
+    # set (len(item_ids) + 10), so it cannot starve the priced items. At the
+    # observed ~84-110 ids that is ~84-110 API requests on the one run that
+    # sweeps the new set. daily_deals_max_items caps the set at 250.
+    daily_deals_probe_unknown: int = 250
     # `hd daily-deals --wait-for-refresh` re-reads the page every
     # daily_deals_poll_seconds until the embedded set's end date changes, for
     # at most daily_deals_poll_max reads, then sweeps the new set. Six reads two
@@ -186,6 +197,16 @@ class Settings(BaseSettings):
     # argument scan_minute makes): the first read waits a per-install 0..N s,
     # and each interval is stretched by a random 0..N s. Only ever delays.
     daily_deals_poll_jitter_seconds: int = 15
+    # Reads two minutes apart always land on the same minutes (3:00, 3:02, ...),
+    # so the flip is only ever bracketed to the interval that contains it. On
+    # alternating nights the first read is held back by this many seconds, which
+    # shifts the whole series (3:01, 3:03, ...) and samples the minutes the other
+    # phase never sees. Across nights that halves the grid the flip time is known
+    # on, for the same six reads — no extra requests. 0 disables the alternation
+    # and every night runs the even series. Which night is which is derived from
+    # the date, not stored, so a missed night does not flip the sequence and the
+    # phase of any past run can be recomputed from its timestamp.
+    daily_deals_poll_phase_seconds: int = 60
     # Every read of the page appends one JSON line here: end date, item count,
     # a digest of the item list. The routine sweep reads the page on the runs
     # DAILY_DEALS_HOURS_ET selects (empty = every run), so with it empty this

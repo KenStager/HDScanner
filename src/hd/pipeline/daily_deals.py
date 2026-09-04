@@ -520,6 +520,25 @@ def _start_offset_seconds(settings: Settings) -> int:
     return int(hashlib.sha256(seed.encode()).hexdigest(), 16) % (jitter + 1)
 
 
+def _phase_offset_seconds(settings: Settings, now_et: datetime) -> int:
+    """Extra delay before the first read, alternating night by night.
+
+    Six reads two minutes apart land on the same six minutes every night, so
+    a flip is only ever located to the interval that contains it. Holding the
+    series back by one interval-half on alternate nights samples the minutes
+    the other phase never sees, which halves the grid the refresh time is
+    known on without spending a single extra read.
+
+    The parity comes from the date rather than a counter: a night the machine
+    missed cannot flip the sequence, and the phase of any past run can be
+    recomputed from its timestamp when the evidence file is read back.
+    """
+    phase = max(0, settings.daily_deals_poll_phase_seconds)
+    if not phase:
+        return 0
+    return phase if now_et.date().toordinal() % 2 else 0
+
+
 async def wait_for_refresh(
     settings: Settings,
     client: HDClient | None = None,
@@ -529,7 +548,9 @@ async def wait_for_refresh(
 ) -> DailyDealsSummary:
     """Re-read the daily-deals page until its set changes, then sweep it.
 
-    Meant to start at 3:00 Eastern, when Home Depot resets the offers. Each
+    Meant to start at 3:00 Eastern, when Home Depot resets the offers — on
+    alternate nights one interval-half after it, so the reads fall on the
+    minutes the other phase misses (see `_phase_offset_seconds`). Each
     read that still shows the processed set is recorded and followed by a
     wait; the first read that shows a newer end date is swept at once, so the
     deals are priced within one poll interval of going live instead of an
@@ -569,7 +590,10 @@ async def wait_for_refresh(
     baseline = cursor
     max_polls = max(1, settings.daily_deals_poll_max) if in_window else 1
     jitter = max(0, settings.daily_deals_poll_jitter_seconds)
-    offset = _start_offset_seconds(settings) if in_window else 0
+    # Only inside the window: a poll that starts late is already off its slot,
+    # and delaying its single read further would only age the reading.
+    phase_offset = _phase_offset_seconds(settings, clock()) if in_window else 0
+    offset = (_start_offset_seconds(settings) + phase_offset) if in_window else 0
     if offset:
         await sleep(offset)
     started = datetime.now(timezone.utc)
@@ -625,6 +649,7 @@ async def wait_for_refresh(
         record_evidence(
             settings, "flip", deal_set,
             poll=attempt, previous=cursor, seconds_after_start=elapsed,
+            start_phase_seconds=phase_offset,
         )
         log.info(
             "Daily-deals set refreshed",
