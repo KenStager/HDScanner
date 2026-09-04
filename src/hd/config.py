@@ -171,21 +171,23 @@ class Settings(BaseSettings):
     daily_deals_cursor_path: str = ".hd_dailydeals_cursor"
     daily_deals_max_items: int = 250
     # Items in the day's set we have never seen carry no brand on the page, so
-    # the catalog cannot answer for them. Skipping them was the default while
-    # the sweep read the set once a day: identifying one costs an API request,
-    # and across every completed sweep on record none of the ~110 daily deals
-    # was a tracked brand.
+    # the catalog cannot answer for them. Identifying one costs an API request.
     #
-    # Raised to cover the whole set by owner decision 2026-09-03. The catalog
-    # filter can only recognise a tool we have already catalogued, so the one
-    # case it is blind to is a tracked brand appearing in the deals for the
-    # FIRST time — which is the case the poll exists to catch. Probing costs one
-    # request per unknown id, once per set (the cursor and sweep lock mean a set
-    # is only ever swept once), against a client budget that sizes itself to the
-    # set (len(item_ids) + 10), so it cannot starve the priced items. At the
-    # observed ~84-110 ids that is ~84-110 API requests on the one run that
-    # sweeps the new set. daily_deals_max_items caps the set at 250.
-    daily_deals_probe_unknown: int = 250
+    # Held at 0 after the 2026-09-03 measurement pass. Probing every unknown was
+    # tried and reverted the same night for three reasons: the sweep discards a
+    # probe that is not our brand (`if not products: continue` precedes the
+    # upsert), so the ~110 requests a night would never decay; the obvious fix,
+    # recording what was probed, is not a logging change, because
+    # _upsert_products marks a row is_active and the snapshot pipeline prices
+    # every active product with no brand filter — non-tool deal items would
+    # silently join the daily rotation; and the size of the blind spot has never
+    # been measured, so there was nothing to weigh the cost against.
+    #
+    # The "partition" evidence line now records that size for zero requests. Set
+    # this once those counts say what probing would actually buy. When raising
+    # it, note that the probe targets only ids the catalog has NEVER seen — an
+    # id it already answered "not ours" for is not re-requested.
+    daily_deals_probe_unknown: int = 0
     # `hd daily-deals --wait-for-refresh` re-reads the page every
     # daily_deals_poll_seconds until the embedded set's end date changes, for
     # at most daily_deals_poll_max reads, then sweeps the new set. Six reads two

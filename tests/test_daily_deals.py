@@ -361,7 +361,9 @@ class TestWaitForRefresh:
         assert summary.snapshots == 2
         assert Path(poll_settings.daily_deals_cursor_path).read_text() == "2026-09-04"
         phases = [e["phase"] for e in _evidence(poll_settings)]
-        assert phases == ["poll", "poll", "flip", "priced", "priced", "swept"]
+        # The partition is recorded once, between the flip and the first price:
+        # what the set was measured against, before anything was requested.
+        assert phases == ["poll", "poll", "flip", "partition", "priced", "priced", "swept"]
         flip = next(e for e in _evidence(poll_settings) if e["phase"] == "flip")
         assert flip["previous"] == "2026-09-03" and flip["end_date"] == "2026-09-04"
         assert flip["poll"] == 3 and "seconds_after_start" in flip
@@ -758,11 +760,12 @@ class TestProbesUnknownItems:
     brand filter is blind to is a tracked brand reaching the deals for the first
     time. Owner decision 2026-09-03: spend a request per unknown id to see it."""
 
-    async def test_shipped_default_covers_a_full_size_set(self):
-        # Sets run ~84-110 ids and daily_deals_max_items caps them at 250, so
-        # the default must not silently leave a tail of the set unprobed.
-        settings = Settings()
-        assert settings.daily_deals_probe_unknown >= settings.daily_deals_max_items
+    async def test_probing_is_off_by_default(self):
+        # Reverted 2026-09-03: a probe is discarded unless it is our brand, so
+        # the spend never decays, and recording it instead would enrol non-tool
+        # items in the snapshot rotation. The partition line sizes the blind
+        # spot for nothing; raise this only against those counts.
+        assert Settings().daily_deals_probe_unknown == 0
 
     async def test_unknown_ids_are_requested_by_default(self, dd_settings, fresh_db):
         from hd.db import base
@@ -770,7 +773,7 @@ class TestProbesUnknownItems:
 
         await base.init_db(dd_settings)
         await seed_catalog(dd_settings, **{"111": "Milwaukee"})
-        dd_settings.daily_deals_probe_unknown = Settings().daily_deals_probe_unknown
+        dd_settings.daily_deals_probe_unknown = 250
         deal_set = DailyDealSet(end_date="2026-08-18", item_ids=["111", "222", "333"])
         client = FakeClient()
 
@@ -789,7 +792,7 @@ class TestProbesUnknownItems:
 
         await base.init_db(dd_settings)
         await seed_catalog(dd_settings, **{"100": "Milwaukee"})
-        dd_settings.daily_deals_probe_unknown = Settings().daily_deals_probe_unknown
+        dd_settings.daily_deals_probe_unknown = 250
         ids = [str(i) for i in range(100, 210)]  # 110 ids, one of them tracked
         client = FakeClient()
 
@@ -800,3 +803,66 @@ class TestProbesUnknownItems:
         assert len(client.requested) == 110
         assert summary.skipped_unknown == 0
         assert summary.aborted is False
+
+
+class TestCatalogPartition:
+    """Sizing the blind spot must cost no requests: it is a database question."""
+
+    async def test_partition_counts_the_three_kinds_and_spends_nothing(
+        self, dd_settings, fresh_db,
+    ):
+        from hd.db import base
+        from hd.pipeline.daily_deals import run_daily_deals
+
+        await base.init_db(dd_settings)
+        # 111 ours, 333 already answered "not ours", 777/888 never seen.
+        await seed_catalog(dd_settings, **{"111": "Milwaukee", "333": "RYOBI"})
+        deal_set = DailyDealSet(end_date="2026-08-18", item_ids=["111", "333", "777", "888"])
+        client = FakeClient()
+
+        with patch("hd.pipeline.daily_deals.fetch_daily_deal_set", return_value=deal_set):
+            await run_daily_deals(dd_settings, client=client)
+
+        part = [e for e in _evidence(dd_settings) if e["phase"] == "partition"]
+        assert len(part) == 1
+        assert part[0]["tracked"] == 1
+        assert part[0]["known_not_ours"] == 1
+        assert part[0]["never_seen"] == 2
+        # Only the tracked item was requested: measuring cost no requests.
+        assert client.requested == ["111"]
+
+    async def test_an_already_answered_id_is_never_re_probed(self, dd_settings, fresh_db):
+        """A probe budget targets the blind spot, not questions we have paid for."""
+        from hd.db import base
+        from hd.pipeline.daily_deals import run_daily_deals
+
+        await base.init_db(dd_settings)
+        await seed_catalog(dd_settings, **{"333": "RYOBI"})
+        dd_settings.daily_deals_probe_unknown = 250
+        deal_set = DailyDealSet(end_date="2026-08-18", item_ids=["333", "777"])
+        client = FakeClient()
+
+        with patch("hd.pipeline.daily_deals.fetch_daily_deal_set", return_value=deal_set):
+            await run_daily_deals(dd_settings, client=client)
+
+        # 333 is known not to be ours; only the never-seen 777 is worth asking about.
+        assert client.requested == ["777"]
+
+    async def test_partition_is_recorded_even_when_nothing_is_ours(
+        self, dd_settings, fresh_db,
+    ):
+        """The night that spends nothing is exactly the night whose blind-spot
+        size we need, so the measurement cannot sit behind the early return."""
+        from hd.db import base
+        from hd.pipeline.daily_deals import run_daily_deals
+
+        await base.init_db(dd_settings)
+        deal_set = DailyDealSet(end_date="2026-08-18", item_ids=[str(i) for i in range(100, 184)])
+        client = FakeClient()
+
+        with patch("hd.pipeline.daily_deals.fetch_daily_deal_set", return_value=deal_set):
+            summary = await run_daily_deals(dd_settings, client=client)
+
+        part = [e for e in _evidence(dd_settings) if e["phase"] == "partition"]
+        assert len(part) == 1 and part[0]["never_seen"] == 84
+        assert client.requested == [] and summary.items_checked == 0

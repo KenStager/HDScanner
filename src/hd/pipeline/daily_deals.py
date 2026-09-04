@@ -309,6 +309,29 @@ async def _tracked_brand_items(settings: Settings, item_ids: list[str]) -> set[s
         return {r[0] for r in rows}
 
 
+async def _catalogued_items(settings: Settings, item_ids: list[str]) -> set[str]:
+    """Which of these item ids the catalog has ever seen, whatever the brand.
+
+    `_tracked_brand_items` answers "is it ours", which collapses two different
+    unknowns into one: an id the catalog has already answered "not ours" for,
+    and an id it has never seen at all. Only the second is a blind spot. The
+    first is a question we have already paid for, and re-asking it would spend
+    a request to be told what we know.
+    """
+    if not item_ids:
+        return set()
+    from sqlalchemy import select
+
+    from hd.db import base
+    from hd.db.models import Product
+
+    async with base.get_session(settings) as session:
+        rows = await session.execute(
+            select(Product.item_id).where(Product.item_id.in_(item_ids))
+        )
+        return {r[0] for r in rows}
+
+
 async def run_daily_deals(
     settings: Settings,
     client: HDClient | None = None,
@@ -385,9 +408,25 @@ async def _sweep(
     )
 
     tracked = await _tracked_brand_items(settings, item_ids)
-    unknown = [i for i in item_ids if i not in tracked]
+    catalogued = await _catalogued_items(settings, item_ids)
+    # The set splits three ways, and only the third is a blind spot: ours,
+    # already answered "not ours", and never seen at all. Recording the sizes
+    # costs one database query and no requests, which is what makes it possible
+    # to price the probe before buying it.
+    never_seen = [i for i in item_ids if i not in catalogued]
+    known_not_ours = len(catalogued) - len(tracked)
+    record_evidence(
+        settings, "partition", deal_set,
+        tracked=len(tracked), known_not_ours=known_not_ours,
+        never_seen=len(never_seen), probe_budget=max(0, settings.daily_deals_probe_unknown),
+    )
+    log.info(
+        "Daily-deals set partitioned against the catalog",
+        listed=len(item_ids), tracked=len(tracked),
+        known_not_ours=known_not_ours, never_seen=len(never_seen),
+    )
     probe = max(0, settings.daily_deals_probe_unknown)
-    targets = [i for i in item_ids if i in tracked] + unknown[:probe]
+    targets = [i for i in item_ids if i in tracked] + never_seen[:probe]
     summary.skipped_unknown = len(item_ids) - len(targets)
 
     if not targets:
@@ -397,6 +436,7 @@ async def _sweep(
             "Daily-deals set contains none of our brands — no requests made",
             end_date=deal_set.end_date,
             listed=len(item_ids),
+            never_seen=len(never_seen),
             categories=[c.get("name") for c in deal_set.categories],
         )
         _write_cursor(settings.daily_deals_cursor_path, deal_set.end_date)
@@ -408,7 +448,7 @@ async def _sweep(
 
     log.info(
         "Daily-deals candidates after brand filter",
-        candidates=len(targets), listed=len(item_ids), probing_unknown=min(probe, len(unknown)),
+        candidates=len(targets), listed=len(item_ids), probing_unknown=min(probe, len(never_seen)),
     )
     item_ids = targets
 
