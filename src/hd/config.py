@@ -75,6 +75,16 @@ class Settings(BaseSettings):
     browse_enabled: bool = True
     root_nav_param: str = "N-5yc1v"           # catalog root; brand/category tokens append with Z
     brand_tokens: str = ""                    # CSV of Brand:facet-token, written by `hd setup`
+    # Brands walked by the network tier only. The shelf tier costs a fixed
+    # ~63 requests per brand per pass and sits near the both-ends eligibility
+    # ceiling, so a brand whose in-store size has not been measured is held
+    # out of it until the network walk has shown what it holds. Empty means
+    # every brand in `brand_tokens` walks both tiers, as before.
+    network_only_brands: str = ""
+    # Brands the daily-deals post may publish. Empty means `brands`, as
+    # before. Exists so that adding a brand to the walk is not the same act as
+    # adding it to a surface named for another brand.
+    daily_deals_brands: str = ""
     api_max_start_index: int = 720            # API rejects startIndex > 720 ("Invalid start index range")
     browse_network_categories_per_run: int = 3  # ALL-tier categories walked per store per run
     # Per-hour tier assignment (US Eastern, CSV). Empty = every run does every
@@ -422,6 +432,15 @@ class Settings(BaseSettings):
     @property
     def scan_keyword_list(self) -> list[str]:
         return _parse_csv(self.scan_keywords)
+
+    @property
+    def network_only_brand_list(self) -> list[str]:
+        return [b.upper() for b in _parse_csv(self.network_only_brands)]
+
+    @property
+    def daily_deals_brand_list(self) -> list[str]:
+        """Brands the daily-deals post is scoped to; `brand_list` unless set."""
+        return _parse_csv(self.daily_deals_brands) or self.brand_list
 
     @property
     def brand_token_list(self) -> list[tuple[str, str]]:

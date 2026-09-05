@@ -296,7 +296,7 @@ async def _tracked_brand_items(settings: Settings, item_ids: list[str]) -> set[s
     from hd.db import base
     from hd.db.models import Product
 
-    uppers = [b.upper() for b in settings.brand_list]
+    uppers = [b.upper() for b in settings.daily_deals_brand_list]
     if not uppers:
         return set()
     async with base.get_session(settings) as session:
@@ -454,7 +454,7 @@ async def _sweep(
 
     owns_client = client is None
     client = client or HDClient(settings, request_budget=len(item_ids) + 10)
-    upper_brands = [b.upper() for b in settings.brand_list]
+    upper_brands = [b.upper() for b in settings.daily_deals_brand_list]
     now = datetime.now(timezone.utc)
     completed = True
 

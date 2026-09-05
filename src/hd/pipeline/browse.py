@@ -1465,7 +1465,15 @@ async def run_browse(
                 # uneven observation cadence.
                 #
                 # Invisible with one brand configured, guaranteed with two.
-                order = brand_order_for_run(brand_tokens, cursors, store_id)
+                #
+                # A brand in `network_only_brands` is not shelf-walked at all:
+                # its in-store size is unmeasured, and the shelf tier is the
+                # one whose cost a brand's size can push past the ceiling.
+                shelf_tokens = [
+                    (b, t) for b, t in brand_tokens
+                    if b.upper() not in settings.network_only_brand_list
+                ]
+                order = brand_order_for_run(shelf_tokens, cursors, store_id)
                 for brand, token in order:
                     if client.is_throttled:
                         summary.aborted = True

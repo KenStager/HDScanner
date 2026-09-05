@@ -2493,3 +2493,44 @@ class TestEveryPieceOfASplitRecordsIt:
         walks, _ = plan_walks("N-5yc1vZzv", "M", 999, {}, browse_settings)
         assert walks[0].truncated
         assert walks[0].split_parent is None and walks[0].split_axis is None
+
+
+class TestBrandTierScope:
+    """Adding a brand to the walk is not adding it to every tier or surface.
+
+    The shelf tier costs a fixed per-brand pass and sits near the both-ends
+    ceiling, so a brand whose in-store size is unmeasured walks the network
+    tier only until it has been. The daily-deals post is scoped by its own
+    list so a walked brand does not land on a surface named for another.
+    """
+
+    def _settings(self, tmp_path, **overrides) -> Settings:
+        base = dict(
+            _env_file=None,
+            database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+            stores="2619",
+            brands="Milwaukee,DEWALT",
+            brand_tokens="Milwaukee:zv,DEWALT:4j2",
+        )
+        base.update(overrides)
+        return Settings(**base)
+
+    def test_empty_scope_settings_change_nothing(self, tmp_path):
+        s = self._settings(tmp_path)
+        assert s.network_only_brand_list == []
+        assert s.daily_deals_brand_list == ["Milwaukee", "DEWALT"]
+
+    def test_network_only_brand_is_held_out_of_the_shelf_list(self, tmp_path):
+        s = self._settings(tmp_path, network_only_brands="dewalt")
+        shelf = [
+            (b, t) for b, t in s.brand_token_list
+            if b.upper() not in s.network_only_brand_list
+        ]
+        assert shelf == [("Milwaukee", "zv")]
+        # The network tier still walks every configured brand.
+        assert s.brand_token_list == [("Milwaukee", "zv"), ("DEWALT", "4j2")]
+
+    def test_daily_deals_scope_overrides_the_walk_set(self, tmp_path):
+        s = self._settings(tmp_path, daily_deals_brands="Milwaukee")
+        assert s.daily_deals_brand_list == ["Milwaukee"]
+        assert s.brand_list == ["Milwaukee", "DEWALT"]
