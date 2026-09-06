@@ -109,15 +109,25 @@ class BrowseSummary:
     deferred_categories: int = 0
 
 
-def brand_order_cursor_key(store_id: str) -> str:
-    """Cursor key for which brand leads this run's network tier."""
-    return f"network|{store_id}|brand-order"
+def brand_order_cursor_key(store_id: str, tier: str = "network") -> str:
+    """Cursor key for which brand leads this run on one tier.
+
+    Keyed per TIER as well as per store. The shelf and network tiers each
+    rotate their own brand order, and a shelf-only run (two of every six on
+    the live schedule) must not advance the network tier's rotation: with one
+    shared key it would, and a both-tiers run would advance it twice — which
+    is the uneven cadence the rotation exists to prevent. Today's config
+    masks it (a single-brand shelf list never advances), so the shared key was
+    a latent defect, not a live one.
+    """
+    return f"{tier}|{store_id}|brand-order"
 
 
 def brand_order_for_run(
     brand_tokens: list[tuple[str, str]],
     cursors: dict[str, int],
     store_id: str,
+    tier: str = "network",
 ) -> list[tuple[str, str]]:
     """`brand_tokens` rotated so a different brand leads each run.
 
@@ -125,12 +135,13 @@ def brand_order_for_run(
     consecutive brands and the brand that went last this run goes first next
     run. With one brand this is the identity and costs nothing.
 
-    Deliberately keyed per store: stores are walked in their own loop and each
-    one exhausts the shared budget independently.
+    Deliberately keyed per store and per tier: stores are walked in their own
+    loop and each one exhausts the shared budget independently, and each tier
+    rotates on its own schedule.
     """
     if len(brand_tokens) < 2:
         return list(brand_tokens)
-    key = brand_order_cursor_key(store_id)
+    key = brand_order_cursor_key(store_id, tier)
     offset = cursors.get(key, 0) % len(brand_tokens)
     cursors[key] = (offset + 1) % len(brand_tokens)
     return list(brand_tokens[offset:]) + list(brand_tokens[:offset])
@@ -546,6 +557,7 @@ def plan_walks(
     price_split_used: bool = False,
     observed_totals: dict[str, int] | None = None,
     recent_axis: dict[str, str] | None = None,
+    recorded_children: dict[str, list[tuple[str, str, int]]] | None = None,
 ) -> tuple[list[Walk], list[tuple[str, str]]]:
     """Split one result set into walkable pieces using its own facets.
 
@@ -558,10 +570,24 @@ def plan_walks(
     last split on inside the freshness window (see coverage_memory). A node
     named there is split on that axis again when this run's facets still
     support it, so its children carry the navParams the record already holds
-    and the caller's per-navParam freshness skip can recognise them. Absent,
-    empty, or naming an axis this run cannot build, the ordinary
-    category-then-price order applies unchanged. Preference only — it never
-    creates a walk and never suppresses one.
+    and the caller's per-navParam freshness skip can recognise them.
+
+    `recorded_children` maps the same navParams to the children that split
+    produced last time — (navParam, label, expected) per child, every status.
+    When this run's facets cannot build the recorded axis, the split is
+    REBUILT FROM THE RECORD rather than taken on the other axis. Measured
+    reason: run 70 (2026-09-06 04:03Z) held a category preference for
+    MILWAUKEE/Tools/Hand Tools, HD served no Category dimension on that read,
+    the planner fell through to price, and 20 price children none of which
+    the freshness skip knew re-read a node whose 16 category children had
+    completed 3h52m earlier — 104 of the run's 135 requests for zero new
+    coverage. The rebuilt children are exactly the navParams the record
+    holds, so the skip recognises them and only the stale ones walk.
+
+    With no record to rebuild from, the ordinary category-then-price order
+    applies, and the substitution is logged as a warning rather than passing
+    silently. Preference only — it never suppresses a walk the facets would
+    have produced.
     """
     if total is None or total <= 0:
         return [], []
@@ -628,19 +654,68 @@ def plan_walks(
                             split_parent=nav_param, split_axis="price"))
         return out
 
-    # The record's axis wins over the category-first default, but only when
-    # this run's facets can actually build it. Category needs no branch of its
-    # own here: it is already the default, so a recorded "category" simply
-    # falls through to the block below and takes it if the dimension is there.
+    def _from_record(axis: str) -> list[Walk] | None:
+        """The recorded split rebuilt as walks, or None when there is none.
+
+        Only leaves are on record — a child that was itself split further
+        left no walk row of its own — so a record whose direct children are
+        partly split parents is incomplete and is refused: rebuilding it
+        would silently drop a sub-tree, which is worse than the re-read.
+        """
+        recorded = (recorded_children or {}).get(nav_param) or []
+        if not recorded:
+            return None
+        recorded_navs = {nav for nav, _, _ in recorded}
+        # A recorded leaf under this node that is NOT a direct child means a
+        # direct child was split further; that child has no row and the
+        # record cannot stand in for the facets.
+        prefix = nav_param + "Z"
+        for nav in recorded_navs:
+            tail = nav[len(prefix):] if nav.startswith(prefix) else ""
+            if not tail or "Z" in tail:
+                log.warning(
+                    "Recorded split is incomplete — not rebuilding from it",
+                    label=label, nav_param=nav_param, axis=axis, child=nav,
+                )
+                return None
+        out: list[Walk] = []
+        for child_nav, child_label, expected in recorded:
+            count = max(int(expected or 0), (observed_totals or {}).get(child_nav, 0))
+            out.append(Walk(child_nav, child_label, count, truncated=count > cap,
+                            split_parent=nav_param, split_axis=axis))
+        log.info("Rebuilding the recorded split — this run's facets cannot",
+                 label=label, nav_param=nav_param, axis=axis, children=len(out))
+        return out
+
+    def _fallback_warning(axis: str, taking: str) -> None:
+        log.warning(
+            "Record axis unavailable this run — falling back to the other axis",
+            label=label, nav_param=nav_param, recorded_axis=axis, taking=taking,
+            categories_available=len(categories),
+        )
+
+    # The record's axis wins over the category-first default. When this run's
+    # facets can build it, they do; when they cannot, the record's own
+    # children stand in (see _from_record); and only with neither does the
+    # ordinary category-then-price order apply — loudly.
     preferred = (recent_axis or {}).get(nav_param)
-    if preferred == "price" and categories:
+    price_tried = False
+    price_walks: list[Walk] | None = None
+    if preferred == "price":
         price_walks = _price_walks()
+        price_tried = True
         if price_walks is not None:
             log.info("Splitting on the axis the record holds",
                      label=label, nav_param=nav_param, axis="price",
                      children=len(price_walks), categories_available=len(categories))
             _route("price-split")
             return price_walks, []
+        rebuilt = _from_record("price")
+        if rebuilt is not None:
+            _route("price-split")
+            return rebuilt, []
+        if categories:
+            _fallback_warning("price", "category")
 
     if categories:
         walks: list[Walk] = []
@@ -668,7 +743,15 @@ def plan_walks(
         _route("category-split")
         return walks, need
 
-    price_walks = _price_walks()
+    if preferred == "category":
+        rebuilt = _from_record("category")
+        if rebuilt is not None:
+            _route("category-split")
+            return rebuilt, []
+        _fallback_warning("category", "price")
+
+    if not price_tried:
+        price_walks = _price_walks()
     if price_walks is not None:
         _route("price-split")
         return price_walks, []
@@ -730,6 +813,7 @@ async def resolve_walks(
     dimensions: dict[str, list[dict]] | None = None,
     observed_totals: dict[str, int] | None = None,
     recent_axis: dict[str, str] | None = None,
+    recorded_children: dict[str, list[tuple[str, str, int]]] | None = None,
 ) -> list[Walk]:
     """Plan walks for a node, fetching facets for any piece still over the cap."""
     raw = None
@@ -739,7 +823,8 @@ async def resolve_walks(
         )
     walks, need = plan_walks(nav_param, label, total, dimensions, settings,
                              observed_totals=observed_totals,
-                             recent_axis=recent_axis)
+                             recent_axis=recent_axis,
+                             recorded_children=recorded_children)
     _prime(walks, nav_param, raw)
     depth = 1
     # Carry the node each pending child was split OUT OF alongside it. Only the
@@ -773,6 +858,7 @@ async def resolve_walks(
                 # The node that flips axis is a depth-1 child, not a root, so
                 # the preference has to reach this call to do anything at all.
                 recent_axis=recent_axis,
+                recorded_children=recorded_children,
             )
             _prime(c_walks, child_nav, c_raw)
             for w in c_walks:
@@ -1280,10 +1366,17 @@ async def _record_run_end(
 
 async def coverage_memory(
     settings: Settings, store_id: str, storefilter: str, refresh_hours: int,
-) -> tuple[dict[str, int], set[str], dict[str, str]]:
+) -> tuple[dict[str, int], set[str], dict[str, str], dict[str, list[tuple[str, str, int]]]]:
     """What the durable coverage record already knows about this tier's nodes.
 
-    Returns (observed_totals, recently_completed, recent_axis).
+    Returns (observed_totals, recently_completed, recent_axis, recorded_children).
+
+    - **recorded_children**: for each node in `recent_axis`, the children its
+      recorded split produced — (navParam, label, expected) per child, in
+      every status, so a truncated band is rebuilt as the truncated walk it
+      was rather than dropped. plan_walks uses this when the run's facets
+      cannot build the recorded axis; see its docstring for the measured
+      cost of not having it.
 
     - **observed_totals**: the largest page-0 total ever recorded per node, so a
       parent that under-reports a child cannot route it into a walk that cannot
@@ -1340,7 +1433,17 @@ async def coverage_memory(
                 select(WalkCoverage.split_parent,
                        WalkCoverage.split_axis,
                        WalkCoverage.nav_param,
-                       func.max(WalkCoverage.ended))
+                       # Ranking is over splits that produced coverage. A
+                       # truncated or failed child never enters `recent`, so
+                       # it could never keep a preference alive — but ranked
+                       # on its `ended` it could KILL one: a lone truncated
+                       # re-walk of one band outranked a clean sweep on the
+                       # other axis (run 65's single $400-$500 walk set the
+                       # recorded axis at runs 68 and 69). Complete rows only.
+                       func.max(WalkCoverage.ended).filter(
+                           WalkCoverage.status == "complete"),
+                       func.max(WalkCoverage.label),
+                       func.max(WalkCoverage.items_expected))
                 .where(WalkCoverage.split_parent.is_not(None),
                        WalkCoverage.split_axis.is_not(None),
                        WalkCoverage.store_id == store_id,
@@ -1351,7 +1454,7 @@ async def coverage_memory(
     except Exception as e:  # coverage memory is an optimisation, never a gate
         log.warning("Coverage memory unavailable — planning from facets only",
                     error=str(e))
-        return {}, set(), {}
+        return {}, set(), {}, {}
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0, refresh_hours))
 
@@ -1392,7 +1495,7 @@ async def coverage_memory(
     # puts the split inside it. Mutation testing found the redundant test —
     # removing it changed no outcome — so it is gone rather than left to look
     # like a guard that is holding something.
-    for parent, ax, child_nav, last_split in axis_rows:
+    for parent, ax, child_nav, last_split, _, _ in axis_rows:
         last_split = _aware(last_split)
         if last_split is None:
             continue
@@ -1402,17 +1505,25 @@ async def coverage_memory(
         elif last_split == prev[0] and ax != prev[1]:
             axis_seen[parent] = (last_split, "")
 
-    kids_by_split: dict[tuple[str, str], set[str]] = {}
-    for parent, ax, child_nav, _ in axis_rows:
-        kids_by_split.setdefault((parent, ax), set()).add(child_nav)
+    # Every child of every recorded split, complete or not: the rebuild in
+    # plan_walks must reproduce the split as it was, and a truncated band
+    # left out of it would be a walk silently dropped.
+    kids_by_split: dict[tuple[str, str], list[tuple[str, str, int]]] = {}
+    for parent, ax, child_nav, _, child_label, expected in axis_rows:
+        kids_by_split.setdefault((parent, ax), []).append(
+            (child_nav, child_label or child_nav, int(expected or 0))
+        )
 
     recent_axis: dict[str, str] = {}
+    recorded_children: dict[str, list[tuple[str, str, int]]] = {}
     for parent, (_, ax) in axis_seen.items():
         if not ax:
             continue
-        if any(k in recent for k in kids_by_split.get((parent, ax), ())):
+        kids = kids_by_split.get((parent, ax), [])
+        if any(nav in recent for nav, _, _ in kids):
             recent_axis[parent] = ax
-    return totals, recent, recent_axis
+            recorded_children[parent] = sorted(kids)
+    return totals, recent, recent_axis, recorded_children
 
 
 async def run_browse(
@@ -1473,7 +1584,16 @@ async def run_browse(
                     (b, t) for b, t in brand_tokens
                     if b.upper() not in settings.network_only_brand_list
                 ]
-                order = brand_order_for_run(shelf_tokens, cursors, store_id)
+                if brand_tokens and not shelf_tokens:
+                    # Every configured brand is network-only: the tier walks
+                    # nothing, and "Shelf tier complete" below would read as
+                    # a pass. Say so, once, in the run's own log.
+                    log.warning(
+                        "Shelf tier has no brand to walk — every brand is network-only",
+                        store_id=store_id,
+                        network_only=settings.network_only_brand_list,
+                    )
+                order = brand_order_for_run(shelf_tokens, cursors, store_id, tier="shelf")
                 for brand, token in order:
                     if client.is_throttled:
                         summary.aborted = True
@@ -1627,7 +1747,7 @@ async def run_browse(
         if "network" in tiers and not client.is_throttled:
             per_run = max(1, settings.browse_network_categories_per_run)
             for store_id in store_ids:
-                observed_totals, recently_done, recent_axis = await coverage_memory(
+                observed_totals, recently_done, recent_axis, recorded_children = await coverage_memory(
                     settings, store_id, "ALL", settings.browse_walk_refresh_hours,
                 )
                 # Rotate which brand goes FIRST, one step per run.
@@ -1715,12 +1835,14 @@ async def run_browse(
                                 store_id, "ALL", total=ref.get("count"), dimensions={},
                                 observed_totals=observed_totals,
                                 recent_axis=recent_axis,
+                                recorded_children=recorded_children,
                             )
                         else:
                             walks = await resolve_walks(
                                 client, settings, child_nav, child_label, store_id, "ALL",
                                 observed_totals=observed_totals,
                                 recent_axis=recent_axis,
+                                recorded_children=recorded_children,
                             )
                         # Forward progress. Anything completed inside the
                         # refresh window is already banked, so re-walking it

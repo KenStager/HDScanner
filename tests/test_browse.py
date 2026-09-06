@@ -1931,7 +1931,7 @@ class TestCategoryResume:
             ("nav/stale", "complete", 40),
             ("nav/cut", "truncated", 1),
         ])
-        totals, recent, _axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        totals, recent, _axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
 
         assert "nav/fresh" in recent          # inside the window
@@ -1948,7 +1948,7 @@ class TestCategoryResume:
         from hd.pipeline.browse import coverage_memory
 
         await self._seed(browse_settings, [("N-5yc1vZzvZpt", "truncated", 2)])
-        totals, recent, _axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        totals, recent, _axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert totals == {"N-5yc1vZzvZpt": 100}
         assert recent == set()
@@ -1967,7 +1967,7 @@ class TestCategoryResume:
                     started=now, ended=now, status="complete",
                     items_expected=10, items_observed=10))
             await session.commit()
-        totals, recent, _axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        totals, recent, _axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         # Only the 2619/ALL row may contribute; the shelf tier and the other
         # store walk the same labels and would otherwise mask each other.
@@ -1981,7 +1981,7 @@ class TestCategoryResume:
         from hd.pipeline.browse import coverage_memory
         broken = browse_settings.model_copy(update={
             "database_url": f"sqlite+aiosqlite:///{tmp_path}/nonexistent-dir/x.db"})
-        totals, recent, axis = await coverage_memory(broken, "2619", "ALL", 20)
+        totals, recent, axis, _kids = await coverage_memory(broken, "2619", "ALL", 20)
         assert totals == {} and recent == set() and axis == {}
 
 
@@ -2207,7 +2207,7 @@ class TestRecordedAxisIsReadBack:
             ("N-aZc1", "N-a", "category", "complete", 30),   # older split
             ("N-aZ12kx", "N-a", "price", "complete", 2),     # newer, still fresh
         ])
-        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        _, recent, axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert axis == {"N-a": "price"} and "N-aZ12kx" in recent
 
@@ -2229,7 +2229,7 @@ class TestRecordedAxisIsReadBack:
             # ...and the one child that did complete has gone stale.
             ("N-aZ12kx", "N-a", "price", "complete", 30),
         ])
-        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        _, recent, axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert recent == set(), "neither child is covered inside the window"
         assert axis == {}, "a split with no fresh child must not steer the planner"
@@ -2240,7 +2240,7 @@ class TestRecordedAxisIsReadBack:
         from hd.db import base
         from hd.pipeline.browse import coverage_memory
         await self._seed(browse_settings, [("N-aZ12kx", "N-a", "price", "complete", 40)])
-        _, _, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        _, _, axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert axis == {}
 
@@ -2253,7 +2253,7 @@ class TestRecordedAxisIsReadBack:
             ("N-aZc1", "N-a", "category", "complete", 2),
             ("N-aZ12kx", "N-a", "price", "complete", 2),
         ])
-        _, _, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        _, _, axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert axis == {}
 
@@ -2281,7 +2281,7 @@ class TestRecordedAxisIsReadBack:
                     split_parent="N-a", split_axis="price", started=now, ended=now,
                     status="complete", items_expected=10, items_observed=10))
             await session.commit()
-        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        _, recent, axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert "N-aZ12kx" in recent
         assert axis == {}, "another store's split must not steer this one"
@@ -2292,7 +2292,7 @@ class TestRecordedAxisIsReadBack:
         from hd.db import base
         from hd.pipeline.browse import coverage_memory
         await self._seed(browse_settings, [("N-aZ12kx", None, None, "complete", 2)])
-        _, recent, axis = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        _, recent, axis, _kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
         await base.close_db()
         assert recent == {"N-aZ12kx"} and axis == {}
 
@@ -2534,3 +2534,374 @@ class TestBrandTierScope:
         s = self._settings(tmp_path, daily_deals_brands="Milwaukee")
         assert s.daily_deals_brand_list == ["Milwaukee"]
         assert s.brand_list == ["Milwaukee", "DEWALT"]
+
+
+# ------------------------------------------------- recorded split stands in for facets
+class TestRecordedSplitStandsInForMissingFacets:
+    """A recorded axis this run's facets cannot build is rebuilt from the record.
+
+    Measured on the live install, run 70 (2026-09-06 04:03Z): the record said
+    "category" for MILWAUKEE/Tools/Hand Tools, HD served no Category dimension
+    on that read, the planner took price instead, and 20 price children the
+    freshness skip had never seen re-read a node whose 16 category children
+    had completed 3h52m earlier — 104 of the run's 135 requests for nothing.
+    """
+
+    PRICE = [price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 5))]
+    CATS = [cat_dim(("Small", "sm", 3), ("Tiny", "ty", 2))]
+    RECORD_CATS = {"N-5yc1vZzv": [("N-5yc1vZzvZsm", "M/Small", 3),
+                                  ("N-5yc1vZzvZty", "M/Tiny", 2)]}
+    RECORD_PRICE = {"N-5yc1vZzv": [("N-5yc1vZzvZ12kx", "M/$0 - $10", 6),
+                                   ("N-5yc1vZzvZ12ky", "M/$10 - $20", 5)]}
+
+    def test_a_recorded_category_split_is_rebuilt_when_the_dimension_is_absent(
+        self, browse_settings
+    ):
+        dims = parse_dimensions(make_page([], 10, dims=self.PRICE))
+        walks, need = plan_walks(
+            "N-5yc1vZzv", "M", 10, dims, browse_settings,
+            recent_axis={"N-5yc1vZzv": "category"},
+            recorded_children=self.RECORD_CATS,
+        )
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZsm", "N-5yc1vZzvZty"]
+        assert [w.label for w in walks] == ["M/Small", "M/Tiny"]
+        assert all(w.split_axis == "category" and w.split_parent == "N-5yc1vZzv"
+                   for w in walks)
+        assert need == [] and not any(w.truncated for w in walks)
+
+    def test_without_a_record_the_same_input_still_falls_back_to_price(
+        self, browse_settings
+    ):
+        dims = parse_dimensions(make_page([], 10, dims=self.PRICE))
+        walks, _ = plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                              recent_axis={"N-5yc1vZzv": "category"})
+        assert walks and all(w.split_axis == "price" for w in walks)
+
+    def test_a_recorded_price_split_is_rebuilt_when_price_cannot_partition(
+        self, browse_settings
+    ):
+        dims = parse_dimensions(make_page([], 10, dims=self.CATS))
+        walks, need = plan_walks(
+            "N-5yc1vZzv", "M", 10, dims, browse_settings,
+            recent_axis={"N-5yc1vZzv": "price"},
+            recorded_children=self.RECORD_PRICE,
+        )
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZ12kx", "N-5yc1vZzvZ12ky"]
+        assert all(w.split_axis == "price" for w in walks) and need == []
+
+    def test_the_facets_still_win_when_they_can_build_the_recorded_axis(
+        self, browse_settings
+    ):
+        """The record is a stand-in, never an override: with the dimension
+        present, the split comes from this run's facets as before."""
+        dims = parse_dimensions(make_page([], 10, dims=self.CATS + self.PRICE))
+        stale_record = {"N-5yc1vZzv": [("N-5yc1vZzvZgone", "M/Gone", 4)]}
+        walks, _ = plan_walks(
+            "N-5yc1vZzv", "M", 10, dims, browse_settings,
+            recent_axis={"N-5yc1vZzv": "category"}, recorded_children=stale_record,
+        )
+        assert [w.nav_param for w in walks] == ["N-5yc1vZzvZsm", "N-5yc1vZzvZty"]
+
+    def test_a_recorded_child_over_the_cap_is_rebuilt_as_the_truncated_walk_it_was(
+        self, browse_settings
+    ):
+        dims = parse_dimensions(make_page([], 20, dims=self.PRICE))
+        record = {"N-5yc1vZzv": [("N-5yc1vZzvZbig", "M/Big", 9),
+                                 ("N-5yc1vZzvZty", "M/Tiny", 2)]}
+        walks, _ = plan_walks(
+            "N-5yc1vZzv", "M", 20, dims, browse_settings,
+            recent_axis={"N-5yc1vZzv": "category"}, recorded_children=record,
+        )
+        assert [(w.nav_param, w.truncated) for w in walks] == [
+            ("N-5yc1vZzvZbig", True), ("N-5yc1vZzvZty", False)]
+
+    def test_an_observed_total_corrects_a_recorded_expected(self, browse_settings):
+        dims = parse_dimensions(make_page([], 20, dims=self.PRICE))
+        walks, _ = plan_walks(
+            "N-5yc1vZzv", "M", 20, dims, browse_settings,
+            recent_axis={"N-5yc1vZzv": "category"}, recorded_children=self.RECORD_CATS,
+            observed_totals={"N-5yc1vZzvZsm": 5},
+        )
+        assert walks[0].total == 5
+
+    def test_an_incomplete_record_is_refused_rather_than_rebuilt_short(
+        self, browse_settings
+    ):
+        """A recorded leaf two levels down means a direct child was split
+        further and has no row of its own. Rebuilding from that record would
+        drop the whole sub-tree silently; the re-read is the lesser harm."""
+        dims = parse_dimensions(make_page([], 10, dims=self.PRICE))
+        record = {"N-5yc1vZzv": [("N-5yc1vZzvZsmZ12kx", "M/Small/$0 - $10", 3),
+                                 ("N-5yc1vZzvZty", "M/Tiny", 2)]}
+        walks, _ = plan_walks(
+            "N-5yc1vZzv", "M", 10, dims, browse_settings,
+            recent_axis={"N-5yc1vZzv": "category"}, recorded_children=record,
+        )
+        assert walks and all(w.split_axis == "price" for w in walks)
+
+    def test_the_substitution_is_a_warning_not_a_silence(self, browse_settings):
+        from structlog.testing import capture_logs
+        dims = parse_dimensions(make_page([], 10, dims=self.PRICE))
+        with capture_logs() as logs:
+            plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                       recent_axis={"N-5yc1vZzv": "category"})
+        warnings = [e for e in logs if e["log_level"] == "warning"]
+        assert [e["event"] for e in warnings] == [
+            "Record axis unavailable this run — falling back to the other axis"]
+        assert warnings[0]["recorded_axis"] == "category" and warnings[0]["taking"] == "price"
+
+    def test_a_rebuilt_split_does_not_warn(self, browse_settings):
+        from structlog.testing import capture_logs
+        dims = parse_dimensions(make_page([], 10, dims=self.PRICE))
+        with capture_logs() as logs:
+            plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                       recent_axis={"N-5yc1vZzv": "category"},
+                       recorded_children=self.RECORD_CATS)
+        assert not [e for e in logs if e["log_level"] == "warning"]
+
+    @pytest.mark.parametrize("recorded", [None, "price", "category"])
+    def test_price_partition_is_still_evaluated_at_most_once(
+        self, browse_settings, monkeypatch, recorded
+    ):
+        from hd.pipeline import browse as mod
+        calls = []
+        real = mod.price_partition
+
+        def counting(refs, total, label=None):
+            calls.append(label)
+            return real(refs, total, label=label)
+
+        monkeypatch.setattr(mod, "price_partition", counting)
+        dims = parse_dimensions(make_page([], 10, dims=self.PRICE))
+        mod.plan_walks("N-5yc1vZzv", "M", 10, dims, browse_settings,
+                       recent_axis={"N-5yc1vZzv": recorded} if recorded else None,
+                       recorded_children=self.RECORD_PRICE if recorded == "price" else None)
+        assert len(calls) <= 1, f"price_partition called {len(calls)} times"
+
+    async def test_the_rebuilt_children_are_the_navparams_the_freshness_skip_knows(
+        self, browse_settings, fresh_db
+    ):
+        """End to end through run_browse: a category split on record, all of
+        its children fresh, the Category dimension gone from this run's
+        facets. Nothing is re-walked."""
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        from hd.pipeline.browse import _record_walk
+
+        await base.init_db(browse_settings)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(browse_settings) as session:
+            for nav, label in (("N-5yc1vZzvZbigZsm", "M/Big/Small"),
+                               ("N-5yc1vZzvZbigZty", "M/Big/Tiny")):
+                session.add(WalkCoverage(
+                    run_id=1, store_id="2619", tier="ALL", label=label,
+                    nav_param=nav, split_parent="N-5yc1vZzvZbig",
+                    split_axis="category", started=now - timedelta(hours=1),
+                    ended=now - timedelta(hours=1), status="complete",
+                    items_expected=3, items_observed=3))
+            await session.commit()
+
+        walked = []
+
+        def router(v):
+            nav, start = v["navParam"], v["startIndex"]
+            if nav == "N-5yc1vZzv":          # root: one over-cap category
+                return make_page([], 10, dims=[cat_dim(("Big", "big", 10))])
+            if nav == "N-5yc1vZzvZbig":      # facets: price only this run
+                return make_page([], 10, dims=[
+                    price_dim(("$0 - $10", "12kx", 6), ("$10 - $20", "12ky", 4))])
+            walked.append(nav)
+            return make_page([], 1)
+
+        summary = await run_browse(browse_settings, client=FakeClient(router),
+                                   tiers=("network",))
+        await base.close_db()
+        assert walked == [], "the recorded children were fresh; nothing to walk"
+        assert summary.walks == 0
+
+
+class TestRecordedChildrenAreReadBack:
+    """coverage_memory hands the planner the children of the recent split."""
+
+    async def _seed(self, s, rows):
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        await base.init_db(s)
+        now = datetime.now(timezone.utc)
+        async with base.get_session(s) as session:
+            for nav, parent, axis, status, ago in rows:
+                session.add(WalkCoverage(
+                    run_id=1, store_id="2619", tier="ALL", label=f"L/{nav}",
+                    nav_param=nav, split_parent=parent, split_axis=axis,
+                    started=now - timedelta(hours=ago), ended=now - timedelta(hours=ago),
+                    status=status, items_expected=10,
+                    items_observed=10 if status == "complete" else 1))
+            await session.commit()
+
+    async def test_every_child_of_the_recent_split_is_returned_truncated_included(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [
+            ("N-aZ12kx", "N-a", "price", "complete", 2),
+            ("N-aZ12ky", "N-a", "price", "truncated", 2),
+            ("N-aZc1", "N-a", "category", "complete", 30),   # the other, older axis
+        ])
+        _, _, axis, kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert axis == {"N-a": "price"}
+        assert kids == {"N-a": [("N-aZ12kx", "L/N-aZ12kx", 10),
+                                ("N-aZ12ky", "L/N-aZ12ky", 10)]}
+
+    async def test_a_lapsed_split_hands_back_no_children(self, browse_settings, fresh_db):
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [("N-aZ12kx", "N-a", "price", "complete", 40)])
+        _, _, axis, kids = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert axis == {} and kids == {}
+
+    async def test_a_truncated_walk_cannot_outrank_a_complete_split(
+        self, browse_settings, fresh_db
+    ):
+        """Run 65 re-walked one truncated price band and nothing else; on
+        `ended` alone that lone walk defined the recorded axis at runs 68 and
+        69. A walk that produced no coverage must not decide which split the
+        record holds."""
+        from hd.db import base
+        from hd.pipeline.browse import coverage_memory
+        await self._seed(browse_settings, [
+            ("N-aZc1", "N-a", "category", "complete", 3),
+            ("N-aZ12ky", "N-a", "price", "truncated", 1),    # newer, but no coverage
+        ])
+        _, _, axis, _ = await coverage_memory(browse_settings, "2619", "ALL", 20)
+        await base.close_db()
+        assert axis == {"N-a": "category"}
+
+
+class TestBrandScopesFailLoud:
+    """A brand scope naming a brand this install does not walk refuses to start."""
+
+    def _settings(self, tmp_path, **overrides) -> Settings:
+        base = dict(
+            _env_file=None,
+            database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+            stores="2619",
+            brands="Milwaukee,DEWALT",
+            brand_tokens="Milwaukee:zv,DEWALT:4j2",
+        )
+        base.update(overrides)
+        return Settings(**base)
+
+    def test_a_misspelled_network_only_brand_refuses_rather_than_shelf_walking(
+        self, tmp_path
+    ):
+        with pytest.raises(ValueError, match="NETWORK_ONLY_BRANDS.*DEWALTT"):
+            self._settings(tmp_path, network_only_brands="DEWALTT")
+
+    def test_a_misspelled_daily_deals_brand_refuses_rather_than_posting_nothing(
+        self, tmp_path
+    ):
+        with pytest.raises(ValueError, match="DAILY_DEALS_BRANDS.*MILWAKEE"):
+            self._settings(tmp_path, daily_deals_brands="Milwakee")
+
+    def test_case_is_not_a_misspelling(self, tmp_path):
+        s = self._settings(tmp_path, network_only_brands="dewalt",
+                           daily_deals_brands="MILWAUKEE")
+        assert s.network_only_brand_list == ["DEWALT"]
+
+    def test_a_brand_known_only_by_token_resolves(self, tmp_path):
+        s = self._settings(tmp_path, brands="Milwaukee", network_only_brands="DEWALT")
+        assert s.network_only_brand_list == ["DEWALT"]
+
+    def test_an_install_with_no_brands_yet_is_not_checked(self, tmp_path):
+        """`hd setup` constructs Settings before BRANDS is written."""
+        s = self._settings(tmp_path, brands="", brand_tokens="",
+                           network_only_brands="DEWALT")
+        assert s.network_only_brand_list == ["DEWALT"]
+
+
+class TestShelfHoldOutIsEnforcedByTheRun:
+    """The shelf exclusion, asserted on what the run walks, not on a list."""
+
+    def _two_brands(self, browse_settings):
+        browse_settings.brands = "Milwaukee,DEWALT"
+        browse_settings.brand_tokens = "Milwaukee:zv,DEWALT:4j2"
+        return browse_settings
+
+    async def test_a_network_only_brand_is_never_shelf_walked(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        from hd.db.models import WalkCoverage
+        s = self._two_brands(browse_settings)
+        s.network_only_brands = "DEWALT"
+        await base.init_db(s)
+
+        def router(v):
+            nav, start = v["navParam"], v["startIndex"]
+            assert "4j2" not in nav.split("Z"), f"DEWALT shelf-walked via {nav}"
+            return make_page([make_product("111")], 1) if start == 0 else make_page([], 1)
+
+        summary = await run_browse(s, client=FakeClient(router), tiers=("shelf",))
+        async with base.get_session(s) as session:
+            labels = [w.label for w in (await session.execute(select(WalkCoverage))).scalars()]
+        await base.close_db()
+        assert summary.walks == 1
+        assert labels and all(not lb.startswith("DEWALT") for lb in labels)
+
+    async def test_without_the_hold_out_both_brands_are_shelf_walked(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        s = self._two_brands(browse_settings)
+        await base.init_db(s)
+        seen = set()
+
+        def router(v):
+            nav, start = v["navParam"], v["startIndex"]
+            seen.add(nav)
+            return make_page([make_product("111")], 1) if start == 0 else make_page([], 1)
+
+        summary = await run_browse(s, client=FakeClient(router), tiers=("shelf",))
+        await base.close_db()
+        assert summary.walks == 2 and {"N-5yc1vZzv", "N-5yc1vZ4j2"} <= seen
+
+    async def test_a_shelf_run_rotates_its_own_brand_order_not_the_network_tiers(
+        self, browse_settings, fresh_db
+    ):
+        from hd import rotation
+        from hd.db import base
+        s = self._two_brands(browse_settings)
+        await base.init_db(s)
+
+        def router(v):
+            nav, start = v["navParam"], v["startIndex"]
+            return make_page([make_product("111")], 1) if start == 0 else make_page([], 1)
+
+        await run_browse(s, client=FakeClient(router), tiers=("shelf",))
+        await base.close_db()
+        cursors = rotation.load_cursors(s.browse_cursor_path)
+        assert cursors.get("shelf|2619|brand-order") == 1
+        assert "network|2619|brand-order" not in cursors
+
+    def test_the_cursor_key_is_per_tier(self):
+        from hd.pipeline.browse import brand_order_cursor_key
+        assert brand_order_cursor_key("2619") == "network|2619|brand-order"
+        assert brand_order_cursor_key("2619", "shelf") == "shelf|2619|brand-order"
+
+    async def test_an_all_network_only_config_warns_that_the_shelf_walks_nothing(
+        self, browse_settings, fresh_db
+    ):
+        from structlog.testing import capture_logs
+        from hd.db import base
+        s = browse_settings
+        s.network_only_brands = "Milwaukee"
+        await base.init_db(s)
+        with capture_logs() as logs:
+            summary = await run_browse(s, client=FakeClient(lambda v: make_page([], 0)),
+                                       tiers=("shelf",))
+        await base.close_db()
+        assert summary.walks == 0
+        assert any(e["event"].startswith("Shelf tier has no brand to walk") for e in logs)

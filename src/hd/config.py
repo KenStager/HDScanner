@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -441,6 +441,43 @@ class Settings(BaseSettings):
     def daily_deals_brand_list(self) -> list[str]:
         """Brands the daily-deals post is scoped to; `brand_list` unless set."""
         return _parse_csv(self.daily_deals_brands) or self.brand_list
+
+    @model_validator(mode="after")
+    def _brand_scopes_resolve(self) -> "Settings":
+        """A brand scope must name brands this install walks.
+
+        Both scopes are compared by upper-cased name against the walk set, so
+        a value that resolves to nothing is not an empty scope but a silent
+        one — and the two fail in opposite directions. `NETWORK_ONLY_BRANDS`
+        misspelled keeps the brand OUT of the hold-out, so it is shelf-walked
+        after all: a collection tier the operator withheld, taken without a
+        line in the log. `DAILY_DEALS_BRANDS` misspelled matches nothing, so
+        the post goes quiet with no error. Either is worse than refusing to
+        start. The venture's own config holds the mirror invariant —
+        PUBLISHED_BRANDS must be a subset of BRANDS — and this is its
+        collection-side twin.
+
+        `hd setup` constructs Settings before BRANDS is written, so an empty
+        walk set is not checked.
+        """
+        known = {b.upper() for b in self.brand_list} | {
+            b.upper() for b, _ in self.brand_token_list
+        }
+        if not known:
+            return self
+        for field, values in (
+            ("NETWORK_ONLY_BRANDS", self.network_only_brand_list),
+            ("DAILY_DEALS_BRANDS",
+             [b.upper() for b in _parse_csv(self.daily_deals_brands)]),
+        ):
+            unknown = sorted(set(values) - known)
+            if unknown:
+                raise ValueError(
+                    f"{field} names {unknown}, which is not in BRANDS/BRAND_TOKENS "
+                    f"{sorted(known)} — a brand scope that resolves to nothing "
+                    f"silently widens a tier or empties a surface"
+                )
+        return self
 
     @property
     def brand_token_list(self) -> list[tuple[str, str]]:
