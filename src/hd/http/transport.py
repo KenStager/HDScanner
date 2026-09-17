@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -68,11 +69,24 @@ class CurlTransport:
     Response headers are dumped to stderr and parsed, which the previous
     implementation did not do — it captured only the status code, so
     Retry-After was invisible and every wait was guesswork.
+
+    `extra_args` are appended to the curl command as given, for the ordinary
+    client-side connection settings any HTTP client exposes — an interface or
+    source address to bind (`--interface`), an outbound proxy (`--proxy`), a
+    pinned resolution (`--resolve`). They are placed before the request body
+    and headers so nothing here can be re-read as a URL or a header, and they
+    never appear in an error message: a value may carry credentials.
     """
 
-    def __init__(self, timeout_seconds: float = 30.0, max_bytes: int = 10 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        timeout_seconds: float = 30.0,
+        max_bytes: int = 10 * 1024 * 1024,
+        extra_args: Sequence[str] = (),
+    ) -> None:
         self._timeout = timeout_seconds
         self._max_bytes = max_bytes
+        self._extra_args = tuple(extra_args)
 
     async def post_json(
         self, url: str, payload: dict[str, Any], headers: dict[str, str]
@@ -86,6 +100,7 @@ class CurlTransport:
             "--compressed",
             "--max-filesize", str(self._max_bytes),
             "--max-time", str(int(self._timeout)),
+            *self._extra_args,
             "-d", json.dumps(payload),
         ]
         for name, value in headers.items():

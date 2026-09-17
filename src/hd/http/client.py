@@ -89,6 +89,25 @@ def build_headers(settings: Settings) -> dict[str, str]:
     return _apply_header_override(headers, settings)
 
 
+def _local_transport(settings: Settings) -> Transport | None:
+    """A transport supplied by an optional local module, or None for the default.
+
+    Third guarded seam, same convention as the two above: a stock clone has no
+    such module and sends every request through CurlTransport exactly as
+    before. Whatever attaches here must honour the Transport protocol — the
+    client's pacing, budget, and refusal handling all sit above it unchanged.
+    Never raises into client construction.
+    """
+    try:
+        from hd.plugins.transport import build_transport
+    except Exception:
+        return None
+    try:
+        return build_transport(settings)
+    except Exception:
+        return None
+
+
 def _apply_header_override(
     headers: dict[str, str], settings: Settings
 ) -> dict[str, str]:
@@ -235,9 +254,13 @@ class HDClient:
         transport: Transport | None = None,
     ) -> None:
         self._settings = settings
-        self._transport = transport or CurlTransport(
-            timeout_seconds=getattr(settings, "read_timeout_seconds", 30.0),
-            max_bytes=getattr(settings, "max_response_bytes", 10 * 1024 * 1024),
+        self._transport = (
+            transport
+            or _local_transport(settings)
+            or CurlTransport(
+                timeout_seconds=getattr(settings, "read_timeout_seconds", 30.0),
+                max_bytes=getattr(settings, "max_response_bytes", 10 * 1024 * 1024),
+            )
         )
         self._rate_limiter = TokenBucketRateLimiter(
             rps=settings.rate_limit_rps,

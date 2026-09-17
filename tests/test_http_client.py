@@ -99,6 +99,74 @@ def make_client(responses, settings=None, **kwargs):
     return c
 
 
+def _install_local_transport_module(monkeypatch, build_transport):
+    """Stand in for an optional local `hd.plugins.transport` module.
+
+    The parent package is stubbed too, so the test is the same whether or not a
+    local package happens to be present on this checkout.
+    """
+    import sys
+    import types
+
+    pkg = types.ModuleType("hd.plugins")
+    pkg.__path__ = []
+    mod = types.ModuleType("hd.plugins.transport")
+    mod.build_transport = build_transport
+    monkeypatch.setitem(sys.modules, "hd.plugins", pkg)
+    monkeypatch.setitem(sys.modules, "hd.plugins.transport", mod)
+
+
+@pytest.mark.asyncio
+async def test_a_local_transport_module_supplies_the_transport(monkeypatch):
+    local = FakeTransport([resp(200, json=OK_BODY)])
+    _install_local_transport_module(monkeypatch, lambda settings: local)
+
+    c = HDClient(make_settings())
+    c._query_cache = "query searchModel { x }"
+    raw = await c.post_graphql({"navParam": "N-1"})
+    await c.close()
+
+    assert is_valid_search_response(raw)
+    assert local.requests[0]["payload"]["variables"] == {"navParam": "N-1"}
+    assert local.closed is True
+
+
+def test_an_explicit_transport_wins_over_the_local_module(monkeypatch):
+    _install_local_transport_module(monkeypatch, lambda settings: FakeTransport([]))
+    explicit = FakeTransport([])
+    c = HDClient(make_settings(), transport=explicit)
+    assert c._transport is explicit
+
+
+def test_a_local_module_returning_none_means_the_default_transport(monkeypatch):
+    from hd.http.transport import CurlTransport
+
+    _install_local_transport_module(monkeypatch, lambda settings: None)
+    c = HDClient(make_settings())
+    assert isinstance(c._transport, CurlTransport)
+
+
+def test_a_broken_local_module_never_reaches_client_construction(monkeypatch):
+    from hd.http.transport import CurlTransport
+
+    def explode(settings):
+        raise RuntimeError("misconfigured")
+
+    _install_local_transport_module(monkeypatch, explode)
+    c = HDClient(make_settings())
+    assert isinstance(c._transport, CurlTransport)
+
+
+def test_no_local_module_means_the_default_transport(monkeypatch):
+    import sys
+
+    from hd.http.transport import CurlTransport
+
+    monkeypatch.setitem(sys.modules, "hd.plugins.transport", None)  # import fails
+    c = HDClient(make_settings())
+    assert isinstance(c._transport, CurlTransport)
+
+
 # --- identity ---------------------------------------------------------------
 
 def test_user_agent_names_the_scanner_not_a_browser():
