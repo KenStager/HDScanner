@@ -222,6 +222,92 @@ class TestBopisOosFallback:
         assert s.inventory_qty == 12
 
 
+def _response(pricing, services):
+    """One product in a searchModel response, with the given store services.
+
+    `services` maps a service type to the inventory dict reported at store
+    2619, which is the only location these tests build.
+    """
+    return {"data": {"searchModel": {"products": [{
+        "itemId": "100",
+        "identifiers": {"productLabel": "Test item"},
+        "pricing": pricing,
+        "fulfillment": {"fulfillmentOptions": [{"services": [
+            {"type": t, "locations": [
+                {"locationId": "2619", "isAnchor": True, "inventory": inv},
+            ]}
+            for t, inv in services.items()
+        ]}]},
+    }]}}}
+
+
+IN_STOCK_5 = {"isOutOfStock": False, "isInStock": True, "quantity": 5}
+ON_CLEARANCE = {"value": 40.00, "original": 100.00,
+                "clearance": {"value": 40.00, "dollarOff": 60.00, "percentageOff": 60}}
+NO_CLEARANCE = {"value": 100.00, "original": 100.00}
+
+
+class TestClearanceWithoutBopis:
+    """Home Depot delists clearance from BOPIS, so absent BOPIS is not absent stock.
+
+    Measured over the saved store-2619 captures: 97 of 112 clearance items
+    carry no BOPIS entry, and 71 of those report express-delivery stock at the
+    store's own locationId. Reading those as out of stock understated the
+    floor by roughly six times.
+    """
+
+    def test_clearance_without_bopis_reads_express_as_presence(self):
+        snapshots = parse_snapshots(
+            _response(ON_CLEARANCE, {"express delivery": IN_STOCK_5}), "2619")
+        s = snapshots[0]
+        assert s.in_stock is True
+        assert s.inventory_qty == 5
+        assert s.out_of_stock is False
+
+    def test_non_clearance_without_bopis_stays_out_of_stock(self):
+        """The narrow scope of the exception: only clearance earns it."""
+        snapshots = parse_snapshots(
+            _response(NO_CLEARANCE, {"express delivery": IN_STOCK_5}), "2619")
+        s = snapshots[0]
+        assert s.in_stock is False
+        assert s.out_of_stock is True
+        assert s.inventory_qty is None
+
+    def test_clearance_without_bopis_or_express_is_still_out_of_stock(self):
+        """No express entry means no evidence of presence — 26 of the 112."""
+        snapshots = parse_snapshots(
+            _response(ON_CLEARANCE, {"boss": IN_STOCK_5}), "2619")
+        s = snapshots[0]
+        assert s.in_stock is False
+        assert s.out_of_stock is True
+
+    def test_clearance_with_express_out_of_stock_is_not_presence(self):
+        """An express entry reporting OOS is not turned into stock."""
+        snapshots = parse_snapshots(
+            _response(ON_CLEARANCE, {"express delivery": {
+                "isOutOfStock": True, "isInStock": False, "quantity": 0}}), "2619")
+        s = snapshots[0]
+        assert s.in_stock is False
+        assert s.out_of_stock is True
+
+    def test_clearance_still_prefers_bopis_when_present(self):
+        """The 15 clearance items that keep BOPIS are unaffected by the exception."""
+        snapshots = parse_snapshots(
+            _response(ON_CLEARANCE, {
+                "bopis": {"isOutOfStock": False, "isInStock": True, "quantity": 2},
+                "express delivery": IN_STOCK_5}), "2619")
+        s = snapshots[0]
+        assert s.inventory_qty == 2
+
+    def test_clearance_express_not_counted_at_another_store(self):
+        """Presence is per-store: store 8452 sees no location of its own here."""
+        snapshots = parse_snapshots(
+            _response(ON_CLEARANCE, {"express delivery": IN_STOCK_5}), "8452")
+        s = snapshots[0]
+        assert s.inventory_qty is None
+        assert s.in_stock is None
+
+
 class TestMatchesProductLine:
     def test_matches_m18_in_title(self):
         p = NormalizedProduct(item_id="1", title="Milwaukee M18 FUEL Impact", model_number="2767-20")
