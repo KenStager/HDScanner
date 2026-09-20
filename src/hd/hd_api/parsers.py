@@ -152,32 +152,6 @@ def _extract_inventory(item: dict, store_id: str) -> dict | None:
             return candidates["express delivery"]
         return bopis_inv
 
-    # CLEARANCE IS THE EXCEPTION TO THE NO-BOPIS RULE, AND IT IS THE COMMON CASE.
-    #
-    # Home Depot delists a clearance item from BOPIS — it cannot be bought
-    # online for pickup — so the rule below ("no BOPIS = not on this store's
-    # shelves") reads every clearance item as out of stock. That inverts the
-    # truth: the item is delisted BECAUSE it is being cleared off this store's
-    # floor. Express delivery dispatches from this store's own locationId, so
-    # a quantity there is physical presence at this store, not a delivery
-    # promise from somewhere else.
-    #
-    # Measured over the saved store-2619 captures: 112 distinct clearance
-    # items, 97 of them carrying no BOPIS entry at all, and 71 of those
-    # reporting express-delivery stock at locationId 2619 (786 units, median
-    # 5, max 202) that the conservative branch below was zeroing. The parser
-    # could see at most ~15 of 112 as in stock; the floor held ~86.
-    #
-    # Deliberately narrow: this applies only to items carrying a clearance
-    # price. For everything else the conservative reading stands, because
-    # express delivery without BOPIS genuinely can be a delivery-only signal
-    # and that case has not been measured.
-    clearance = (item.get("pricing") or {}).get("clearance") or {}
-    if clearance.get("value") is not None:
-        express = candidates.get("express delivery")
-        if express and not express.get("isOutOfStock"):
-            return express
-
     # No BOPIS = item not assorted to this store's shelves.
     # Express delivery / BOSS without BOPIS are delivery-only — not on-shelf stock.
     # Mark as OOS to avoid false "in stock" signals.
