@@ -129,11 +129,12 @@ def brand_order_for_run(
     store_id: str,
     tier: str = "network",
 ) -> list[tuple[str, str]]:
-    """`brand_tokens` rotated so a different brand leads each run.
+    """`brand_tokens` rotated so a different brand leads this run.
 
-    Advances the cursor as a side effect, so consecutive runs start at
-    consecutive brands and the brand that went last this run goes first next
-    run. With one brand this is the identity and costs nothing.
+    READ-ONLY. The cursor moves in `advance_brand_order`, called once the
+    leading brand has actually had its turn — the same advance-on-progress
+    rule the category cursor below already follows, and for the same reason.
+    With one brand this is the identity and costs nothing.
 
     Deliberately keyed per store and per tier: stores are walked in their own
     loop and each one exhausts the shared budget independently, and each tier
@@ -143,8 +144,42 @@ def brand_order_for_run(
         return list(brand_tokens)
     key = brand_order_cursor_key(store_id, tier)
     offset = cursors.get(key, 0) % len(brand_tokens)
-    cursors[key] = (offset + 1) % len(brand_tokens)
     return list(brand_tokens[offset:]) + list(brand_tokens[:offset])
+
+
+def advance_brand_order(
+    cursors: dict[str, int],
+    store_id: str,
+    brand_count: int,
+    tier: str = "network",
+) -> None:
+    """Hand the lead to the next brand — but only once this one has had it.
+
+    Rotation used to advance the moment the order was READ, which spends a
+    brand's turn on a run that walks nothing. A run throttled at its first
+    request, or an extra run outside the schedule, consumed a turn all the
+    same — and because rotation is modular, a single spurious step INVERTS the
+    parity of every run after it. With two brands that is not a small
+    unfairness: it is one brand leading four runs out of five while the other
+    leads none, and the trailing brand only ever gets the budget the leader
+    leaves behind.
+
+    It bites hardest where the brands are unequal in size. A brand whose whole
+    category set fits inside one run's budget is complete whenever it leads and
+    nearly invisible whenever it does not, so the rotation decides its coverage
+    rather than the budget does. Measured over two weeks on a two-brand install,
+    the smaller brand's daily coverage of its own category set was bimodal on
+    exactly this axis: leading twice a day covered 21-25 of its 26 nodes,
+    leading once covered 18-24, leading not at all covered 13-15.
+
+    So the caller advances only after the leading brand has made progress —
+    walked something, or moved its own category cursor. Anything else leaves
+    the lead where it is, and the brand that was owed a turn gets it next run.
+    """
+    if brand_count < 2:
+        return
+    key = brand_order_cursor_key(store_id, tier)
+    cursors[key] = (cursors.get(key, 0) + 1) % brand_count
 
 
 def build_nav(root: str, *tokens: str) -> str:
@@ -1594,6 +1629,10 @@ async def run_browse(
                         network_only=settings.network_only_brand_list,
                     )
                 order = brand_order_for_run(shelf_tokens, cursors, store_id, tier="shelf")
+                # Same advance-on-progress rule as the network tier.
+                shelf_lead_key = f"shelf|{store_id}|{order[0][1]}" if order else ""
+                shelf_lead_cursor_before = cursors.get(shelf_lead_key)
+                shelf_walks_before_lead = summary.walks
                 for brand, token in order:
                     if client.is_throttled:
                         summary.aborted = True
@@ -1736,6 +1775,13 @@ async def run_browse(
                         if walk.truncated:
                             summary.truncated_walks.append(walk.label)
                         await _pause(settings)
+                if order and (
+                    summary.walks > shelf_walks_before_lead
+                    or cursors.get(shelf_lead_key) != shelf_lead_cursor_before
+                ):
+                    advance_brand_order(
+                        cursors, store_id, len(shelf_tokens), tier="shelf"
+                    )
                 log.info(
                     "Shelf tier complete",
                     store_id=store_id,
@@ -1767,6 +1813,14 @@ async def run_browse(
                 #
                 # Invisible with one brand configured, guaranteed with two.
                 order = brand_order_for_run(brand_tokens, cursors, store_id)
+                # The lead is handed on only if this brand actually gets its
+                # turn; see advance_brand_order. Progress is either a walk or a
+                # step of the brand's own category cursor — the second covers
+                # the case where every category was already fresh, which is a
+                # real turn taken and must not re-lead forever.
+                lead_key = f"network|{store_id}|{order[0][1]}" if order else ""
+                lead_cursor_before = cursors.get(lead_key)
+                walks_before_lead = summary.walks
                 for brand, token in order:
                     if client.is_throttled:
                         summary.aborted = True
@@ -1918,6 +1972,11 @@ async def run_browse(
                             break
                         completed += 1
                     cursors[key] = (start + completed) % len(categories)
+                if order and (
+                    summary.walks > walks_before_lead
+                    or cursors.get(lead_key) != lead_cursor_before
+                ):
+                    advance_brand_order(cursors, store_id, len(brand_tokens))
     except CircuitOpenError as e:
         # Reached run_browse uncaught before this, killing the process mid-run:
         # no cursor save, no cooldown written, no summary. Now it stops the run

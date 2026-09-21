@@ -1390,6 +1390,72 @@ class TestCoverageRecords:
         assert len(runs) == 1 and runs[0].status == "aborted"
         assert walks == []  # nothing attempted, nothing claimed
 
+    async def test_a_throttled_run_does_not_spend_a_brands_turn(
+        self, browse_settings, fresh_db, tmp_path
+    ):
+        """End to end: walling at request one must leave the lead where it is.
+
+        The rotation cursor used to move when the order was merely READ, so a
+        run that walked nothing still handed the lead on. With two brands that
+        inverts the parity of every later run, and the brand that was owed the
+        lead can go a whole day without it.
+        """
+        from hd.db import base
+        from hd import rotation
+        from hd.pipeline.browse import brand_order_cursor_key
+
+        settings = browse_settings.model_copy(
+            update={
+                "brands": "Milwaukee,DEWALT",
+                "brand_tokens": "Milwaukee:zv,DEWALT:4j2",
+            }
+        )
+        await base.init_db(settings)
+
+        class ThrottledClient(FakeClient):
+            @property
+            def is_throttled(self):
+                return True
+
+        await run_browse(settings, client=ThrottledClient(full_router()))
+
+        cursors = rotation.load_cursors(settings.browse_cursor_path)
+        assert cursors.get(brand_order_cursor_key("2619"), 0) == 0
+        assert cursors.get(brand_order_cursor_key("2619", "shelf"), 0) == 0
+
+    async def test_a_run_that_walks_hands_the_lead_on(
+        self, browse_settings, fresh_db
+    ):
+        """The counterpart: a run that does real work must still rotate."""
+        from hd.db import base
+        from hd import rotation
+        from hd.pipeline.browse import brand_order_cursor_key
+
+        settings = browse_settings.model_copy(
+            update={
+                "brands": "Milwaukee,DEWALT",
+                "brand_tokens": "Milwaukee:zv,DEWALT:4j2",
+            }
+        )
+        await base.init_db(settings)
+
+        base_router = full_router()
+
+        def router(v):
+            # The second brand has no fixtures; an empty page is a legitimate
+            # answer and keeps this test about the cursor, not the catalogue.
+            try:
+                return base_router(v)
+            except KeyError:
+                return make_page([], 0)
+
+        summary = await run_browse(settings, client=FakeClient(router))
+        assert summary.walks > 0
+
+        cursors = rotation.load_cursors(settings.browse_cursor_path)
+        assert cursors.get(brand_order_cursor_key("2619")) == 1
+        assert cursors.get(brand_order_cursor_key("2619", "shelf")) == 1
+
 
 class TestWalkAdmission:
     """Budget-aware admission: never start a walk the run cannot finish.
@@ -2033,54 +2099,107 @@ class TestCrossBrandFairness:
     reaches each maturity level later purely by position in a CSV.
     """
 
-    def test_the_leading_brand_advances_each_run(self):
-        from hd.pipeline.browse import brand_order_for_run
+    def test_the_leading_brand_advances_each_run_that_makes_progress(self):
+        from hd.pipeline.browse import advance_brand_order, brand_order_for_run
 
         brands = [("Milwaukee", "zv"), ("DEWALT", "4j2"), ("RYOBI", "r1")]
         cursors: dict[str, int] = {}
-        leaders = [
-            brand_order_for_run(brands, cursors, "2619")[0][0] for _ in range(4)
-        ]
+        leaders = []
+        for _ in range(4):
+            leaders.append(brand_order_for_run(brands, cursors, "2619")[0][0])
+            advance_brand_order(cursors, "2619", len(brands))
         assert leaders == ["Milwaukee", "DEWALT", "RYOBI", "Milwaukee"]
+
+    def test_reading_the_order_does_not_move_the_cursor(self):
+        """Reading is free; only a turn actually taken costs one.
+
+        The advance used to happen on READ, so a run that walked nothing still
+        spent a brand's turn.
+        """
+        from hd.pipeline.browse import brand_order_for_run
+
+        brands = [("Milwaukee", "zv"), ("DEWALT", "4j2")]
+        cursors: dict[str, int] = {}
+        for _ in range(3):
+            assert brand_order_for_run(brands, cursors, "2619")[0][0] == "Milwaukee"
+        assert cursors == {}
+
+    def test_a_run_that_walks_nothing_does_not_spend_a_turn(self):
+        """Throttled at request one, so the brand that was owed the lead keeps it.
+
+        With two brands a single spurious step inverts the parity of every run
+        after it, which is how one brand came to lead four runs out of five.
+        """
+        from hd.pipeline.browse import advance_brand_order, brand_order_for_run
+
+        brands = [("Milwaukee", "zv"), ("DEWALT", "4j2")]
+        cursors: dict[str, int] = {}
+        assert brand_order_for_run(brands, cursors, "2619")[0][0] == "Milwaukee"
+        advance_brand_order(cursors, "2619", len(brands))  # it walked; hand on
+        assert brand_order_for_run(brands, cursors, "2619")[0][0] == "DEWALT"
+        # This run walls before walking anything, so no advance happens.
+        assert brand_order_for_run(brands, cursors, "2619")[0][0] == "DEWALT"
+        advance_brand_order(cursors, "2619", len(brands))
+        assert brand_order_for_run(brands, cursors, "2619")[0][0] == "Milwaukee"
 
     def test_rotation_is_a_rotation_not_a_reshuffle(self):
         """Every brand appears exactly once, order preserved cyclically — the
         per-brand resume cursors depend on it."""
-        from hd.pipeline.browse import brand_order_for_run
+        from hd.pipeline.browse import advance_brand_order, brand_order_for_run
 
         brands = [("A", "1"), ("B", "2"), ("C", "3")]
         cursors: dict[str, int] = {}
         for _ in range(3):
             order = brand_order_for_run(brands, cursors, "2619")
             assert sorted(order) == sorted(brands)
+            advance_brand_order(cursors, "2619", len(brands))
         assert brand_order_for_run(brands, cursors, "2619") == brands
 
     def test_one_brand_is_the_identity_and_burns_no_cursor(self):
-        from hd.pipeline.browse import brand_order_for_run
+        from hd.pipeline.browse import advance_brand_order, brand_order_for_run
 
         brands = [("Milwaukee", "zv")]
         cursors: dict[str, int] = {}
         assert brand_order_for_run(brands, cursors, "2619") == brands
+        advance_brand_order(cursors, "2619", len(brands))
         assert cursors == {}
 
     def test_stores_rotate_independently(self):
         """Each store exhausts the shared budget in its own loop, so one
         store's rotation must not advance another's."""
-        from hd.pipeline.browse import brand_order_for_run
+        from hd.pipeline.browse import advance_brand_order, brand_order_for_run
 
         brands = [("A", "1"), ("B", "2")]
         cursors: dict[str, int] = {}
-        brand_order_for_run(brands, cursors, "2619")
-        brand_order_for_run(brands, cursors, "2619")
+        advance_brand_order(cursors, "2619", len(brands))
+        advance_brand_order(cursors, "2619", len(brands))
         assert brand_order_for_run(brands, cursors, "8452")[0][0] == "A"
 
+    def test_tiers_rotate_independently(self):
+        """A shelf-only run must not spend the network tier's turn."""
+        from hd.pipeline.browse import advance_brand_order, brand_order_for_run
+
+        brands = [("A", "1"), ("B", "2")]
+        cursors: dict[str, int] = {}
+        advance_brand_order(cursors, "2619", len(brands), tier="shelf")
+        assert brand_order_for_run(brands, cursors, "2619")[0][0] == "A"
+        assert brand_order_for_run(
+            brands, cursors, "2619", tier="shelf"
+        )[0][0] == "B"
+
     def test_a_corrupt_cursor_cannot_break_the_walk(self):
-        from hd.pipeline.browse import brand_order_for_run, brand_order_cursor_key
+        from hd.pipeline.browse import (
+            advance_brand_order,
+            brand_order_cursor_key,
+            brand_order_for_run,
+        )
 
         brands = [("A", "1"), ("B", "2")]
         cursors = {brand_order_cursor_key("2619"): 9999}
         order = brand_order_for_run(brands, cursors, "2619")
         assert sorted(order) == sorted(brands)
+        advance_brand_order(cursors, "2619", len(brands))
+        assert cursors[brand_order_cursor_key("2619")] < len(brands)
 
 
 class TestRecordedSplitAxis:
