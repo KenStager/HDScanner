@@ -161,8 +161,8 @@ class TestContextChip:
     def test_caption_carries_the_low_as_a_subordinate_clause(self):
         from hd.dashboard.components.cards import verdict_facts
         cap = verdict_facts(self._ctx(), CAP)["caption"]
-        assert cap.startswith("My price record backs the 30% off")
-        assert "It has sold lower in my record — $100.00 on May 10." in cap
+        assert cap.startswith("The record backs the 30% off")
+        assert "Offered lower before in the record — $100.00 on May 10." in cap
 
     def test_never_beside_lowest_recorded(self):
         """price>low and price<=low cannot both hold; the chip slots are
@@ -322,10 +322,10 @@ class TestRecentContext:
     def test_caption_leads_with_today_and_keeps_the_long_story(self):
         from hd.dashboard.components.cards import verdict_facts
         cap = verdict_facts(self._stale(), CAP)["caption"]
-        assert cap.startswith("Down 11% from the $279.00 I've tracked "
-                              "over the last 8d")
-        assert "my lowest recorded in 3mo+ of tracking" in cap
-        assert "I've seen it as high as $429.00" in cap
+        assert cap.startswith("Down 11% from the $279.00 tracked "
+                              "over the last 8 days")
+        assert "the lowest recorded in 3+ months of tracking" in cap
+        assert "The record has it as high as $429.00" in cap
 
     def test_the_flash_follows_the_leading_number(self):
         assert flash(**self._stale()) == "−11%"
@@ -396,9 +396,9 @@ class TestStaleOnlyAnchor:
     def test_caption_is_dated_and_unchanged_honest(self):
         from hd.dashboard.components.cards import verdict_facts
         cap = verdict_facts(self._stale0(), CAP)["caption"]
-        assert cap.startswith("My lowest recorded price since May 1")
-        assert "33% under the $369.00 I've seen in 3mo+ of tracking" in cap
-        assert "unchanged over the last 8d" in cap
+        assert cap.startswith("The lowest recorded price since May 1")
+        assert "33% under the $369.00 in the record over 3+ months of tracking" in cap
+        assert "unchanged over the last 8 days" in cap
 
     def test_ranks_at_the_bottom(self):
         from hd.dashboard.components.cards import headline_pct

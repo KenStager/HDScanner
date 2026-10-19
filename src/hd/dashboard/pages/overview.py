@@ -182,7 +182,19 @@ async def overview_page() -> None:
                     _render_deal(d, is_online, _dismiss, store_key,
                                  hidden=True, restore=_restore)
 
-    await content()
+    # The board's four queries take several seconds on a year of snapshots,
+    # and NiceGUI cancels a page still building after response_timeout (3 s)
+    # and deletes its client — the browser then shows nothing at all. So the
+    # page returns at once with its header, and the board is built after the
+    # client connects (a timer does not fire before then). The first timer
+    # loads the board once; the second keeps it current.
+    placeholder = ui.label("Loading the deal board…").classes("px-6 mt-4 text-grey")
+
+    async def _first_load() -> None:
+        placeholder.delete()
+        await content()
+
+    ui.timer(0, _first_load, once=True)
     ui.timer(settings.dashboard_refresh_seconds, content.refresh)
 
 

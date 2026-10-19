@@ -8,6 +8,7 @@ is rendered.
 from __future__ import annotations
 
 import html as _html
+import re
 
 from hd.dashboard.components.formatters import fmt_history_span, fmt_low_date
 
@@ -49,6 +50,19 @@ def headline_pct(d: dict) -> int:
     if mode == "stale":
         return 0
     return int(d.get("evidence_pct") or 0)
+
+
+def _prose_span(token: str) -> str:
+    """A chip's span token, spelled for a sentence: "19d" → "19 days",
+    "3mo+" → "3+ months". Chips keep the token; prose never abbreviates."""
+    m = re.fullmatch(r"(\d+)d", token)
+    if m:
+        n = int(m.group(1))
+        return f"{n} day{'' if n == 1 else 's'}"
+    m = re.fullmatch(r"(\d+)mo\+", token)
+    if m:
+        return f"{m.group(1)}+ months"
+    return token
 
 
 def verdict_facts(d: dict, cap_days: int) -> dict:
@@ -176,38 +190,48 @@ def verdict_facts(d: dict, cap_days: int) -> dict:
         if long_context:
             chips.append(long_context)
         if stale_only:
-            tail = (f"{witnessed}% under the ${our_high:,.2f} I've seen in "
-                    f"{watched} of tracking, unchanged over the last {span}.")
+            tail = (f"{witnessed}% under the ${our_high:,.2f} in the record "
+                    f"over {_prose_span(watched)} of tracking, unchanged over "
+                    f"the last {_prose_span(span)}.")
             if at_lowest:
                 when_low = fmt_low_date(d.get("low_ts"))
-                caption = (f"My lowest recorded price"
+                caption = (f"The lowest recorded price"
                            f"{' since ' + when_low if when_low else ''} — "
                            + tail)
             else:
                 caption = tail[0].upper() + tail[1:]
         elif divergent:
             hw = float(d["high_window"])
-            caption = (f"Down {display_pct}% from the ${hw:,.2f} I've tracked "
-                       f"over the last {span}")
+            caption = (f"Down {display_pct}% from the ${hw:,.2f} tracked "
+                       f"over the last {_prose_span(span)}")
             if at_lowest:
-                caption += (f" — my lowest recorded in {watched} of tracking. "
-                            f"I've seen it as high as ${our_high:,.2f} in "
-                            f"that time.")
+                caption += (f" — the lowest recorded in {_prose_span(watched)} "
+                            f"of tracking. The record has it as high as "
+                            f"${our_high:,.2f} in that time.")
             else:
-                caption += (f". I've seen it as high as ${our_high:,.2f} in "
-                            f"{watched} of tracking.")
+                caption += (f". The record has it as high as ${our_high:,.2f} "
+                            f"in {_prose_span(watched)} of tracking.")
         elif true_pct >= witnessed:
-            caption = (f"My price record backs the {evidence}% off — down from "
-                       f"what I tracked over {span}.")
+            caption = (f"The record backs the {evidence}% off — down from the "
+                       f"price tracked over {_prose_span(span)}.")
         elif at_lowest:
-            caption = (f"Real {evidence}% off — the lowest price I've recorded "
-                       f"in {watched} of tracking.")
+            caption = (f"A real {evidence}% off — the lowest price in the "
+                       f"record over {_prose_span(watched)} of tracking.")
         else:
-            caption = f"My record supports about {evidence}% off."
+            caption = f"The record supports about {evidence}% off."
         if sold_lower:
             when = fmt_low_date(d.get("low_ts"))
-            caption += (f" It has sold lower in my record — ${low:,.2f}"
+            caption += (f" Offered lower before in the record — ${low:,.2f}"
                         f"{' on ' + when if when else ''}.")
+        # The retailer's reference price, when the record has never seen a
+        # price that high and the claim materially outruns the measurement:
+        # the same sentence the unverified branch already uses, so a
+        # verified card never hides the disagreement its chip shows.
+        if (original is not None and our_high is not None
+                and original > our_high and claimed
+                and claimed - display_pct > 5 and not stale_only):
+            caption += (f" HD claims {claimed}% off ${original:,.2f}, a price "
+                        f"the record has never seen.")
         # HD's number gets a chip when it materially disagrees with the
         # number the card leads with — on a divergent card that gap is the
         # story: the claim was real once, the recent price says today. A
@@ -234,15 +258,15 @@ def verdict_facts(d: dict, cap_days: int) -> dict:
                 (f"seen ${low:,.2f}{' · ' + when if when else ''}", "above"))
         claim = f"HD claims {claimed}% off" if claimed else "Listed as a deal"
         seen = f"${low:,.2f}" if low is not None else "less"
-        caption = (f"{claim}, but my tracker saw it selling for {seen}"
+        caption = (f"{claim}, but the record has it offered at {seen}"
                    f"{' on ' + when if when else ''}.")
         return {"flash": flash, "struck": struck, "chips": chips, "caption": caption}
 
     if tier == "hollow":
         if d.get("high_window") is not None:
             chips.append((f"flat {span} price", "flat"))
-        caption = (f"HD claims {claimed}% off, but the price hasn't moved in "
-                   f"{watched} of my watching.")
+        caption = (f"HD claims {claimed}% off, but the price has not moved in "
+                   f"{_prose_span(watched)} of watching.")
         return {"flash": flash, "struck": struck, "chips": chips, "caption": caption}
 
     # ---- unverified ----
@@ -261,27 +285,28 @@ def verdict_facts(d: dict, cap_days: int) -> dict:
         if claimed and abs(claimed - display_pct) > 5:
             chips.append((f"HD claims {claimed}%", ""))
         if divergent:
-            caption = (f"Down to my lowest recorded ${price:,.2f} — "
+            caption = (f"Down to the lowest recorded, ${price:,.2f} — "
                        f"{display_pct}% under the "
-                       f"${float(d['high_window']):,.2f} I've tracked over "
-                       f"the last {span}. I've seen it as high as "
-                       f"${our_high:,.2f}.")
+                       f"${float(d['high_window']):,.2f} tracked over "
+                       f"the last {_prose_span(span)}. The record has it as "
+                       f"high as ${our_high:,.2f}.")
         elif inflated and claimed - evidence > 5:
-            caption = (f"Down to my lowest recorded ${price:,.2f} — about "
-                       f"{evidence}% under the ${our_high:,.2f} I've tracked. "
-                       f"HD claims {claimed}% off ${original:,.2f}, a price I've "
-                       f"never recorded.")
+            caption = (f"Down to the lowest recorded, ${price:,.2f} — about "
+                       f"{evidence}% under the ${our_high:,.2f} tracked. "
+                       f"HD claims {claimed}% off ${original:,.2f}, a price the "
+                       f"record has never seen.")
         else:
-            caption = (f"Down to my lowest recorded ${price:,.2f} — about "
-                       f"{evidence}% under the ${our_high:,.2f} I've tracked.")
+            caption = (f"Down to the lowest recorded, ${price:,.2f} — about "
+                       f"{evidence}% under the ${our_high:,.2f} tracked.")
         return {"flash": flash, "struck": struck, "chips": chips, "caption": caption}
 
     if not price_varied and d.get("high_window") is not None:
         # Genuinely flat: the price never moved while we watched. Only here
         # does "flat" tell the truth.
         chips.append((f"flat {span} price", "flat"))
-        caption = (f"HD claims {claimed}% off, but I've only ever seen it at "
-                   f"${price:,.2f} in {watched} of watching." if claimed
+        caption = (f"HD claims {claimed}% off, but the record has only ever "
+                   f"seen it at ${price:,.2f} in {_prose_span(watched)} of "
+                   f"watching." if claimed
                    else "No discount claimed or measured — listed in today's set as-is.")
         return {"flash": flash, "struck": struck, "chips": chips, "caption": caption}
 
@@ -290,9 +315,9 @@ def verdict_facts(d: dict, cap_days: int) -> dict:
     if not claimed:
         caption = "No discount claimed or measured — listed in today's set as-is."
     elif history_days is None:
-        caption = f"HD claims {claimed}% off — too new in my record to verify yet."
+        caption = f"HD claims {claimed}% off — too new in the record to verify yet."
     else:
-        caption = f"HD claims {claimed}% off — more than my record can back yet."
+        caption = f"HD claims {claimed}% off — more than the record can back yet."
     return {"flash": flash, "struck": struck, "chips": chips, "caption": caption}
 
 

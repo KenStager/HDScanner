@@ -56,7 +56,9 @@ Rate limiting, jitter, and backoff are not optional — they are hardcoded requi
 
 ### Do not attempt to bypass bot protection
 
-No proxy rotation, no CAPTCHA solving, no headless browser emulation. If the API returns a 403, log a warning and back off. Do not try to circumvent it.
+This published project makes no attempt to bypass bot protection: no proxy rotation, no CAPTCHA solving, no headless browser emulation. If the API returns a 403, it logs a warning and backs off rather than circumventing it. A stock clone behaves exactly this way, and this repository ships no policy to the contrary.
+
+These rules bind the project as published. An operator running a private, local `hd.plugins` overlay may attach its own transport and header policy through the guarded seams in `hd.http.client` (the `override_headers` and transport hooks). What such an overlay does is that operator's decision and legal responsibility, recorded with the overlay — not here. The seams carry no such policy themselves.
 
 ---
 
