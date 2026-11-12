@@ -24,6 +24,10 @@ Two tiers:
 
 Both tiers upsert products AND append snapshots from the same pages, so a
 newly discovered item is monitored the same run it is first seen.
+
+A network run can also be given a LEAD: nodes it walks before the rotation at
+configured hours, for prices that change on the retailer's daily clock rather
+than whenever (see `browse_network_lead` in config and `run_network_lead`).
 """
 
 from __future__ import annotations
@@ -960,6 +964,33 @@ def effective_shelf_fraction(settings: Settings, now: datetime | None = None) ->
     return 1.0 if now.hour in hours else settings.browse_shelf_fraction
 
 
+def network_lead_for_run(
+    settings: Settings, tiers: tuple[str, ...], now: datetime | None = None,
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    """(brand, facet token, label path) for each node this run walks first.
+
+    Empty means no lead: the setting is off, this is not a network run, or the
+    run did not start in a lead hour. Read once per run, like
+    `effective_shelf_fraction` and for the same reason — a run that crosses
+    the hour keeps the behaviour it began with.
+
+    The brand comes back in the BRAND_TOKENS spelling, because that is the
+    spelling the rotation labels its walks with and the two must agree.
+    """
+    if "network" not in tiers:
+        return []
+    hours = parse_et_hours(settings.browse_network_lead_hours_et)
+    if not hours or current_et_hour(now) not in hours:
+        return []
+    tokens = {b.upper(): (b, t) for b, t in settings.brand_token_list}
+    leads: list[tuple[str, str, tuple[str, ...]]] = []
+    for brand, path in settings.browse_network_lead_list:
+        known = tokens.get(brand.upper())
+        if known:
+            leads.append((known[0], known[1], path))
+    return leads
+
+
 def rotate_shelf_walks(
     walks: list[Walk],
     cursors: dict[str, int],
@@ -1561,13 +1592,222 @@ async def coverage_memory(
     return totals, recent, recent_axis, recorded_children
 
 
+@dataclass
+class LeadOutcome:
+    """What the lead did, in the terms the rotation needs to hear it."""
+
+    # Every navParam the lead ATTEMPTED, complete or not. The rotation treats
+    # these as done for this run: a walk the lead truncated minutes ago would
+    # otherwise pass the freshness filter (which knows only completions) and
+    # be paged a second time for nothing.
+    walked: set[str] = field(default_factory=set)
+    # NavParams the lead refused for lack of budget. The rotation will refuse
+    # them again when it reaches their category — `admits` only gets stricter
+    # as a run spends — and must not count them a second time.
+    deferred: set[str] = field(default_factory=set)
+
+
+async def locate_lead_node(
+    client: HDClient,
+    settings: Settings,
+    store_id: str,
+    brand: str,
+    token: str,
+    path: tuple[str, ...],
+    facets: dict[str, tuple[int | None, dict[str, list[dict]]]],
+) -> tuple[str, str, str] | None:
+    """Find a lead node by its label path: (navParam, label, parent navParam).
+
+    One facet read per level, shared across entries through `facets`. The
+    label is assembled from the facets' own labels exactly as the rotation
+    assembles it, never from the configured text: two spellings for one
+    navParam would split everything downstream that groups walks by label.
+
+    None when the path cannot be followed. The caller carries on with the
+    ordinary rotation — a lead that cannot be found must not cost the run.
+    """
+    nav = build_nav(settings.root_nav_param, token)
+    label = brand
+    parent = nav
+    for segment in path:
+        if client.is_throttled or budget_spent(client, settings):
+            return None
+        if nav not in facets:
+            total, dims, _ = await fetch_facets(
+                client, settings, nav, store_id, "ALL", page_size=1
+            )
+            facets[nav] = (total, dims)
+        total, dims = facets[nav]
+        in_nav = set(nav.split("Z"))
+        offered = [
+            r for r in dims.get(CATEGORY_DIMENSION, [])
+            if r.get("count") and r["count"] > 0 and r["token"] not in in_nav
+        ]
+        wanted = segment.casefold()
+        matches = [
+            r for r in offered
+            if (r.get("label") or "").casefold() == wanted or r["token"] == segment
+        ]
+        if len(matches) != 1:
+            log.warning(
+                "Lead node not found — continuing with the ordinary rotation",
+                brand=brand, path="/".join(path), segment=segment,
+                reason="facet read failed" if total is None else
+                       "no such category" if not matches else "ambiguous",
+                offered=[r.get("label") or r["token"] for r in offered],
+            )
+            return None
+        parent = nav
+        nav = build_nav(nav, matches[0]["token"])
+        label = f"{label}/{matches[0].get('label') or matches[0]['token']}"
+    return nav, label, parent
+
+
+def _remember_lead_split(
+    walks: list[Walk],
+    lead_nav: str,
+    recent_axis: dict[str, str],
+    recorded_children: dict[str, list[tuple[str, str, int]]],
+) -> None:
+    """Tell this run's memory how the lead just split its node.
+
+    The rotation re-resolves the lead's category later in the same run, with a
+    NEW facet read. If that read offers a different axis than the lead's did,
+    the children carry navParams nobody has marked done and the whole node is
+    walked again — the flip described above plan_walks, inside one run. The
+    coverage rows that would prevent it are written, but `coverage_memory` was
+    read before the lead ran. So hand the planner what the next run's memory
+    would have said.
+
+    Only for parents at or under the lead node. A lead node that turned out to
+    be a single walk is tagged with ITS parent, and recording that as the
+    parent's whole split would let a rebuild-from-record drop its siblings.
+    """
+    prefix = lead_nav + "Z"
+    by_parent: dict[tuple[str, str], list[tuple[str, str, int]]] = {}
+    for walk in walks:
+        parent, axis = walk.split_parent, walk.split_axis
+        if not parent or not axis:
+            continue
+        if parent != lead_nav and not parent.startswith(prefix):
+            continue
+        by_parent.setdefault((parent, axis), []).append(
+            (walk.nav_param, walk.label, int(walk.total or 0))
+        )
+    for (parent, axis), kids in by_parent.items():
+        recent_axis[parent] = axis
+        recorded_children[parent] = sorted(kids)
+
+
+async def _capture_walk(
+    client: HDClient,
+    settings: Settings,
+    summary: BrowseSummary,
+    run_id: int | None,
+    walk: Walk,
+    store_id: str,
+    storefilter: str,
+    seen: set[str],
+    brands: list[str],
+) -> None:
+    """Walk one node and account for it the way the tier loops do."""
+    started = datetime.now(timezone.utc)
+    upserts, inserts = await walk_and_capture(
+        client, settings, walk, store_id, storefilter, seen, brands,
+    )
+    await _record_walk(settings, run_id, walk, store_id, storefilter, started)
+    summary.products += upserts
+    summary.snapshots += inserts
+    summary.walks += 1
+    if walk.truncated:
+        summary.truncated_walks.append(walk.label)
+    await _pause(settings)
+
+
+async def run_network_lead(
+    client: HDClient,
+    settings: Settings,
+    summary: BrowseSummary,
+    run_id: int | None,
+    store_id: str,
+    leads: list[tuple[str, str, tuple[str, ...]]],
+    memory: tuple[dict[str, int], dict[str, str], dict[str, list[tuple[str, str, int]]]],
+    seen: set[str],
+    brands: list[str],
+) -> LeadOutcome:
+    """Walk the configured lead nodes before the rotation gets the run.
+
+    Freshness is deliberately ignored: the point of a lead is a read at THIS
+    hour, and a node the rotation happened to walk four hours ago is exactly
+    the case it exists for. Everything else is the rotation's own machinery —
+    the same planner, the same admission test, the same coverage rows — so the
+    record cannot tell a lead walk from a rotation walk, and resume and axis
+    memory keep working on what it leaves behind.
+
+    It owns no cursor. The category cursor and the brand order move only on
+    what the rotation itself finishes; the caller takes the brand-lead
+    baseline AFTER this returns, so a lead's walks never count as a brand
+    having had its turn.
+    """
+    observed_totals, recent_axis, recorded_children = memory
+    outcome = LeadOutcome()
+    facets: dict[str, tuple[int | None, dict[str, list[dict]]]] = {}
+    for brand, token, path in leads:
+        node = await locate_lead_node(
+            client, settings, store_id, brand, token, path, facets,
+        )
+        if node is None or budget_spent(client, settings):
+            continue
+        nav, label, parent = node
+        walks = await resolve_walks(
+            client, settings, nav, label, store_id, "ALL",
+            observed_totals=observed_totals,
+            recent_axis=recent_axis,
+            recorded_children=recorded_children,
+        )
+        for walk in walks:
+            # Reached through its category, a node that is a walk in its own
+            # right is tagged as a piece of that category's split (see
+            # resolve_walks). Reached directly it has no idea it has a parent.
+            if len(path) > 1 and walk.split_parent is None and walk.nav_param == nav:
+                walk.split_parent, walk.split_axis = parent, "category"
+        _remember_lead_split(walks, nav, recent_axis, recorded_children)
+        log.info("Network lead", store_id=store_id, label=label, walks=len(walks))
+        for position, walk in enumerate(walks):
+            if client.is_throttled:
+                break
+            if not admits(client, settings, walk):
+                log.info(
+                    "Lead walk deferred — run cannot afford to finish it",
+                    label=walk.label,
+                    estimate=walk_cost_estimate(walk, settings),
+                    used=client.request_count,
+                    ceiling=admission_ceiling(settings),
+                )
+                refused = {w.nav_param for w in walks[position:]}
+                summary.deferred_walks += len(refused)
+                outcome.deferred |= refused
+                break
+            await _capture_walk(
+                client, settings, summary, run_id, walk, store_id, "ALL", seen, brands,
+            )
+            outcome.walked.add(walk.nav_param)
+    return outcome
+
+
 async def run_browse(
     settings: Settings,
     store_ids: list[str] | None = None,
     client: HDClient | None = None,
     tiers: tuple[str, ...] = ("shelf", "network"),
+    now: datetime | None = None,
 ) -> BrowseSummary:
-    """Run the facet-driven browse scan for each store and configured brand."""
+    """Run the facet-driven browse scan for each store and configured brand.
+
+    `now` is the instant the run is deemed to have started. The caller that
+    chose the tiers from the clock passes the same instant here, so the tier
+    choice and the lead decision cannot disagree across an hour boundary.
+    """
     store_ids = store_ids or settings.store_list
     brand_tokens = settings.brand_token_list
     brands = [b for b, _ in brand_tokens]
@@ -1577,7 +1817,8 @@ async def run_browse(
     seen_by_store: dict[str, set[str]] = {s: set() for s in store_ids}
 
     cursors: dict[str, int] = rotation.load_cursors(settings.browse_cursor_path)
-    shelf_fraction = effective_shelf_fraction(settings)
+    shelf_fraction = effective_shelf_fraction(settings, now)
+    network_lead = network_lead_for_run(settings, tiers, now)
 
     if not brand_tokens:
         log.error("No brand tokens configured — browse cannot run")
@@ -1796,6 +2037,17 @@ async def run_browse(
                 observed_totals, recently_done, recent_axis, recorded_children = await coverage_memory(
                     settings, store_id, "ALL", settings.browse_walk_refresh_hours,
                 )
+                # The lead goes before everything the rotation decides, and
+                # before the brand-lead baseline below is taken.
+                lead_deferred: set[str] = set()
+                if network_lead:
+                    lead = await run_network_lead(
+                        client, settings, summary, run_id, store_id, network_lead,
+                        (observed_totals, recent_axis, recorded_children),
+                        seen_by_store[store_id], brands,
+                    )
+                    recently_done = recently_done | lead.walked
+                    lead_deferred = lead.deferred
                 # Rotate which brand goes FIRST, one step per run.
                 #
                 # The per-brand cursor keeps a brand fair to itself across
@@ -1934,8 +2186,13 @@ async def run_browse(
                                     ceiling=admission_ceiling(settings),
                                 )
                                 # Count every remaining walk, not just this
-                                # one — the break abandons them all.
-                                summary.deferred_walks += len(walks) - position
+                                # one — the break abandons them all. Less any
+                                # the lead already refused and counted: this is
+                                # the same refusal reached a second time.
+                                summary.deferred_walks += sum(
+                                    1 for w in walks[position:]
+                                    if w.nav_param not in lead_deferred
+                                )
                                 category_finished = False
                                 break
                             walk_started = datetime.now(timezone.utc)

@@ -120,6 +120,40 @@ class Settings(BaseSettings):
     # so a category is refreshed once per cycle rather than re-read per run.
     # 0 disables resume entirely and restores the restart behaviour.
     browse_walk_refresh_hours: int = 20
+    # A network run that starts in one of these Eastern hours walks the nodes
+    # named in `browse_network_lead` FIRST — whatever the freshness window
+    # says about them — and then lets the ordinary rotation spend what is left.
+    #
+    # The rotation covers every node about once a day, but nothing ties a node
+    # to an hour: the category cursor has no clock input, so which run reaches
+    # a node is an accident of where the previous runs stopped. That is fine
+    # for prices that change whenever, and wrong for prices that change on the
+    # retailer's own daily clock. Home Depot's one-day prices begin at 03:00
+    # Eastern; a node the rotation happens to reach at 16:00 shows them
+    # thirteen hours late. Measured on a two-brand install: the run after the
+    # daily refresh never met the quota stop in 75 runs (the afternoon run met
+    # it in 35 of 78), and the single node holding about half of the one-day
+    # price drops was walked in that run on only 16 of 74 days.
+    #
+    # `browse_network_lead` is a CSV of BRAND:Category/Subcategory paths, e.g.
+    # MILWAUKEE:Tools/Power Tools. Each segment is matched, ignoring case,
+    # against the label the retailer's own category facet carries at that
+    # level, or exactly against its token (use the token for a label that
+    # contains a comma or a slash). The walk's label always comes from the
+    # facets, never from this text.
+    #
+    # Read before setting it:
+    # - The lead spends the SAME admission ceiling as the rotation. A lead
+    #   whose nodes cost more than the ceiling defers its own tail every day
+    #   and leaves the rotation — and every other brand — nothing in that run.
+    # - It runs once per store, on network runs only; an hour that is a shelf
+    #   hour would never fire, so that combination refuses to start.
+    # - It costs about three extra facet reads on the lead run (one per path
+    #   level, plus the node's own), nothing on any other run.
+    # - A run started by hand inside a lead hour walks the lead again.
+    # Both empty (the default) is today's behaviour exactly.
+    browse_network_lead_hours_et: str = ""
+    browse_network_lead: str = ""
     # Both-ends paging: walk a mid-size node from both price ends (orderBy PRICE
     # ASC + DESC) instead of facet-splitting it, lifting reach from one cap to
     # ~two and collapsing a split into one walk. OFF by default — a staged,
@@ -477,6 +511,78 @@ class Settings(BaseSettings):
                     f"{sorted(known)} — a brand scope that resolves to nothing "
                     f"silently widens a tier or empties a surface"
                 )
+        return self
+
+    @property
+    def browse_network_lead_list(self) -> list[tuple[str, tuple[str, ...]]]:
+        """(brand, path segments) per `browse_network_lead` entry.
+
+        Malformed entries are dropped here and refused by
+        `_network_lead_resolves`, so a caller never sees one.
+        """
+        leads = []
+        for entry in _parse_csv(self.browse_network_lead):
+            brand, sep, path = entry.partition(":")
+            segments = tuple(s.strip() for s in path.split("/") if s.strip())
+            if sep and brand.strip() and segments:
+                leads.append((brand.strip(), segments))
+        return leads
+
+    @model_validator(mode="after")
+    def _network_lead_resolves(self) -> "Settings":
+        """A network lead must be able to fire, or the install refuses to start.
+
+        Every way this setting can be wrong fails SILENT otherwise: an hour
+        that does not parse is no hour, a lead without an hour never runs, a
+        shelf hour never reaches the network tier, and a misspelled brand has
+        no token to walk. Each would read as "the lead is on" in the config
+        and as nothing at all in the record.
+        """
+        hours_raw = (self.browse_network_lead_hours_et or "").strip()
+        lead_raw = (self.browse_network_lead or "").strip()
+        if not hours_raw and not lead_raw:
+            return self
+        if not hours_raw or not lead_raw:
+            raise ValueError(
+                "BROWSE_NETWORK_LEAD and BROWSE_NETWORK_LEAD_HOURS_ET must be "
+                "set together — one without the other is a lead that never runs"
+            )
+        hours: set[int] = set()
+        for part in _parse_csv(hours_raw):
+            if not (part.isdigit() and 0 <= int(part) <= 23):
+                raise ValueError(
+                    f"BROWSE_NETWORK_LEAD_HOURS_ET has {part!r}, which is not "
+                    f"an Eastern hour 0-23"
+                )
+            hours.add(int(part))
+        shelf_hours = {
+            int(p) for p in _parse_csv(self.browse_shelf_hours_et)
+            if p.isdigit() and 0 <= int(p) <= 23
+        }
+        clash = sorted(hours & shelf_hours)
+        if clash:
+            raise ValueError(
+                f"BROWSE_NETWORK_LEAD_HOURS_ET names {clash}, which "
+                f"BROWSE_SHELF_HOURS_ET gives to the shelf tier — a network "
+                f"lead in a shelf hour never fires"
+            )
+        entries = _parse_csv(lead_raw)
+        if len(self.browse_network_lead_list) != len(entries):
+            raise ValueError(
+                f"BROWSE_NETWORK_LEAD {lead_raw!r} has an entry that is not "
+                f"BRAND:Category/Subcategory"
+            )
+        tokens = {b.upper() for b, _ in self.brand_token_list}
+        if not tokens:
+            # `hd setup` constructs Settings before BRAND_TOKENS is written.
+            return self
+        unknown = sorted({b.upper() for b, _ in self.browse_network_lead_list} - tokens)
+        if unknown:
+            raise ValueError(
+                f"BROWSE_NETWORK_LEAD names {unknown}, which has no entry in "
+                f"BRAND_TOKENS {sorted(tokens)} — a lead needs the brand's "
+                f"facet token to walk anything"
+            )
         return self
 
     @property

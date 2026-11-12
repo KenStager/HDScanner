@@ -549,7 +549,12 @@ def run_once(
                 # (spread across them via the rotation fraction), the ALL/online
                 # catalogue at every other scan hour. Empty keeps the original
                 # both-tiers-every-run behaviour.
-                et_hour = current_et_hour()
+                # One instant for the whole run. The daily-deals sweep runs
+                # between this line and the browse, and can carry a run that
+                # started at 03:59 past the hour: the tier chosen here and the
+                # browse's own hour-keyed decisions must read the same clock.
+                run_started = datetime.now(timezone.utc)
+                et_hour = current_et_hour(run_started)
                 shelf_hours = parse_et_hours(settings.browse_shelf_hours_et)
                 dd_hours = parse_et_hours(settings.daily_deals_hours_et)
                 if shelf_hours:
@@ -584,6 +589,7 @@ def run_once(
                     store_ids=settings.store_list,
                     client=shared_client,
                     tiers=tiers,
+                    now=run_started,
                 )
                 product_count += summary.products
                 snapshot_count += summary.snapshots
