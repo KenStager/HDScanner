@@ -853,19 +853,28 @@ async def resolve_walks(
     observed_totals: dict[str, int] | None = None,
     recent_axis: dict[str, str] | None = None,
     recorded_children: dict[str, list[tuple[str, str, int]]] | None = None,
+    depth: int = 0,
 ) -> list[Walk]:
-    """Plan walks for a node, fetching facets for any piece still over the cap."""
+    """Plan walks for a node, fetching facets for any piece still over the cap.
+
+    `depth` is how many splits already lie above `nav_param`. A caller that
+    starts below the top of a category passes it, so the node is planned at
+    the depth it has when reached through that category: the split-depth guard
+    in plan_walks is tested before anything else, and a node planned one level
+    too shallow is split where the other route would walk it whole.
+    """
     raw = None
     if total is None or dimensions is None:
         total, dimensions, raw = await fetch_facets(
             client, settings, nav_param, store_id, storefilter
         )
     walks, need = plan_walks(nav_param, label, total, dimensions, settings,
+                             depth=depth,
                              observed_totals=observed_totals,
                              recent_axis=recent_axis,
                              recorded_children=recorded_children)
     _prime(walks, nav_param, raw)
-    depth = 1
+    depth += 1
     # Carry the node each pending child was split OUT OF alongside it. Only the
     # category branch produces `need`, so the axis is always "category"; the
     # parent is whichever plan_walks call handed the child back.
@@ -1601,9 +1610,10 @@ class LeadOutcome:
     # otherwise pass the freshness filter (which knows only completions) and
     # be paged a second time for nothing.
     walked: set[str] = field(default_factory=set)
-    # NavParams the lead refused for lack of budget. The rotation will refuse
-    # them again when it reaches their category — `admits` only gets stricter
-    # as a run spends — and must not count them a second time.
+    # NavParams the lead refused for lack of budget. The rotation re-plans
+    # their category later in the run and, planning from the same counts with
+    # less budget left, refuses them again. That is the same refusal reached a
+    # second time, and it must not be counted a second time.
     deferred: set[str] = field(default_factory=set)
 
 
@@ -1710,7 +1720,11 @@ async def _capture_walk(
     seen: set[str],
     brands: list[str],
 ) -> None:
-    """Walk one node and account for it the way the tier loops do."""
+    """Walk one node and account for it the way the tier loops do.
+
+    The tier loops carry this block inline. They are left as they are so that
+    adding the lead changes nothing on the paths that already run.
+    """
     started = datetime.now(timezone.utc)
     upserts, inserts = await walk_and_capture(
         client, settings, walk, store_id, storefilter, seen, brands,
@@ -1722,6 +1736,55 @@ async def _capture_walk(
     if walk.truncated:
         summary.truncated_walks.append(walk.label)
     await _pause(settings)
+
+
+async def _plan_lead(
+    client: HDClient,
+    settings: Settings,
+    store_id: str,
+    lead: tuple[str, str, tuple[str, ...]],
+    facets: dict[str, tuple[int | None, dict[str, list[dict]]]],
+    memory: tuple[dict[str, int], dict[str, str], dict[str, list[tuple[str, str, int]]]],
+) -> list[Walk]:
+    """The walks for one lead entry, planned as the rotation would plan them.
+
+    Empty when the node cannot be found, read or afforded. Everything the
+    rotation needs in order to recognise these walks when it re-plans the same
+    category later in the run is put into `memory` here.
+    """
+    brand, token, path = lead
+    observed_totals, recent_axis, recorded_children = memory
+    node = await locate_lead_node(client, settings, store_id, brand, token, path, facets)
+    if node is None or budget_spent(client, settings):
+        return []
+    nav, label, parent = node
+    total, dims, raw = await fetch_facets(client, settings, nav, store_id, "ALL")
+    if not total:
+        return []
+    # The node's own count, where the rotation will look for it. Its category
+    # states a count for it too, and that claim is sometimes several times too
+    # small (see plan_walks). Planned from the claim, the rotation would route
+    # this node differently than the lead just did — walk whole what the lead
+    # split, or admit what the lead could not afford.
+    observed_totals[nav] = max(observed_totals.get(nav, 0), int(total))
+    walks = await resolve_walks(
+        client, settings, nav, label, store_id, "ALL",
+        total=total, dimensions=dims, depth=len(path) - 1,
+        observed_totals=observed_totals,
+        recent_axis=recent_axis,
+        recorded_children=recorded_children,
+    )
+    _prime(walks, nav, raw)
+    for walk in walks:
+        # Reached through its category, a node that is a walk in its own right
+        # is tagged as a piece of that category's split (see resolve_walks).
+        # Reached directly it has no idea it has a parent. A top-level
+        # category has none, and the rotation leaves it untagged too.
+        if len(path) > 1 and walk.split_parent is None and walk.nav_param == nav:
+            walk.split_parent, walk.split_axis = parent, "category"
+    _remember_lead_split(walks, nav, recent_axis, recorded_children)
+    log.info("Network lead", store_id=store_id, label=label, walks=len(walks))
+    return walks
 
 
 async def run_network_lead(
@@ -1740,39 +1803,31 @@ async def run_network_lead(
     Freshness is deliberately ignored: the point of a lead is a read at THIS
     hour, and a node the rotation happened to walk four hours ago is exactly
     the case it exists for. Everything else is the rotation's own machinery —
-    the same planner, the same admission test, the same coverage rows — so the
-    record cannot tell a lead walk from a rotation walk, and resume and axis
-    memory keep working on what it leaves behind.
+    the same planner at the same depth, the same admission test, the same
+    coverage rows — so a lead walk writes the row the rotation would have
+    written for that node, and resume and axis memory keep working on it.
 
-    It owns no cursor. The category cursor and the brand order move only on
-    what the rotation itself finishes; the caller takes the brand-lead
-    baseline AFTER this returns, so a lead's walks never count as a brand
-    having had its turn.
+    It writes no cursor. What it completes can leave the rotation finding a
+    category already fresh, and the rotation counts that as it always has: the
+    category is advanced and the brand has had a turn. The brand-lead baseline
+    is taken AFTER this returns, so the lead's own walks are never what hands
+    the lead on.
     """
-    observed_totals, recent_axis, recorded_children = memory
     outcome = LeadOutcome()
     facets: dict[str, tuple[int | None, dict[str, list[dict]]]] = {}
-    for brand, token, path in leads:
-        node = await locate_lead_node(
-            client, settings, store_id, brand, token, path, facets,
-        )
-        if node is None or budget_spent(client, settings):
-            continue
-        nav, label, parent = node
-        walks = await resolve_walks(
-            client, settings, nav, label, store_id, "ALL",
-            observed_totals=observed_totals,
-            recent_axis=recent_axis,
-            recorded_children=recorded_children,
-        )
-        for walk in walks:
-            # Reached through its category, a node that is a walk in its own
-            # right is tagged as a piece of that category's split (see
-            # resolve_walks). Reached directly it has no idea it has a parent.
-            if len(path) > 1 and walk.split_parent is None and walk.nav_param == nav:
-                walk.split_parent, walk.split_axis = parent, "category"
-        _remember_lead_split(walks, nav, recent_axis, recorded_children)
-        log.info("Network lead", store_id=store_id, label=label, walks=len(walks))
+    for lead in leads:
+        if client.is_throttled or budget_spent(client, settings):
+            # Not an error, but not silent either: a lead that did not run
+            # should say so in the run's own log.
+            log.info(
+                "Network lead skipped — the run has no budget left for it",
+                store_id=store_id, brand=lead[0], path="/".join(lead[2]),
+                used=client.request_count, throttled=client.is_throttled,
+            )
+            break
+        planned = await _plan_lead(client, settings, store_id, lead, facets, memory)
+        # Two entries can name one node (a label and its token); walk it once.
+        walks = [w for w in planned if w.nav_param not in outcome.walked]
         for position, walk in enumerate(walks):
             if client.is_throttled:
                 break
@@ -1784,7 +1839,8 @@ async def run_network_lead(
                     used=client.request_count,
                     ceiling=admission_ceiling(settings),
                 )
-                refused = {w.nav_param for w in walks[position:]}
+                # Every walk the break abandons, not just this one.
+                refused = {w.nav_param for w in walks[position:]} - outcome.deferred
                 summary.deferred_walks += len(refused)
                 outcome.deferred |= refused
                 break

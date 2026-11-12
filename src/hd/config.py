@@ -8,6 +8,45 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _lenient_et_hours(csv: str) -> list[int]:
+    """Eastern hours from a CSV, ignoring anything that is not one."""
+    return [int(p) for p in _parse_csv(csv) if p.isdigit() and 0 <= int(p) <= 23]
+
+
+def _strict_et_hours(csv: str, field: str) -> set[int]:
+    """Eastern hours from a CSV; anything that is not an hour, or no hour at
+    all, is an error rather than an empty set."""
+    parts = _parse_csv(csv)
+    bad = [p for p in parts if not (p.isdigit() and 0 <= int(p) <= 23)]
+    if bad or not parts:
+        raise ValueError(
+            f"{field} is {csv!r}: {bad[0]!r} is not an Eastern hour 0-23"
+            if bad else f"{field} is {csv!r}, which names no hour"
+        )
+    return {int(p) for p in parts}
+
+
+def _refuse_overlapping_leads(leads: list[tuple[str, tuple[str, ...]]]) -> None:
+    """Two lead entries must not name one node, or a node inside another.
+
+    The second would re-read what the first just walked, and a refusal would
+    be counted against both. (An entry given once by label and once by token
+    cannot be seen from here; the run walks such a node once.)
+    """
+    seen: list[tuple[str, tuple[str, ...]]] = []
+    for brand, path in leads:
+        key = (brand.upper(), tuple(s.casefold() for s in path))
+        for other_brand, other in seen:
+            shorter = min(len(other), len(key[1]))
+            if other_brand == key[0] and other[:shorter] == key[1][:shorter]:
+                raise ValueError(
+                    f"BROWSE_NETWORK_LEAD names {brand}:{'/'.join(path)} twice, "
+                    f"or inside another entry — the second walk would re-read "
+                    f"the first"
+                )
+        seen.append(key)
+
+
 def _parse_csv(v: Any) -> list[str]:
     if isinstance(v, list):
         return v
@@ -121,8 +160,10 @@ class Settings(BaseSettings):
     # 0 disables resume entirely and restores the restart behaviour.
     browse_walk_refresh_hours: int = 20
     # A network run that starts in one of these Eastern hours walks the nodes
-    # named in `browse_network_lead` FIRST — whatever the freshness window
-    # says about them — and then lets the ordinary rotation spend what is left.
+    # named in `browse_network_lead` before the rotation — whatever the
+    # freshness window says about them — and then lets the ordinary rotation
+    # spend what is left. (In a run that does both tiers, the shelf tier still
+    # goes first.)
     #
     # The rotation covers every node about once a day, but nothing ties a node
     # to an hour: the category cursor has no clock input, so which run reaches
@@ -151,7 +192,9 @@ class Settings(BaseSettings):
     # - It costs about three extra facet reads on the lead run (one per path
     #   level, plus the node's own), nothing on any other run.
     # - A run started by hand inside a lead hour walks the lead again.
-    # Both empty (the default) is today's behaviour exactly.
+    # - An hour no scan is scheduled for never fires; that is not checked.
+    # - Two entries must not name one node, or a node inside another.
+    # Both empty (the default) means no lead.
     browse_network_lead_hours_et: str = ""
     browse_network_lead: str = ""
     # Both-ends paging: walk a mid-size node from both price ends (orderBy PRICE
@@ -547,36 +590,24 @@ class Settings(BaseSettings):
                 "BROWSE_NETWORK_LEAD and BROWSE_NETWORK_LEAD_HOURS_ET must be "
                 "set together — one without the other is a lead that never runs"
             )
-        hours: set[int] = set()
-        for part in _parse_csv(hours_raw):
-            if not (part.isdigit() and 0 <= int(part) <= 23):
-                raise ValueError(
-                    f"BROWSE_NETWORK_LEAD_HOURS_ET has {part!r}, which is not "
-                    f"an Eastern hour 0-23"
-                )
-            hours.add(int(part))
-        shelf_hours = {
-            int(p) for p in _parse_csv(self.browse_shelf_hours_et)
-            if p.isdigit() and 0 <= int(p) <= 23
-        }
-        clash = sorted(hours & shelf_hours)
+        hours = _strict_et_hours(hours_raw, "BROWSE_NETWORK_LEAD_HOURS_ET")
+        clash = sorted(hours & set(_lenient_et_hours(self.browse_shelf_hours_et)))
         if clash:
             raise ValueError(
                 f"BROWSE_NETWORK_LEAD_HOURS_ET names {clash}, which "
                 f"BROWSE_SHELF_HOURS_ET gives to the shelf tier — a network "
                 f"lead in a shelf hour never fires"
             )
-        entries = _parse_csv(lead_raw)
-        if len(self.browse_network_lead_list) != len(entries):
+        leads = self.browse_network_lead_list
+        if not leads or len(leads) != len(_parse_csv(lead_raw)):
             raise ValueError(
-                f"BROWSE_NETWORK_LEAD {lead_raw!r} has an entry that is not "
-                f"BRAND:Category/Subcategory"
+                f"BROWSE_NETWORK_LEAD {lead_raw!r} must be one or more "
+                f"BRAND:Category/Subcategory entries"
             )
+        _refuse_overlapping_leads(leads)
         tokens = {b.upper() for b, _ in self.brand_token_list}
-        if not tokens:
-            # `hd setup` constructs Settings before BRAND_TOKENS is written.
-            return self
-        unknown = sorted({b.upper() for b, _ in self.browse_network_lead_list} - tokens)
+        # `hd setup` constructs Settings before BRAND_TOKENS is written.
+        unknown = sorted({b.upper() for b, _ in leads} - tokens) if tokens else []
         if unknown:
             raise ValueError(
                 f"BROWSE_NETWORK_LEAD names {unknown}, which has no entry in "

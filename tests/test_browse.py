@@ -3042,7 +3042,7 @@ AT_NOON = datetime(2026, 12, 1, 17, 30, tzinfo=timezone.utc)
 
 def lead_router(seen: list, power_dims=None, power_total: int = 7,
                 leaves: dict | None = None, totals: dict | None = None,
-                tools_dims=None):
+                tools_dims=None, power_claim: int | None = None):
     """Root -> Garage, Plumbing, Tools; Tools -> Hand (a walk) and Power (split).
 
     Tools is over the cap, so the rotation has to resolve it; Power is over
@@ -3074,7 +3074,8 @@ def lead_router(seen: list, power_dims=None, power_total: int = 7,
             return make_page([], 1, dims=[cat_dim(("Tools", "dt", 1))])
         if nav == LEAD_TOOLS:
             reads["tools"] += 1
-            dims = [cat_dim(("Hand", "c2", 2), ("Power", "c3", power_total))]
+            claim = power_total if power_claim is None else power_claim
+            dims = [cat_dim(("Hand", "c2", 2), ("Power", "c3", claim))]
             if tools_dims is not None:
                 dims = tools_dims(reads["tools"], dims)
             return make_page([], 2 + power_total, dims=dims)
@@ -3196,7 +3197,8 @@ class TestNetworkLead:
         assert all(r.status == "complete" for r in walked_again)
         assert summary.aborted is False
 
-    @pytest.mark.parametrize("shape", ["price", "category", "own-walk"])
+    @pytest.mark.parametrize(
+        "shape", ["price", "category", "own-walk", "depth-limit", "top-level"])
     async def test_lead_rows_are_the_rows_the_rotation_writes(
         self, browse_settings, fresh_db, shape
     ):
@@ -3206,6 +3208,7 @@ class TestNetworkLead:
         s = browse_settings
         await base.init_db(s)
         kwargs: dict = {}
+        lead, under = "Milwaukee:Tools/Power", LEAD_POWER
         if shape == "category":
             kwargs = dict(
                 power_dims=[cat_dim(("Saws", "ca", 4), ("Drills", "cb", 3))],
@@ -3213,12 +3216,19 @@ class TestNetworkLead:
                         LEAD_POWER + "Zcb": ["305", "306", "307"]})
         elif shape == "own-walk":
             kwargs = dict(power_total=5, leaves={LEAD_POWER: ["301", "302", "303", "304", "305"]})
+        elif shape == "depth-limit":
+            # Through Tools the node sits at depth 1, where the guard stops the
+            # split and the node is walked whole. The lead must not split it.
+            s.browse_max_split_depth = 1
+        elif shape == "top-level":
+            # A category of its own: the rotation leaves it untagged.
+            lead, under = "Milwaukee:Garage", LEAD_ROOT + "Zgar"
 
         def tags(rows):
             return sorted((r.nav_param, r.label, r.split_parent, r.split_axis)
-                          for r in rows if r.nav_param.startswith(LEAD_POWER))
+                          for r in rows if r.nav_param.startswith(under))
 
-        self._lead(s)
+        self._lead(s, lead=lead)
         await run_browse(s, client=FakeClient(lead_router([], **kwargs)),
                          tiers=("network",), now=AT_FOUR)
         by_lead = tags(await self._rows(s, run_id=1))
@@ -3297,6 +3307,123 @@ class TestNetworkLead:
         assert LEAD_POWER + "Zca" not in navs and LEAD_POWER + "Zcb" not in navs
         assert seen.count((LEAD_BAND_A, 0)) == 1
 
+    async def test_rotation_rebuilds_the_leads_split_when_its_own_read_cannot(
+        self, browse_settings, fresh_db
+    ):
+        """The lead splits on price; the rotation's read of the node offers
+        only categories. The lead's children, handed over in memory, are
+        rebuilt and skipped instead of the node being walked on the other axis."""
+        from hd.db import base
+        s = self._lead(browse_settings)
+        s.browse_network_categories_per_run = 3
+        await base.init_db(s)
+        only_categories = [cat_dim(("Saws", "ca", 4), ("Drills", "cb", 3))]
+        seen: list = []
+        router = lead_router(
+            seen, power_dims=lambda n: PRICE_BANDS if n == 1 else only_categories,
+            leaves={LEAD_POWER + "Zca": ["301", "302", "303", "304"],
+                    LEAD_POWER + "Zcb": ["305", "306", "307"]})
+        await run_browse(s, client=FakeClient(router), tiers=("network",), now=AT_FOUR)
+        await base.close_db()
+        navs = {nav for nav, _ in seen}
+        assert seen.count((LEAD_POWER, 0)) == 2, "the rotation should have re-read the node"
+        assert LEAD_POWER + "Zca" not in navs and LEAD_POWER + "Zcb" not in navs
+        assert seen.count((LEAD_BAND_A, 0)) == 1 and seen.count((LEAD_BAND_B, 0)) == 1
+
+    async def test_rotation_plans_the_node_from_its_own_count_not_its_parents_claim(
+        self, browse_settings, fresh_db
+    ):
+        """Tools says Power holds 5 (one walk); Power's own read says 7 (a
+        split). The lead splits it. Planned from the claim, the rotation would
+        then walk Power whole, minutes after its bands were walked."""
+        from hd.db import base
+        from hd.pipeline.browse import _plan_lead
+        s = self._lead(browse_settings)
+        s.browse_network_categories_per_run = 3
+        await base.init_db(s)
+        seen: list = []
+        await run_browse(s, client=FakeClient(lead_router(seen, power_claim=5)),
+                         tiers=("network",), now=AT_FOUR)
+        rows = await self._rows(s)
+        await base.close_db()
+        assert not any(r.nav_param == LEAD_POWER for r in rows), "Power was walked whole"
+        assert seen.count((LEAD_BAND_A, 0)) == 1
+
+        memory: tuple = ({}, {}, {})
+        walks = await _plan_lead(FakeClient(lead_router([], power_claim=5)), s, "2619",
+                                 ("Milwaukee", "zv", ("Tools", "Power")), {}, memory)
+        assert len(walks) == 2 and memory[0][LEAD_POWER] == 7
+
+    async def test_two_entries_naming_one_node_walk_it_once(self, browse_settings, fresh_db):
+        """By label and by token: the settings check cannot see that these are
+        one node, so the run has to."""
+        from hd.db import base
+        s = self._lead(browse_settings, lead="Milwaukee:Tools/Power,Milwaukee:Tools/c3")
+        await base.init_db(s)
+        seen: list = []
+        await run_browse(s, client=FakeClient(lead_router(seen)), tiers=("network",), now=AT_FOUR)
+        await base.close_db()
+        assert seen.count((LEAD_BAND_A, 0)) == 1 and seen.count((LEAD_BAND_B, 0)) == 1
+        # ...and the path levels they share are read once.
+        assert seen.count((LEAD_TOOLS, 0)) == 1
+
+    async def test_a_refusal_reached_through_two_entries_is_one_deferral(
+        self, browse_settings, fresh_db
+    ):
+        from hd.db import base
+        s = self._lead(browse_settings, lead="Milwaukee:Tools/Power,Milwaukee:Tools/c3")
+        s.browse_walk_admission_ceiling = 4      # both bands refused, twice over
+        await base.init_db(s)
+        summary = await run_browse(s, client=FakeClient(lead_router([])),
+                                   tiers=("network",), now=AT_FOUR)
+        await base.close_db()
+        assert summary.deferred_walks == 2
+
+    async def test_a_lead_node_that_is_one_walk_reuses_its_own_first_page(
+        self, browse_settings, fresh_db
+    ):
+        """The read that plans the node is page 0 of the walk; it is not paid twice."""
+        from hd.db import base
+        s = self._lead(browse_settings)
+        await base.init_db(s)
+        seen: list = []
+        router = lead_router(seen, power_total=5,
+                             leaves={LEAD_POWER: ["301", "302", "303", "304", "305"]})
+        await run_browse(s, client=FakeClient(router), tiers=("network",), now=AT_FOUR)
+        rows = [r for r in await self._rows(s) if r.nav_param == LEAD_POWER]
+        await base.close_db()
+        assert [r.status for r in rows] == ["complete"]
+        assert seen.count((LEAD_POWER, 0)) == 1
+
+    async def test_a_node_is_not_found_inside_itself(self, browse_settings, fresh_db):
+        """A category's own facets can list the category. It is not its own child."""
+        from structlog.testing import capture_logs
+        from hd.db import base
+        s = self._lead(browse_settings, lead="Milwaukee:Tools/Tools")
+        await base.init_db(s)
+        seen: list = []
+        router = lead_router(seen, tools_dims=lambda n, dims: [cat_dim(
+            ("Tools", "c1", 9), ("Hand", "c2", 2), ("Power", "c3", 7))])
+        with capture_logs() as logs:
+            await run_browse(s, client=FakeClient(router), tiers=("network",), now=AT_FOUR)
+        await base.close_db()
+        assert any(e["event"].startswith("Lead node not found") for e in logs)
+        assert not any(nav.startswith(LEAD_TOOLS + "Z") for nav, _ in seen)
+
+    async def test_every_walk_the_lead_abandons_is_counted(self, browse_settings, fresh_db):
+        """Refusing the first band abandons both. Both are deferred walks."""
+        from hd.db import base
+        s = self._lead(browse_settings)
+        # The three planning reads leave 1 of 4; band A's estimate is 3.
+        s.browse_walk_admission_ceiling = 4
+        await base.init_db(s)
+        seen: list = []
+        summary = await run_browse(s, client=FakeClient(lead_router(seen)),
+                                   tiers=("network",), now=AT_FOUR)
+        await base.close_db()
+        assert LEAD_BAND_A not in {nav for nav, _ in seen}
+        assert summary.deferred_walks == 2
+
     async def test_lead_leaves_the_cursors_alone(self, browse_settings, fresh_db):
         """Two brands, and a ceiling the lead uses up: the rotation walks
         nothing, so no brand has had a turn and no category was finished."""
@@ -3369,6 +3496,12 @@ class TestNetworkLead:
         s.browse_walk_refresh_hours = 0
         await base.init_db(s)
 
+        # The root read is the whole budget: the next path level is not read.
+        s.browse_walk_admission_ceiling = 1
+        client = FakeClient(lead_router([]))
+        await run_browse(s, client=client, tiers=("network",), now=AT_FOUR)
+        assert client.request_count == 1
+
         # The root and Tools reads are the whole budget: the node is found and
         # must not be planned.
         s.browse_walk_admission_ceiling = 2
@@ -3383,10 +3516,14 @@ class TestNetworkLead:
         s.browse_walk_admission_ceiling = 6
         seen: list = []
         client = FakeClient(lead_router(seen))
-        await run_browse(s, client=client, tiers=("network",), now=AT_FOUR)
+        from structlog.testing import capture_logs
+        with capture_logs() as logs:
+            await run_browse(s, client=client, tiers=("network",), now=AT_FOUR)
         await base.close_db()
         assert client.request_count == 6
         assert not any(nav.startswith("N-5yc1vZ4j2") for nav, _ in seen)
+        skipped = [e for e in logs if e["event"].startswith("Network lead skipped")]
+        assert [e["brand"] for e in skipped] == ["DEWALT"], "a lead that did not run must say so"
 
     async def test_a_single_walk_lead_is_not_recorded_as_its_parents_whole_split(
         self, browse_settings, fresh_db
@@ -3443,6 +3580,16 @@ class TestNetworkLead:
         assert seen == [(LEAD_ROOT, 0), (LEAD_TOOLS, 0), (LEAD_POWER, 0), (LEAD_BAND_A, 0)]
         assert [r.nav_param for r in rows] == [LEAD_BAND_A], "a walk was recorded after the throttle"
         assert rotation.load_cursors(s.browse_cursor_path) == {}
+
+    async def test_throttle_between_path_levels_stops_the_search(self, browse_settings, fresh_db):
+        from hd.db import base
+        s = self._lead(browse_settings)
+        await base.init_db(s)
+        seen: list = []
+        summary = await run_browse(s, client=ThrottlesAfter(lead_router(seen), after=1),
+                                   tiers=("network",), now=AT_FOUR)
+        await base.close_db()
+        assert seen == [(LEAD_ROOT, 0)] and summary.aborted is True
 
     async def test_missing_label_warns_and_the_rotation_is_unchanged(
         self, browse_settings, fresh_db
@@ -3545,3 +3692,29 @@ class TestNetworkLeadConfigFailsLoud:
                            browse_network_lead_hours_et="4",
                            browse_network_lead="Milwaukee:Tools")
         assert s.browse_network_lead_list == [("Milwaukee", ("Tools",))]
+
+    @pytest.mark.parametrize("hours", [",", " , "])
+    def test_hours_that_name_no_hour_refuse(self, tmp_path, hours):
+        with pytest.raises(ValueError, match="names no hour"):
+            self._settings(tmp_path, browse_network_lead_hours_et=hours,
+                           browse_network_lead="Milwaukee:Tools")
+
+    def test_a_lead_that_names_no_node_refuses(self, tmp_path):
+        with pytest.raises(ValueError, match="one or more"):
+            self._settings(tmp_path, browse_network_lead_hours_et="4",
+                           browse_network_lead=",")
+
+    @pytest.mark.parametrize("lead", [
+        "Milwaukee:Tools/Power,milwaukee:tools/power",     # the same node twice
+        "Milwaukee:Tools,Milwaukee:Tools/Power",           # a node inside another
+        "Milwaukee:Tools/Power,Milwaukee:Tools",
+    ])
+    def test_overlapping_entries_refuse(self, tmp_path, lead):
+        with pytest.raises(ValueError, match="twice, or inside another"):
+            self._settings(tmp_path, browse_network_lead_hours_et="4",
+                           browse_network_lead=lead)
+
+    def test_sibling_nodes_and_two_brands_do_not_overlap(self, tmp_path):
+        s = self._settings(tmp_path, browse_network_lead_hours_et="04, 20",
+                           browse_network_lead="Milwaukee:Tools/Power,Milwaukee:Tools/Hand,DEWALT:Tools")
+        assert len(s.browse_network_lead_list) == 3

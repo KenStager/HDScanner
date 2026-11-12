@@ -121,3 +121,48 @@ class TestDealsPollCommands:
         assert data["WorkingDirectory"] == str(tmp_path)
         assert "--load was ignored" in trailer
         assert not list(tmp_path.glob("*.plist"))
+
+
+class TestRunOnceReadsOneClock:
+    """The tier choice and the browse's hour-keyed decisions share an instant."""
+
+    def test_run_once_hands_the_browse_the_instant_it_chose_the_tiers_from(
+        self, monkeypatch, tmp_path
+    ):
+        from datetime import datetime
+        from hd.pipeline import browse
+        from hd.pipeline.browse import BrowseSummary
+
+        seen: dict = {}
+        real_hour = browse.current_et_hour
+
+        def spy_hour(now=None):
+            seen.setdefault("tier_clock", now)
+            return real_hour(now)
+
+        async def fake_browse(**kw):
+            seen["browse_clock"] = kw.get("now")
+            return BrowseSummary()
+
+        async def nothing(*a, **kw):
+            return []
+
+        for key, value in {
+            "STORES": "2619", "BRANDS": "Milwaukee", "BRAND_TOKENS": "Milwaukee:zv",
+            "DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path}/t.db",
+            "DAILY_DEALS_ENABLED": "false", "SLACK_BOT_TOKEN": "",
+            "THROTTLE_COOLDOWN_PATH": str(tmp_path / "cooldown"),
+            "METRICS_PATH": str(tmp_path / "metrics.jsonl"),
+            "HEALTH_STATE_PATH": str(tmp_path / "health"),
+        }.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.chdir(tmp_path)                     # no operator .env here
+        monkeypatch.setattr("hd.pipeline.browse.current_et_hour", spy_hour)
+        monkeypatch.setattr("hd.pipeline.browse.run_browse", fake_browse)
+        monkeypatch.setattr("hd.pipeline.diff.run_diff", nothing)
+        monkeypatch.setattr("hd.cli._plugins", lambda: None)
+
+        result = runner.invoke(app, ["run-once"])
+        assert result.exit_code == 0, result.output
+        assert isinstance(seen["tier_clock"], datetime)
+        assert seen["browse_clock"] is seen["tier_clock"]
